@@ -48,7 +48,7 @@ DENIED_TOOLS = ",".join([
 INFRA_MARKERS = ("usage limit", "rate limit", "not logged in", "please run /login", "overloaded", "api error", "credit balance")
 CSV_FIELDS = ["trick", "side", "task", "run", "passed", "grade_reason", "infra_error", "timeout",
               "duration_min", "cost_usd", "turns", "input_tokens", "output_tokens", "cache_read_tokens",
-              "models", "permission_denials", "files_changed", "insertions", "deletions", "started_at"]
+              "models", "permission_denials", "files_changed", "insertions", "deletions", "extra", "started_at"]
 lock = threading.Lock()
 
 
@@ -70,6 +70,20 @@ def clone_base(dest: Path):
     r = subprocess.run(["cp", "-cR", str(BASE), str(dest)], capture_output=True, text=True)
     if r.returncode != 0:
         subprocess.run(["cp", "-R", str(BASE), str(dest)], check=True)
+
+
+def ensure_fetched(trick: dict, trick_dir: Path):
+    """Download third-party trick files at a pinned URL and hash instead of committing them (no licence to redistribute)."""
+    import hashlib, urllib.request
+    for f in trick.get("fetch", []):
+        dest = trick_dir / f["dest"]
+        if not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(f["url"], timeout=60) as r:
+                dest.write_bytes(r.read())
+        got = hashlib.sha256(dest.read_bytes()).hexdigest()
+        if got != f["sha256"]:
+            sys.exit(f"hash mismatch for {dest}: expected {f['sha256']}, got {got}")
 
 
 def apply_overlay(trick_dir: Path, side_cfg: dict, work: Path):
@@ -98,11 +112,41 @@ def diffstat(work: Path):
     return num("file") + len(untracked), num("insertion"), num("deletion")
 
 
-def agent_env():
+def agent_env(extra=None):
     env = {k: v for k, v in os.environ.items() if not (k.startswith("CLAUDE_CODE_") or k == "CLAUDECODE")}
     if os.environ.get("LAB_CLAUDE_CONFIG_DIR"):
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(os.environ["LAB_CLAUDE_CONFIG_DIR"])
+    env["CI"] = "true"  # keeps vitest and similar tools out of watch mode
+    env.update({k: os.path.expandvars(str(v)) for k, v in (extra or {}).items()})  # e.g. a side on a local Ollama model
     return env
+
+
+def build_prompt(tdir: Path, side_cfg: dict, task: str) -> str:
+    """Task prompt for one side: a full replacement file per task, or the task's prompt.md, plus prefixes."""
+    by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
+    body = (tdir / by_file).read_text() if by_file else (LAB / "tasks" / task / "prompt.md").read_text()
+    prefix = (side_cfg.get("prompt_prefix") or "") + ((side_cfg.get("prompt_prefix_by_task") or {}).get(task) or "")
+    return prefix + body
+
+
+def call_claude(cmd, work, timeout_s, env_extra=None):
+    """One headless call. Returns (json data, timed_out)."""
+    try:
+        r = subprocess.run(cmd, cwd=work, env=agent_env(env_extra), capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=timeout_s)
+        try:
+            return json.loads(r.stdout), False
+        except json.JSONDecodeError:
+            return {"is_error": True, "result": (r.stdout + r.stderr)[-2000:]}, False
+    except subprocess.TimeoutExpired:
+        return {}, True
+
+
+def save_diff(work: Path, dest: Path):
+    subprocess.run(["git", "-C", str(work), "add", "-A"], capture_output=True)
+    d = subprocess.run(["git", "-C", str(work), "diff", "--cached", "lab-base", "--", ".", ":(exclude)node_modules", ":(exclude,glob)**/dist/**"],
+                       capture_output=True, text=True).stdout
+    dest.write_text(d[:2_000_000])
 
 
 def run_one(trick, tid, side, task, n, out_dir, dry):
@@ -114,10 +158,15 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     work = WORK_ROOT / tid / side / task / f"r{n}"
     clone_base(work)
     apply_overlay(tdir, side_cfg, work)
-    prompt = (side_cfg.get("prompt_prefix") or "") + (LAB / "tasks" / task / "prompt.md").read_text()
-    cmd = ["claude", "-p", prompt, "--output-format", "json", "--no-session-persistence",
-           "--permission-mode", "acceptEdits", "--allowedTools", ALLOWED_TOOLS, "--disallowedTools", DENIED_TOOLS,
-           "--setting-sources", "project,local", "--strict-mcp-config"]
+    prompt = build_prompt(tdir, side_cfg, task)
+    turns = side_cfg.get("turns") or []
+    allowed = ",".join([ALLOWED_TOOLS] + list(side_cfg.get("allowed_tools_extra") or []))
+    base_flags = ["--output-format", "json", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
+                  "--allowedTools", allowed, "--disallowedTools", DENIED_TOOLS,
+                  "--setting-sources", "project,local", "--strict-mcp-config"]
+    if not turns:
+        base_flags.insert(2, "--no-session-persistence")
+    cmd = ["claude", "-p", prompt] + base_flags
     if not trick.get("skills"):
         cmd.append("--disable-slash-commands")
     model = side_cfg.get("model") or trick.get("model")
@@ -127,6 +176,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     if effort:
         cmd += ["--effort", effort]
     cmd += side_cfg.get("extra_args", [])
+    timeout_s = int(trick.get("timeout_min", 20)) * 60
 
     row = {"trick": tid, "side": side, "task": task, "run": n, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     data, timeout, infra = {}, False, ""
@@ -135,15 +185,34 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
         print("DRY", " ".join(c if len(c) < 60 else c[:57] + "..." for c in cmd), f"(cwd {work})")
     else:
         t0 = time.time()
-        try:
-            r = subprocess.run(cmd, cwd=work, env=agent_env(), capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, timeout=int(trick.get("timeout_min", 20)) * 60)
-            try:
-                data = json.loads(r.stdout)
-            except json.JSONDecodeError:
-                data = {"is_error": True, "result": (r.stdout + r.stderr)[-2000:]}
-        except subprocess.TimeoutExpired:
-            timeout = True
+        data, timeout = call_claude(cmd, work, timeout_s, side_cfg.get("env"))
+        calls = [data]
+        # Follow-up turns resume the same session (plan -> execute, review -> fix, /compact, retries).
+        for turn in turns:
+            if timeout or data.get("is_error") or not data.get("session_id"):
+                break
+            left = timeout_s - (time.time() - t0)
+            if left <= 0:
+                timeout = True
+                break
+            tp = turn.get("prompt") or (tdir / turn["prompt_file"]).read_text().replace("{task_prompt}", prompt)
+            tcmd = ["claude", "-p", tp, "--resume", data["session_id"]] + base_flags
+            if not trick.get("skills") and not turn.get("slash_commands"):
+                tcmd.append("--disable-slash-commands")
+            if turn.get("model") or model:
+                tcmd += ["--model", turn.get("model") or model]
+            if effort:
+                tcmd += ["--effort", effort]
+            tcmd += turn.get("extra_args", [])
+            nxt, timeout = call_claude(tcmd, work, left, side_cfg.get("env"))
+            calls.append(nxt)
+            data = nxt or data
+        if len(calls) > 1:
+            data = dict(data)
+            data["total_cost_usd"] = sum(float(c.get("total_cost_usd") or 0) for c in calls)
+            data["duration_ms"] = sum(float(c.get("duration_ms") or 0) for c in calls)
+            data["num_turns"] = sum(int(c.get("num_turns") or 0) for c in calls)
+            data["calls"] = len(calls)
         wall = (time.time() - t0) / 60
         text = str(data.get("result", "")).lower()
         if data.get("is_error") and any(m in text for m in INFRA_MARKERS):
@@ -156,11 +225,16 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
                    models="|".join((data.get("modelUsage") or {}).keys()),
                    permission_denials=len(data.get("permission_denials") or []))
     files, ins, dels = diffstat(work)
+    extra = ""
+    if trick.get("extra_check"):  # trick-specific measurement on the finished repo, before grading touches it
+        chk = subprocess.run([str(tdir / trick["extra_check"]), str(work), side, task], capture_output=True, text=True, timeout=300)
+        extra = (chk.stdout.strip().splitlines() or [""])[-1][:200]
     passed, reason = (False, "infra error, not graded") if infra else grade(task, work)
     row.update(passed=passed, grade_reason=reason, infra_error=infra, timeout=timeout,
-               files_changed=files, insertions=ins, deletions=dels)
+               files_changed=files, insertions=ins, deletions=dels, extra=extra)
     if not dry:
         raw.parent.mkdir(parents=True, exist_ok=True)
+        save_diff(work, raw.with_suffix(".diff"))
         raw.write_text(json.dumps({"row": row, "claude": data, "cmd": cmd[:2] + ["<prompt>"] + cmd[3:]}, indent=2))
         with lock:
             new = not (out_dir / "runs.csv").exists()
@@ -248,6 +322,7 @@ def main():
     ap.add_argument("--only-task")
     a = ap.parse_args()
     trick = load_trick(a.trick)
+    ensure_fetched(trick, LAB / "tricks" / a.trick)
     out_dir = LAB / "runs" / a.trick
     out_dir.mkdir(parents=True, exist_ok=True)
     if a.summarize_only:

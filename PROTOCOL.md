@@ -17,7 +17,7 @@ can't read the fix from `git log`). One test file is pre-aligned so every remain
 | Task | Type | The agent is asked to | Graded by (`tasks/<task>/accept.sh`) |
 |---|---|---|---|
 | `t1-flag-bug` | Real bug | Fix `frai gate init --ci` silently not creating the workflow | Builds the CLI, runs `init --ci` and plain `init` in empty folders, checks `frai-gate` was not modified |
-| `t2-failing-tests` | Real failing tests | Make the frai-core suite pass without touching tests | Suite passes, no test file changed, hidden contract tests (toxicity still works, references don't leak, exports exist) |
+| `t2-failing-tests` | Real failing tests | Make the frai-core suite pass without touching tests | Suite passes, no existing test file modified or deleted (new test files are allowed), hidden contract tests (toxicity still works, references don't leak, exports exist) |
 | `t3-summary-feature` | Feature | Add `renderSummary` and a `--summary` flag to `frai-gate check` | Builds, suite passes, hidden `renderSummary` tests, one-line CLI output, exit codes, `--json` priority |
 
 Every task was validated before day 1: each **fails** on the untouched baseline and **passes** with the reference
@@ -40,7 +40,7 @@ implementing the function without the flag in t3) all **fail**.
 
 ## Default size
 
-3 tasks × 3 runs × 2 sides = **18 runs per trick**, up to 3 in parallel.
+3 tasks × 3 runs × 2 sides = **18 runs per trick**, up to 3 in parallel. Some days differ and say so in `plan/days.json` (`runs_per_side`, `task_note`): bug-only tricks use t1 and t2 (12 runs), some use their own fixture, long autonomous runs use one run per side. Days 47 and 49 are measurement days with no verdict.
 
 If the first test block shows that 18 runs per trick won't fit the subscription's usage limits across two blocks a
 week, drop to **2 runs per side (12 runs)** from then on. The post always states the real run count.
@@ -83,3 +83,6 @@ Not every trick can run headless. Each day in the Notion scorecard has a **Run m
 
 - 2026-09-14: protocol written, tasks validated, day 1 trick defined.
 - 2026-09-15: runner denies reads outside the run folder; repo published at github.com/sebuzdugan/100-tricks-lab.
+- 2026-09-15: before any run. t2 grader now fails only modified, deleted or renamed existing test files; adding a new test file is allowed, because the prompt only forbids editing tests. Revalidated: baseline fails, reference passes, edited test fails, reference plus a new test passes.
+- 2026-09-15: runner sets `CI=true` (keeps vitest out of watch mode), saves each run's diff, and supports per-task prompts, follow-up turns in the same session, per-side environment (local models through Ollama), extra allowed tools, a trick-specific check, and third-party trick files fetched at a pinned URL and hash.
+- 2026-09-15: all 100 days reviewed against live sources (`plan/briefs.json`). Day 1 uses the original viral CLAUDE.md unchanged instead of a paraphrase. One-run-per-side days (91, 92, 94, 95) will get a grading-unit rule in this log before 13 Dec.

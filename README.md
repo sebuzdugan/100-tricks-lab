@@ -38,7 +38,24 @@ scorecard row and the `test-result-crosspost` skill.
 Create `tricks/dNN/trick.json` (copy `tricks/d01/trick.json`) and put the files that make up the trick in
 `tricks/dNN/with/` (or `without/`). Files in an overlay folder are copied into the repo copy before the agent starts.
 Use `prompt_prefix`, `model`, `effort` or `extra_args` on a side when the trick is a prompt, model or flag rather
-than a file.
+than a file. More side options:
+
+| Field | Use |
+|---|---|
+| `prompt_prefix_by_task` | `{task: text}` added before one task's prompt |
+| `prompt_file_by_task` | `{task: path}` replaces that task's prompt with a file in the trick folder |
+| `turns` | follow-up calls in the same session: `[{"prompt": "...", "model": "sonnet"}]` (plan then execute, review then fix) |
+| `allowed_tools_extra` | extra tools, e.g. `["Agent"]` or `["WebFetch"]` |
+| `permission_mode` | defaults to `acceptEdits` |
+| `env` | extra environment, e.g. a local model: `{"ANTHROPIC_BASE_URL": "http://localhost:11434", "ANTHROPIC_AUTH_TOKEN": "ollama"}` |
+
+Trick-level: `tasks`, `runs`, `timeout_min`, `skills` (enables slash commands and skills), `extra_check` (script run on
+each finished repo copy, its last output line lands in the `extra` column), `fetch` (third-party files downloaded at a
+pinned URL and SHA-256 instead of being committed).
+
+`plan/briefs.json` holds the reviewed brief for every day: exact setup, caveats, clip plan, sources. Day cards live in
+`assets/cards/` (`python3 harness/render_cards.py` re-renders them; pips fill in once `runs/dNN/summary.json` exists).
+Icons: [Lucide](https://lucide.dev), ISC licence.
 
 ## Layout
 
@@ -51,5 +68,7 @@ reference/           known-good fixes used to validate the graders (never shown 
 tricks/dNN/          one folder per day
 runs/dNN/            results
 base/frai            the baseline repo (rebuilt by setup_base.sh, not committed)
-plan/days.json       the 100-day plan: trick, test, run mode, source
+plan/days.json       the 100-day plan: trick, test, run mode, runs, source
+plan/briefs.json     reviewed brief per day
+assets/cards/        day cards (PNG + SVG)
 ```

@@ -123,6 +123,10 @@ def values(summary: dict, spoken: bool, extra: dict, unit: str = "run") -> dict:
         else:  # one way better, the other worse: say both, don't call it level
             why = f"{close}, {time_p}, and {cost_p}" if spoken else f"within 1 pass, {time_p}, {cost_p}"
     v["why_phrase"] = why
+    # Aliases used by feature- or task-graded days, filled from the same summary fields.
+    for alias, src in {"with_done": "with_passed", "with_units": "with_total", "without_done": "without_passed",
+                       "without_units": "without_total", "unit_gap_phrase": "pass_gap_phrase"}.items():
+        v.setdefault(alias, v[src])
     for k, val in extra.items():
         v[k] = words(int(val)) if spoken and re.fullmatch(r"-?\d+", str(val)) else str(val)
     return v

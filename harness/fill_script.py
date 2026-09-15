@@ -13,6 +13,14 @@ digits in `screen`) and writes private/out/dNN/:
   prompter.json   one entry for the yt-short-voicematch teleprompter SCRIPTS array
   beats.json      voice + on_screen per beat, a starting point for the voicematch project
 
+  x.md / x.json    the X post and reply, filled (digits, links)
+
+Series spine (private/course.json, private/playbook.json):
+  {playbook_update}  "Rule fourteen in the Playbook." / "The Playbook marks it optional." / "The Playbook crosses it out."
+  {playbook_tally}   running totals up to today;  {module_recap} totals for this module;  {module_question}
+A real (non-preview) fill records today's rule and category in private/playbook.json, so tallies and module
+recaps always come from actual results. harness/playbook.py prints the Playbook and builds module threads.
+
 It refuses inconclusive results (they are rerun, never posted).
 """
 import argparse
@@ -142,6 +150,45 @@ def fill(text: str, v: dict, day: str) -> str:
     return re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out)  # a phrase may open a sentence
 
 
+CATEGORY = {"works": "kept", "no_difference": "optional", "hurts": "cut"}
+
+
+def module_of(day):
+    return (day - 1) // 10
+
+
+def playbook_values(s, day, key, spoken):
+    """Playbook placeholders: today's category plus the running tally from private/playbook.json."""
+    pb_path = LAB / "private" / "playbook.json"
+    pb = json.loads(pb_path.read_text()) if pb_path.exists() else {}
+    cat = (s.get("playbook_by_variant") or {}).get(key) or CATEGORY.get(key, "none")
+    entries = {int(k): v for k, v in pb.items() if int(k) != day}
+    entries[day] = {"category": cat}
+    upto = [v["category"] for d, v in entries.items() if d <= day]
+    mod = [v["category"] for d, v in entries.items() if module_of(d) == module_of(day) and d <= day]
+    n = lambda c, L: sum(1 for x in L if x == c)
+    num = (lambda k: words(k)) if spoken else (lambda k: str(k))
+    kept, cut, opt = n("kept", upto), n("cut", upto), n("optional", upto)
+    course_path = LAB / "private" / "course.json"
+    mq = json.loads(course_path.read_text())["module_questions"] if course_path.exists() else {}
+    plan = {d["day"]: d for d in json.loads((LAB / "plan" / "days.json").read_text())["days"]}
+    if spoken:
+        update = {"kept": f"Rule {words(kept)} in the Playbook.", "optional": "The Playbook marks it optional.",
+                  "cut": "The Playbook crosses it out.", "none": "The Playbook stays as it is today."}[cat]
+    else:
+        update = {"kept": f"Playbook: kept, rule {kept}", "optional": "Playbook: optional", "cut": "Playbook: cut",
+                  "none": "Playbook: unchanged"}[cat]
+    v = {"playbook_update": update,
+         "playbook_tally": f"{num(kept)} kept, {num(cut)} cut, {num(opt)} optional" if spoken else f"{kept} kept · {cut} cut · {opt} optional",
+         "module_recap": (f"{num(n('kept', mod))} kept, {num(n('cut', mod))} cut, {num(n('optional', mod))} optional" if spoken
+                          else f"{n('kept', mod)} kept · {n('cut', mod)} cut · {n('optional', mod)} optional"),
+         "module_question": mq.get(plan[day]["module"], ""),
+         "day_tag": f"Day {day}/100 · {plan[day]['module'].split(' ', 1)[1]}",
+         "method_url": f"https://github.com/sebuzdugan/100-tricks-lab/tree/main/runs/d{day:02d}",
+         "short_link": f"https://sebuzdugan.com/l/d{day:02d}"}
+    return v, cat
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("day")
@@ -176,6 +223,9 @@ def main():
         sys.exit(f"unknown variant {key}. Keys: {', '.join(s['takeaways'])}")
     unit = s.get("unit", "run")
     vs, vd = values(summary, True, extra, unit), values(summary, False, extra, unit)
+    pvs, category = playbook_values(s, day, key, True)
+    pvd, _ = playbook_values(s, day, key, False)
+    vs.update({k: v for k, v in pvs.items() if k not in vs}); vd.update({k: v for k, v in pvd.items() if k not in vd})
 
     beats = []
     for b in s["beats"]:
@@ -195,8 +245,22 @@ def main():
     (out / "beats.json").write_text(json.dumps({"title": s["title"], "beats": [
         {"section": b["role"], "voice": b["voice"], "on_screen": b["screen"], "visual_note": b["visual"]} for b in beats]},
         ensure_ascii=False, indent=2))
+    x = s.get("x")
+    if x:
+        vx = dict(vd)
+        vx["x_takeaway"] = fill(x["x_takeaways"][key], vd, tid) if key in x.get("x_takeaways", {}) else ""
+        post, reply = fill(x["post"], vx, tid), fill(x["reply"], vx, tid)
+        (out / "x.json").write_text(json.dumps({"post": post, "reply": reply}, ensure_ascii=False, indent=2))
+        (out / "x.md").write_text(f"# Day {day} X draft\n\n## Post\n\n{post}\n\n## Reply\n\n{reply}\n")
+        md += ["", "---", "X post:", post, "", "X reply:", reply]
+    if not a.preview:
+        pb_path = LAB / "private" / "playbook.json"
+        pb = json.loads(pb_path.read_text()) if pb_path.exists() else {}
+        pb[str(day)] = {"rule": s.get("playbook_rule", ""), "category": category, "verdict": summary["verdict"], "variant": key}
+        pb_path.write_text(json.dumps(dict(sorted(pb.items(), key=lambda kv: int(kv[0]))), ensure_ascii=False, indent=1))
     print("\n".join(md))
-    print(f"\nwrote {out.relative_to(LAB)}/script.md, prompter.json, beats.json")
+    print(f"\nwrote {out.relative_to(LAB)}/script.md, prompter.json, beats.json" + (", x.md, x.json" if x else "")
+          + ("" if a.preview else f"; Playbook: day {day} {category}"))
 
 
 if __name__ == "__main__":

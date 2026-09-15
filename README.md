@@ -31,6 +31,14 @@ python3 harness/fill_script.py d01            # picks the takeaway from the verd
 python3 harness/fill_script.py d01 --preview works   # rehearse before results exist
 ```
 
+Each real fill also records the day's rule in the Playbook: kept (works), cut (hurts) or optional (no difference).
+The tally and module recaps in the scripts and X drafts come only from those recorded results:
+
+```bash
+python3 harness/playbook.py                   # the Playbook so far, grouped by module
+python3 harness/playbook.py thread M2         # a module's X thread: opener, one line per day, recap
+```
+
 When the verdict is in, publish the raw runs before the post goes out (the post links to them):
 
 ```bash

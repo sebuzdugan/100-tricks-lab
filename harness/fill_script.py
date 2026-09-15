@@ -7,6 +7,7 @@
 
 Scripts live in private/scripts.json (not committed: they are unpublished content). Each script has fixed beats,
 one `takeaway` slot and verdict variants. This picks the variant, fills the placeholders (spoken words in `voice`,
+digits in `screen`; {why_phrase} always states the real reason for the verdict, whichever route produced it)
 digits in `screen`) and writes private/out/dNN/:
   script.md       what Sebi reads, beat by beat, with on-screen text and visuals
   prompter.json   one entry for the yt-short-voicematch teleprompter SCRIPTS array
@@ -76,16 +77,19 @@ def ratio_phrase(a: float, b: float, better: str, worse: str, same: str, spoken:
     return f"about {words(pct)} percent {'slower' if worse == 'time' else 'more expensive'}" if spoken else f"{pct}% {'slower' if worse == 'time' else 'costlier'}"
 
 
-def values(summary: dict, spoken: bool, extra: dict) -> dict:
+def values(summary: dict, spoken: bool, extra: dict, unit: str = "run") -> dict:
     w, o = summary["with"], summary["without"]
+    units = {"run": ("passing run", "passing runs", "passes", "the same passes"),
+             "feature": ("finished feature", "finished features", "features", "the same number of finished features"),
+             "task": ("finished task", "finished tasks", "tasks", "the same number of finished tasks")}[unit]
     num = (lambda n: words(int(n))) if spoken else (lambda n: str(int(n)))
     dp = w["passed"] - o["passed"]
     if dp == 0:
-        gap = "the same number of passes"
+        gap = f"the same number of {units[2]}"
     elif abs(dp) == 1:
-        gap = "one more passing run" if dp > 0 else "one fewer passing run"
+        gap = f"one {'more' if dp > 0 else 'fewer'} {units[0]}"
     else:
-        gap = f"{words(abs(dp))} {'more' if dp > 0 else 'fewer'} passing runs" if spoken else f"{abs(dp)} {'more' if dp > 0 else 'fewer'} passes"
+        gap = f"{words(abs(dp))} {'more' if dp > 0 else 'fewer'} {units[1]}" if spoken else f"{abs(dp)} {'more' if dp > 0 else 'fewer'} {units[2]}"
     v = {
         "with_passed": num(w["passed"]), "with_total": num(w["graded"]),
         "without_passed": num(o["passed"]), "without_total": num(o["graded"]),
@@ -98,6 +102,27 @@ def values(summary: dict, spoken: bool, extra: dict) -> dict:
         "time_phrase": ratio_phrase(w["avg_minutes"], o["avg_minutes"], "faster", "time", "about the same time", spoken),
         "cost_phrase": ratio_phrase(w["avg_cost_usd"], o["avg_cost_usd"], "cheaper", "cost", "about the same cost", spoken),
     }
+    # One phrase that always states the real reason for the verdict (mirrors decide() in run.py).
+    t_ratio = (w["avg_minutes"] / o["avg_minutes"]) if o["avg_minutes"] else 1.0
+    c_ratio = (w["avg_cost_usd"] / o["avg_cost_usd"]) if o["avg_cost_usd"] else 1.0
+    time_p, cost_p = v["time_phrase"], v["cost_phrase"]
+    if w["passed"] == 0 and o["passed"] == 0:
+        why = f"no {units[0]} on either side" if spoken else "0 passes both sides"
+    elif abs(dp) >= 2:
+        why = gap
+    elif dp >= 0 and (t_ratio <= 0.75 or c_ratio <= 0.75) and t_ratio < 1.25 and c_ratio < 1.25:
+        lead = units[3] if dp == 0 else f"one more {units[0]}"
+        why = f"{lead}, {time_p if t_ratio <= 0.75 else cost_p}"
+    elif dp <= 0 and t_ratio >= 1.25 and c_ratio >= 1.25:
+        lead = units[3] if dp == 0 else f"one fewer {units[0]}"
+        why = f"{lead}, but {time_p} and {cost_p}"
+    else:
+        close = f"{units[2]} within one" if abs(dp) == 1 else units[3]
+        if 0.75 < t_ratio < 1.25 and 0.75 < c_ratio < 1.25:
+            why = f"{close}, and no big gap in time or cost" if spoken else "within 1 pass, similar time and cost"
+        else:  # one way better, the other worse: say both, don't call it level
+            why = f"{close}, {time_p}, and {cost_p}" if spoken else f"within 1 pass, {time_p}, {cost_p}"
+    v["why_phrase"] = why
     for k, val in extra.items():
         v[k] = words(int(val)) if spoken and re.fullmatch(r"-?\d+", str(val)) else str(val)
     return v
@@ -109,7 +134,8 @@ def fill(text: str, v: dict, day: str) -> str:
         if k not in v:
             sys.exit(f"{day}: placeholder {{{k}}} has no value. Pass it with --set {k}=VALUE")
         return v[k]
-    return re.sub(r"\{(\w+)\}", sub, text)
+    out = re.sub(r"\{(\w+)\}", sub, text)
+    return re.sub(r"(^|[.!?]\s+)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out)  # a phrase may open a sentence
 
 
 def main():
@@ -143,7 +169,8 @@ def main():
         sys.exit(f"{tid} needs --variant. Rule: {s.get('variant_rule')}. Keys: {', '.join(s['takeaways'])}")
     if key not in s["takeaways"]:
         sys.exit(f"unknown variant {key}. Keys: {', '.join(s['takeaways'])}")
-    vs, vd = values(summary, True, extra), values(summary, False, extra)
+    unit = s.get("unit", "run")
+    vs, vd = values(summary, True, extra, unit), values(summary, False, extra, unit)
 
     beats = []
     for b in s["beats"]:

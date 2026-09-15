@@ -1,0 +1,996 @@
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..613987b 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -53,6 +53,7 @@ interface EvalOptions {
+   references?: string;
+   report?: string;
+   format?: 'json' | 'markdown';
++  threshold?: string[];
+ }
+ 
+ interface RagOptions {
+@@ -473,8 +474,51 @@ function assertFileExists(targetPath: string) {
+   }
+ }
+ 
++function parseThresholds(thresholdStrings?: string[]): { valid: boolean; thresholds: Record<string, number>; errors: string[] } {
++  const thresholds: Record<string, number> = {};
++  const errors: string[] = [];
++
++  if (!thresholdStrings || thresholdStrings.length === 0) {
++    return { valid: true, thresholds, errors };
++  }
++
++  for (const thresholdStr of thresholdStrings) {
++    const parts = thresholdStr.split('=');
++    if (parts.length !== 2) {
++      errors.push(`Malformed threshold: ${thresholdStr}. Expected format: <metric>=<number>`);
++      continue;
++    }
++
++    const [metricId, minStr] = parts;
++    const min = Number.parseFloat(minStr);
++
++    if (Number.isNaN(min) || min < 0 || min > 1) {
++      errors.push(`Invalid threshold for ${metricId}: minimum must be a number between 0 and 1, got ${minStr}`);
++      continue;
++    }
++
++    thresholds[metricId] = min;
++  }
++
++  return {
++    valid: errors.length === 0,
++    thresholds,
++    errors
++  };
++}
++
+ function runEvalCommand(options: EvalOptions) {
+   assertFileExists(options.outputs);
++
++  const thresholdParsing = parseThresholds(options.threshold);
++  if (!thresholdParsing.valid) {
++    log.error('Invalid thresholds provided.');
++    thresholdParsing.errors.forEach((error) => {
++      console.error(`  - ${error}`);
++    });
++    process.exit(2);
++  }
++
+   const dataset = (Eval.loadDataset as unknown as (config: unknown) => any)({
+     outputsPath: options.outputs,
+     referencesPath: options.references
+@@ -483,17 +527,32 @@ function runEvalCommand(options: EvalOptions) {
+     outputs: dataset.outputs,
+     references: dataset.references
+   });
++
+   const report = (Eval.generateReport as unknown as (config: unknown) => any)({
+     evaluations,
+     outputsPath: dataset.outputsPath,
+-    referencesPath: dataset.referencesPath
++    referencesPath: dataset.referencesPath,
++    thresholds: Object.keys(thresholdParsing.thresholds).length > 0 ? thresholdParsing.thresholds : undefined
+   });
++
++  if ((report as any)._thresholdValidationErrors) {
++    log.error('Invalid thresholds provided.');
++    ((report as any)._thresholdValidationErrors as string[]).forEach((error) => {
++      console.error(`  - ${error}`);
++    });
++    process.exit(2);
++  }
++
+   const resolvedPath = (Eval.writeReport as unknown as (config: unknown) => string)({
+     report,
+     format: options.format ?? 'json',
+     reportPath: options.report
+   });
+   log.success('Evaluation report generated.', { path: resolvedPath });
++
++  if (report.passed === false) {
++    process.exit(1);
++  }
+ }
+ 
+ function runRagIndexCommand(options: RagOptions) {
+@@ -712,6 +771,9 @@ async function main() {
+     .option('--references <file>', 'Path to JSON file containing reference outputs')
+     .option('--report <path>', 'Report path (default: frai-eval-report.json)')
+     .option('--format <format>', 'Report format (json or markdown)', 'json')
++    .option('--threshold <metric>=<min>', 'Threshold for a metric (can be given multiple times)', (value, previous: string[] | undefined) => {
++      return previous ? [...previous, value] : [value];
++    })
+     .action((options: EvalOptions) => {
+       runEvalCommand(options);
+     });
+diff --git a/packages/frai-core/src/eval/index.js b/packages/frai-core/src/eval/index.js
+index d2d2fbe..b9f09c0 100644
+--- a/packages/frai-core/src/eval/index.js
++++ b/packages/frai-core/src/eval/index.js
+@@ -59,10 +59,39 @@ export function runEvaluations({
+   return evaluations;
+ }
+ 
++function validateAndParseThresholds(thresholds, availableMetricIds) {
++  const result = {};
++  const errors = [];
++
++  if (!thresholds || typeof thresholds !== 'object') {
++    return { valid: true, thresholds: result, errors, validationErrors: null };
++  }
++
++  for (const [metricId, min] of Object.entries(thresholds)) {
++    if (!availableMetricIds.includes(metricId)) {
++      errors.push(`Unknown metric id: ${metricId}. Valid metrics: ${availableMetricIds.join(', ')}`);
++      continue;
++    }
++    if (typeof min !== 'number' || min < 0 || min > 1) {
++      errors.push(`Invalid threshold for ${metricId}: minimum must be a number between 0 and 1, got ${min}`);
++      continue;
++    }
++    result[metricId] = min;
++  }
++
++  return {
++    valid: errors.length === 0,
++    thresholds: result,
++    errors,
++    validationErrors: errors.length > 0 ? errors : null
++  };
++}
++
+ export function generateReport({
+   evaluations,
+   outputsPath,
+   referencesPath,
++  thresholds,
+   generatedAt = new Date().toISOString()
+ }) {
+   const totalSamples = evaluations.reduce((total, metric) => {
+@@ -70,7 +99,10 @@ export function generateReport({
+     return total;
+   }, 0);
+ 
+-  return {
++  const availableMetricIds = evaluations.map((m) => m.id);
++  const thresholdValidation = validateAndParseThresholds(thresholds, availableMetricIds);
++
++  const report = {
+     metadata: {
+       generatedAt,
+       outputsPath,
+@@ -79,6 +111,35 @@ export function generateReport({
+     },
+     metrics: evaluations
+   };
++
++  if (thresholdValidation.validationErrors) {
++    report._thresholdValidationErrors = thresholdValidation.validationErrors;
++  }
++
++  if (Object.keys(thresholdValidation.thresholds).length > 0) {
++    const thresholdResults = [];
++    let allPassed = true;
++
++    for (const [metricId, min] of Object.entries(thresholdValidation.thresholds)) {
++      const metric = evaluations.find((m) => m.id === metricId);
++      const score = metric?.score;
++      const passed = score !== null && score !== undefined ? score >= min : false;
++
++      if (!passed) allPassed = false;
++
++      thresholdResults.push({
++        metric: metricId,
++        min,
++        score: score ?? null,
++        passed
++      });
++    }
++
++    report.passed = allPassed;
++    report.thresholds = thresholdResults;
++  }
++
++  return report;
+ }
+ 
+ export function writeReport({
+diff --git a/packages/frai-core/src/eval/index.test.js b/packages/frai-core/src/eval/index.test.js
+index 2cac2fb..67d5bcb 100644
+--- a/packages/frai-core/src/eval/index.test.js
++++ b/packages/frai-core/src/eval/index.test.js
+@@ -76,4 +76,94 @@ describe('Evaluation harness', () => {
+     expect(fs.existsSync(jsonPath)).toBe(true);
+     expect(fs.existsSync(markdownPath)).toBe(true);
+   });
++
++  it('validates and applies thresholds', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello', 'World'],
++      references: ['hello', 'goodbye']
++    });
++
++    const report = generateReport({
++      evaluations,
++      outputsPath: '/tmp/outputs.json',
++      referencesPath: '/tmp/refs.json',
++      thresholds: { exact_match: 0.3 }
++    });
++
++    expect(report.passed).toBe(true);
++    expect(report.thresholds).toHaveLength(1);
++    expect(report.thresholds[0].metric).toBe('exact_match');
++    expect(report.thresholds[0].min).toBe(0.3);
++    expect(report.thresholds[0].passed).toBe(true);
++  });
++
++  it('fails thresholds when score is below minimum', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello', 'World'],
++      references: ['hello', 'goodbye']
++    });
++
++    const report = generateReport({
++      evaluations,
++      outputsPath: '/tmp/outputs.json',
++      referencesPath: '/tmp/refs.json',
++      thresholds: { exact_match: 0.7 }
++    });
++
++    expect(report.passed).toBe(false);
++    expect(report.thresholds[0].passed).toBe(false);
++  });
++
++  it('fails thresholds when metric score is null', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello'],
++      references: []
++    });
++
++    const report = generateReport({
++      evaluations,
++      outputsPath: '/tmp/outputs.json',
++      referencesPath: null,
++      thresholds: { exact_match: 0.5 }
++    });
++
++    expect(report.passed).toBe(false);
++    expect(report.thresholds[0].score).toBe(null);
++    expect(report.thresholds[0].passed).toBe(false);
++  });
++
++  it('detects unknown metric ids in thresholds', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello'],
++      references: ['hello']
++    });
++
++    const report = generateReport({
++      evaluations,
++      outputsPath: '/tmp/outputs.json',
++      referencesPath: '/tmp/refs.json',
++      thresholds: { unknown_metric: 0.5 }
++    });
++
++    expect(report._thresholdValidationErrors).toBeDefined();
++    expect(report._thresholdValidationErrors[0]).toContain('Unknown metric id');
++    expect(report._thresholdValidationErrors[0]).toContain('unknown_metric');
++  });
++
++  it('supports multiple thresholds', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello'],
++      references: ['hello']
++    });
++
++    const report = generateReport({
++      evaluations,
++      outputsPath: '/tmp/outputs.json',
++      referencesPath: '/tmp/refs.json',
++      thresholds: { exact_match: 0.5, length_variance: 0.5 }
++    });
++
++    expect(report.thresholds).toHaveLength(2);
++    expect(report.passed).toBe(true);
++  });
+ });
+diff --git a/packages/frai-core/src/eval/reporters.js b/packages/frai-core/src/eval/reporters.js
+index 6cdb9a5..b9f8461 100644
+--- a/packages/frai-core/src/eval/reporters.js
++++ b/packages/frai-core/src/eval/reporters.js
+@@ -35,6 +35,16 @@ export function toMarkdown(report) {
+     }
+     lines.push('');
+   });
++  if (report.thresholds && report.thresholds.length > 0) {
++    lines.push('## Thresholds');
++    lines.push('');
++    report.thresholds.forEach((threshold) => {
++      const status = threshold.passed ? 'PASS' : 'FAIL';
++      const score = threshold.score ?? 'n/a';
++      lines.push(`- **${threshold.metric}:** ${status} (min: ${threshold.min}, score: ${score})`);
++    });
++    lines.push('');
++  }
+   lines.push('---');
+   lines.push('*Generated by FRAI Evaluation Harness*');
+   return lines.join('\n');
+diff --git a/test-markdown-report.md b/test-markdown-report.md
+new file mode 100644
+index 0000000..f45e8d0
+--- /dev/null
++++ b/test-markdown-report.md
+@@ -0,0 +1,34 @@
++# FRAI Evaluation Report
++
++- **Generated At:** 2026-09-15T14:33:30.129Z
++- **Outputs File:** /private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-fail.json
++- **References File:** /private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json
++- **Total Samples:** 2
++
++## Metrics
++
++### Exact Match
++
++- **Score:** 0.5
++- **Total Samples:** 2
++- **Matches:** 1
++
++### Toxicity (keyword scan)
++
++- **Score:** 0.5
++- **Total Samples:** 2
++- **Flagged Samples:** 1
++
++### Length Variance
++
++- **Score:** 0.998
++- **Total Samples:** 2
++- **Average Delta:** 1
++
++## Thresholds
++
++- **exact_match:** FAIL (min: 0.6, score: 0.5)
++- **toxicity:** FAIL (min: 0.6, score: 0.5)
++
++---
++*Generated by FRAI Evaluation Harness*
+\ No newline at end of file
+diff --git a/test-multi-threshold-fail.json b/test-multi-threshold-fail.json
+new file mode 100644
+index 0000000..3ee5c69
+--- /dev/null
++++ b/test-multi-threshold-fail.json
+@@ -0,0 +1,82 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:33:25.759Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-fail.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 0.5,
++      "total": 2,
++      "matches": 1,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": false,
++          "predicted": "goodbye",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0.5,
++      "total": 2,
++      "flagged": 1,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 0.998,
++      "total": 2,
++      "averageDelta": 1,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 7,
++          "expectedLength": 5,
++          "delta": 2
++        }
++      ]
++    }
++  ],
++  "passed": false,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.6,
++      "score": 0.5,
++      "passed": false
++    },
++    {
++      "metric": "toxicity",
++      "min": 0.6,
++      "score": 0.5,
++      "passed": false
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-multi-threshold.json b/test-multi-threshold.json
+new file mode 100644
+index 0000000..0ee178b
+--- /dev/null
++++ b/test-multi-threshold.json
+@@ -0,0 +1,82 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:33:21.431Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-fail.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 0.5,
++      "total": 2,
++      "matches": 1,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": false,
++          "predicted": "goodbye",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0.5,
++      "total": 2,
++      "flagged": 1,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 0.998,
++      "total": 2,
++      "averageDelta": 1,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 7,
++          "expectedLength": 5,
++          "delta": 2
++        }
++      ]
++    }
++  ],
++  "passed": true,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.5,
++      "score": 0.5,
++      "passed": true
++    },
++    {
++      "metric": "toxicity",
++      "min": 0.5,
++      "score": 0.5,
++      "passed": true
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-null-score-md.md b/test-null-score-md.md
+new file mode 100644
+index 0000000..a54d684
+--- /dev/null
++++ b/test-null-score-md.md
+@@ -0,0 +1,31 @@
++# FRAI Evaluation Report
++
++- **Generated At:** 2026-09-15T14:33:41.835Z
++- **Outputs File:** /private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-no-refs.json
++- **Total Samples:** 2
++
++## Metrics
++
++### Exact Match
++
++- **Score:** n/a
++- **Total Samples:** 2
++- **Matches:** 0
++
++### Toxicity (keyword scan)
++
++- **Score:** 1
++- **Total Samples:** 2
++- **Flagged Samples:** 0
++
++### Length Variance
++
++- **Score:** n/a
++- **Total Samples:** 2
++
++## Thresholds
++
++- **exact_match:** FAIL (min: 0.5, score: n/a)
++
++---
++*Generated by FRAI Evaluation Harness*
+\ No newline at end of file
+diff --git a/test-null-score.json b/test-null-score.json
+new file mode 100644
+index 0000000..6aaebb1
+--- /dev/null
++++ b/test-null-score.json
+@@ -0,0 +1,43 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:33:35.802Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-no-refs.json",
++    "referencesPath": null,
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": null,
++      "total": 2,
++      "matches": 0,
++      "details": "Outputs and references must be non-empty arrays of equal length for exact match."
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 1,
++      "total": 2,
++      "flagged": 0,
++      "flaggedSamples": []
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": null,
++      "total": 2,
++      "averageDelta": null,
++      "details": "Outputs and references must be non-empty arrays of equal length for length variance."
++    }
++  ],
++  "passed": false,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.5,
++      "score": null,
++      "passed": false
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-outputs-fail.json b/test-outputs-fail.json
+new file mode 100644
+index 0000000..6ac7c5d
+--- /dev/null
++++ b/test-outputs-fail.json
+@@ -0,0 +1 @@
++["Hello", "Goodbye"]
+diff --git a/test-outputs-no-refs.json b/test-outputs-no-refs.json
+new file mode 100644
+index 0000000..a3a4145
+--- /dev/null
++++ b/test-outputs-no-refs.json
+@@ -0,0 +1 @@
++["Hello", "World"]
+diff --git a/test-outputs.json b/test-outputs.json
+new file mode 100644
+index 0000000..a3a4145
+--- /dev/null
++++ b/test-outputs.json
+@@ -0,0 +1 @@
++["Hello", "World"]
+diff --git a/test-references.json b/test-references.json
+new file mode 100644
+index 0000000..9c30a74
+--- /dev/null
++++ b/test-references.json
+@@ -0,0 +1 @@
++["hello", "world"]
+diff --git a/test-report-fail.json b/test-report-fail.json
+new file mode 100644
+index 0000000..6049101
+--- /dev/null
++++ b/test-report-fail.json
+@@ -0,0 +1,82 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:32:30.562Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 1,
++      "total": 2,
++      "matches": 2,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": true,
++          "predicted": "world",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0,
++      "total": 2,
++      "flagged": 2,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        },
++        {
++          "index": 1,
++          "terms": [
++            "world"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 1,
++      "total": 2,
++      "averageDelta": 0,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        }
++      ]
++    }
++  ],
++  "passed": true,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.99,
++      "score": 1,
++      "passed": true
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-report-fail2.json b/test-report-fail2.json
+new file mode 100644
+index 0000000..be63b40
+--- /dev/null
++++ b/test-report-fail2.json
+@@ -0,0 +1,76 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:32:37.063Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs-fail.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 0.5,
++      "total": 2,
++      "matches": 1,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": false,
++          "predicted": "goodbye",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0.5,
++      "total": 2,
++      "flagged": 1,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 0.998,
++      "total": 2,
++      "averageDelta": 1,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 7,
++          "expectedLength": 5,
++          "delta": 2
++        }
++      ]
++    }
++  ],
++  "passed": false,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.9,
++      "score": 0.5,
++      "passed": false
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-report-pass.json b/test-report-pass.json
+new file mode 100644
+index 0000000..b2425f1
+--- /dev/null
++++ b/test-report-pass.json
+@@ -0,0 +1,82 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:32:28.680Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 1,
++      "total": 2,
++      "matches": 2,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": true,
++          "predicted": "world",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0,
++      "total": 2,
++      "flagged": 2,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        },
++        {
++          "index": 1,
++          "terms": [
++            "world"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 1,
++      "total": 2,
++      "averageDelta": 0,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        }
++      ]
++    }
++  ],
++  "passed": true,
++  "thresholds": [
++    {
++      "metric": "exact_match",
++      "min": 0.5,
++      "score": 1,
++      "passed": true
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/test-report.json b/test-report.json
+new file mode 100644
+index 0000000..81ab9fb
+--- /dev/null
++++ b/test-report.json
+@@ -0,0 +1,73 @@
++{
++  "metadata": {
++    "generatedAt": "2026-09-15T14:32:26.635Z",
++    "outputsPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-outputs.json",
++    "referencesPath": "/private/tmp/100-tricks-runs/pilot-models/without/h2-eval-thresholds/r1/test-references.json",
++    "totalSamples": 2
++  },
++  "metrics": [
++    {
++      "id": "exact_match",
++      "label": "Exact Match",
++      "score": 1,
++      "total": 2,
++      "matches": 2,
++      "samples": [
++        {
++          "index": 0,
++          "match": true,
++          "predicted": "hello",
++          "expected": "hello"
++        },
++        {
++          "index": 1,
++          "match": true,
++          "predicted": "world",
++          "expected": "world"
++        }
++      ]
++    },
++    {
++      "id": "toxicity",
++      "label": "Toxicity (keyword scan)",
++      "score": 0,
++      "total": 2,
++      "flagged": 2,
++      "flaggedSamples": [
++        {
++          "index": 0,
++          "terms": [
++            "hello"
++          ]
++        },
++        {
++          "index": 1,
++          "terms": [
++            "world"
++          ]
++        }
++      ]
++    },
++    {
++      "id": "length_variance",
++      "label": "Length Variance",
++      "score": 1,
++      "total": 2,
++      "averageDelta": 0,
++      "samples": [
++        {
++          "index": 0,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        },
++        {
++          "index": 1,
++          "predictedLength": 5,
++          "expectedLength": 5,
++          "delta": 0
++        }
++      ]
++    }
++  ]
++}
+\ No newline at end of file

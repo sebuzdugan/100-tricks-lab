@@ -1,0 +1,289 @@
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..a81914e 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -227,6 +227,11 @@ function summarizeScanResult(scan: ScanResult | null) {
+ }
+ 
+ function runScanCommand({ root = process.cwd(), ci = false, json = false, silent = false }: ScanOptions) {
++  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
++    log.error('Scan target directory does not exist.', { root });
++    process.exit(1);
++  }
++
+   const result = Scanners.scanCodebase({ root });
+ 
+   if (json) {
+@@ -641,11 +646,14 @@ async function main() {
+ 
+   program
+     .command('scan')
+-    .description('Scan the current codebase for AI/ML artefacts.')
++    .description('Scan a codebase for AI/ML artefacts.')
++    .argument('[directory]', 'Directory to scan (defaults to the current working directory)')
+     .option('--ci', 'Run in CI mode')
+     .option('--json', 'Print raw JSON results')
+-    .action((options: { ci?: boolean; json?: boolean }) => {
++    .action((directory: string | undefined, options: { ci?: boolean; json?: boolean }) => {
++      const root = directory ? path.resolve(process.cwd(), directory) : process.cwd();
+       runScanCommand({
++        root,
+         ci: Boolean(options.ci),
+         json: Boolean(options.json),
+         silent: false
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..0976bee 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -16,6 +16,10 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.ts',
+   '.jsx',
+   '.tsx',
++  '.mjs',
++  '.cjs',
++  '.mts',
++  '.cts',
+   '.r',
+   '.rmd',
+   '.java',
+@@ -47,6 +51,12 @@ export const DEFAULT_AI_LIBRARIES = [
+   'brain.js',
+   'synaptic',
+   '@huggingface',
++  // LLM SDKs
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // R packages
+   'caret',
+   'randomForest',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..3e704b7 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -1,8 +1,13 @@
++import path from 'path';
++
+ import {
+   DEFAULT_AI_FUNCTIONS,
+   DEFAULT_AI_LIBRARIES
+ } from './constants.js';
+ 
++const JS_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts']);
++const PYTHON_EXTENSIONS = new Set(['.py']);
++
+ const uniqPush = (store, key, value) => {
+   const list = store[key] || (store[key] = []);
+   if (!list.includes(value)) {
+@@ -10,12 +15,207 @@ const uniqPush = (store, key, value) => {
+   }
+ };
+ 
++const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++
++// Strips // and /* */ comments while leaving string contents (which may hold
++// import specifiers) untouched.
++function stripJsComments(source) {
++  let out = '';
++  let i = 0;
++  const n = source.length;
++  while (i < n) {
++    const c = source[i];
++    const next = source[i + 1];
++    if (c === '/' && next === '/') {
++      while (i < n && source[i] !== '\n') i++;
++      continue;
++    }
++    if (c === '/' && next === '*') {
++      i += 2;
++      while (i < n && !(source[i] === '*' && source[i + 1] === '/')) i++;
++      i = Math.min(i + 2, n);
++      continue;
++    }
++    if (c === '"' || c === "'" || c === '`') {
++      const quote = c;
++      out += c;
++      i++;
++      while (i < n && source[i] !== quote) {
++        if (source[i] === '\\' && i + 1 < n) {
++          out += source[i] + source[i + 1];
++          i += 2;
++          continue;
++        }
++        out += source[i];
++        i++;
++      }
++      if (i < n) {
++        out += source[i];
++        i++;
++      }
++      continue;
++    }
++    out += c;
++    i++;
++  }
++  return out;
++}
++
++// Strips # comments and drops docstring bodies while respecting quoted strings.
++function stripPythonComments(source) {
++  let out = '';
++  let i = 0;
++  const n = source.length;
++  while (i < n) {
++    const c = source[i];
++    if (c === '#') {
++      while (i < n && source[i] !== '\n') i++;
++      continue;
++    }
++    if (c === '"' || c === "'") {
++      const quote = c;
++      const isTriple = source[i + 1] === quote && source[i + 2] === quote;
++      if (isTriple) {
++        i += 3;
++        while (i < n && !(source[i] === quote && source[i + 1] === quote && source[i + 2] === quote)) {
++          i++;
++        }
++        i = Math.min(i + 3, n);
++        continue;
++      }
++      out += c;
++      i++;
++      while (i < n && source[i] !== quote && source[i] !== '\n') {
++        if (source[i] === '\\' && i + 1 < n) {
++          out += source[i] + source[i + 1];
++          i += 2;
++          continue;
++        }
++        out += source[i];
++        i++;
++      }
++      if (i < n && source[i] === quote) {
++        out += source[i];
++        i++;
++      }
++      continue;
++    }
++    out += c;
++    i++;
++  }
++  return out;
++}
++
++function stripGenericComments(source) {
++  return source
++    .replace(/\/\*[\s\S]*?\*\//g, '')
++    .split('\n')
++    .map((line) => {
++      const hashIdx = line.indexOf('#');
++      const slashIdx = line.indexOf('//');
++      let idx = -1;
++      if (hashIdx !== -1) idx = hashIdx;
++      if (slashIdx !== -1 && (idx === -1 || slashIdx < idx)) idx = slashIdx;
++      return idx === -1 ? line : line.slice(0, idx);
++    })
++    .join('\n');
++}
++
++// import(...) / require(...) / static `import ... from '...'` / bare
++// `import '...'` / `export ... from '...'`, including `import type` and
++// declarations that span multiple lines.
++function extractJsSpecifiers(content) {
++  const source = stripJsComments(content);
++  const specifiers = new Set();
++
++  const patterns = [
++    /\bimport\s*\(\s*['"`]([^'"`]+)['"`]/g,
++    /\brequire\s*\(\s*['"`]([^'"`]+)['"`]/g,
++    /\bimport\b[^;'"`]*?\bfrom\s*['"`]([^'"`]+)['"`]/g,
++    /\bexport\b[^;'"`]*?\bfrom\s*['"`]([^'"`]+)['"`]/g,
++    /\bimport\s*['"`]([^'"`]+)['"`]/g
++  ];
++
++  for (const pattern of patterns) {
++    let match;
++    while ((match = pattern.exec(source)) !== null) {
++      specifiers.add(match[1]);
++    }
++  }
++
++  return specifiers;
++}
++
++// `import a, b as c`, `import pkg.sub`, and `from pkg.sub import x`.
++// Relative imports (`from . import x`, `from .pkg import x`) are captured
++// with their leading dot so they never match a real library name.
++function extractPythonSpecifiers(content) {
++  const source = stripPythonComments(content);
++  const specifiers = new Set();
++
++  const importRegex = /^[ \t]*import\s+([^\n]+)/gm;
++  let match;
++  while ((match = importRegex.exec(source)) !== null) {
++    for (const part of match[1].split(',')) {
++      const name = part.trim().split(/\s+as\s+/i)[0].trim();
++      if (name) specifiers.add(name);
++    }
++  }
++
++  const fromRegex = /^[ \t]*from\s+([.\w]+)\s+import\b/gm;
++  while ((match = fromRegex.exec(source)) !== null) {
++    specifiers.add(match[1]);
++  }
++
++  return specifiers;
++}
++
++// A specifier matches a library if it *is* that library, or a submodule of
++// it (`openai/resources`, `torch.nn`) - never a different module that just
++// happens to share a prefix (`openai-mock`, `caretaker`).
++const matchesLibrary = (specifier, library) => {
++  if (specifier === library) return true;
++  if (!specifier.startsWith(library)) return false;
++  const boundary = specifier[library.length];
++  return boundary === '/' || boundary === '.';
++};
++
++const genericMatchers = new Map();
++function genericLibraryMatches(strippedContent, library) {
++  let regex = genericMatchers.get(library);
++  if (!regex) {
++    const escaped = escapeRegExp(library);
++    regex = new RegExp(
++      `(?:\\bimport\\b|\\bfrom\\b|\\brequire\\b|\\blibrary\\b)\\s*\\(?\\s*['"\`]?${escaped}(?![\\w-])`,
++      'i'
++    );
++    genericMatchers.set(library, regex);
++  }
++  return regex.test(strippedContent);
++}
++
++function collectImportView(content, filePath) {
++  const ext = path.extname(filePath).toLowerCase();
++  if (JS_EXTENSIONS.has(ext)) {
++    return { mode: 'specifiers', specifiers: extractJsSpecifiers(content) };
++  }
++  if (PYTHON_EXTENSIONS.has(ext)) {
++    return { mode: 'specifiers', specifiers: extractPythonSpecifiers(content) };
++  }
++  return { mode: 'generic', content: stripGenericComments(content) };
++}
++
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    const view = collectImportView(content, filePath);
++
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
++      const matched = view.mode === 'specifiers'
++        ? Array.from(view.specifiers).some((specifier) => matchesLibrary(specifier, library))
++        : genericLibraryMatches(view.content, library);
++
++      if (matched) {
+         uniqPush(result.aiLibraryMatches, filePath, library);
+         result.markAiFile(filePath);
+       }

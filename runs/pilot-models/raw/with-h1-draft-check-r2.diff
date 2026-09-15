@@ -1,0 +1,203 @@
+diff --git a/packages/frai-gate/src/gate/validate.ts b/packages/frai-gate/src/gate/validate.ts
+index 9862788..dff7346 100644
+--- a/packages/frai-gate/src/gate/validate.ts
++++ b/packages/frai-gate/src/gate/validate.ts
+@@ -9,14 +9,36 @@ import {
+ } from './schema.js';
+ 
+ const PLACEHOLDER = /\b(TBD|TODO|FIXME|XXX)\b|\bfill\s+(this\s+)?in\b/i;
+-/** A template field line whose value was never filled in, e.g. `- **Retention**:` */
++/** A template field line whose value was never filled in, e.g. `- **Retention**:` - used only as a
++ *  fallback when a line isn't recognized by the field parser below (see extractSignoff). */
+ const EMPTY_FIELD = /^\s*[-*]\s*\*\*[^*]+\*\*.*:\s*$/;
++const NEEDS_HUMAN_INPUT = /needs\s+human\s+input/i;
++
++/** A field label where the trailing colon sits inside the bold markers: `- **Retention:** 30 days`. */
++const FIELD_COLON_INSIDE = /^(\s*)[-*]\s*\*\*([^*:]+):\*\*\s*(.*)$/;
++/** A field label where the colon sits outside the bold markers, optionally after a parenthetical
++ *  hint: `- **Retention**: 30 days` or `- **Retention** (how long):`. The hint itself may contain
++ *  colons (e.g. "(high tier: name + date)"), so the *last* colon on the line is the real
++ *  terminator - hence the greedy `.*` rather than `[^:]*`. */
++const FIELD_COLON_OUTSIDE = /^(\s*)[-*]\s*\*\*([^*]+)\*\*.*:\s*(.*)$/;
++/** Deeper-indented lines belong to the field above (nested bullets, an indented table or paragraph)
++ *  rather than starting a new field. */
++const FIELD_INDENT_LIMIT = 2;
+ 
+ interface Section {
+   heading: string;
+   body: string;
+ }
+ 
++interface FieldEntry {
++  label: string;
++  /** Raw text of the field's own bulleted line, used in "unanswered field" messages. */
++  raw: string;
++  /** The field's full answer: the inline value plus any nested continuation lines, trimmed. */
++  text: string;
++  isEmpty: boolean;
++}
++
+ function stripComments(markdown: string): string {
+   return markdown.replace(/<!--[\s\S]*?-->/g, '');
+ }
+@@ -65,13 +87,74 @@ function splitSubsections(gateSection: string): Section[] {
+   return sections;
+ }
+ 
+-function extractTier(body: string): RiskTier | null {
+-  // When an explicit "Tier" field line exists, it is authoritative - a fallback body
+-  // search would pick up incidental mentions like "(tier below high)" in the sign-off.
+-  const fieldLine = body
+-    .split(/\r?\n/)
+-    .find((l) => /\*\*tier\*\*/i.test(l) || /^\s*[-*]\s*tier\b/i.test(l));
+-  const haystacks = fieldLine ? [fieldLine] : [body];
++function matchFieldLine(line: string): { label: string; value: string } | null {
++  const indent = line.length - line.trimStart().length;
++  if (indent >= FIELD_INDENT_LIMIT) return null;
++  const inside = line.match(FIELD_COLON_INSIDE);
++  if (inside) return { label: inside[2].trim(), value: inside[3].trim() };
++  const outside = line.match(FIELD_COLON_OUTSIDE);
++  if (outside) return { label: outside[2].trim(), value: outside[3].trim() };
++  return null;
++}
++
++/** Splits a gate subsection's body into its bulleted fields. A field's answer may continue on
++ *  indented lines below it (nested bullets, an indented table or paragraph); blank lines in
++ *  between are allowed. */
++function parseFields(body: string): FieldEntry[] {
++  const lines = body.split(/\r?\n/);
++  const fields: FieldEntry[] = [];
++  let current: { label: string; raw: string; value: string; extra: string[] } | null = null;
++
++  const flush = () => {
++    if (!current) return;
++    const hasExtra = current.extra.some((l) => l.trim() !== '');
++    fields.push({
++      label: current.label,
++      raw: current.raw,
++      text: [current.value, ...current.extra].join('\n').trim(),
++      isEmpty: current.value === '' && !hasExtra
++    });
++    current = null;
++  };
++
++  for (const line of lines) {
++    const match = matchFieldLine(line);
++    if (match) {
++      flush();
++      current = { label: match.label, raw: line, value: match.value, extra: [] };
++      continue;
++    }
++    if (!current) continue;
++    if (line.trim() === '') {
++      current.extra.push(line);
++      continue;
++    }
++    const indent = line.length - line.trimStart().length;
++    if (indent >= FIELD_INDENT_LIMIT) {
++      current.extra.push(line);
++    } else {
++      // Top-level, non-field content (e.g. a trailing "---") ends this field's answer.
++      flush();
++    }
++  }
++  flush();
++  return fields;
++}
++
++function extractTier(body: string, fields: FieldEntry[]): RiskTier | null {
++  // When an explicit "Tier" field exists, it is authoritative - a fallback body search would
++  // pick up incidental mentions like "(tier below high)" in the sign-off or justification.
++  const tierField = fields.find((f) => /^tier\b/i.test(f.label));
++  const haystacks: string[] = [];
++  if (tierField) {
++    haystacks.push(tierField.text);
++  } else {
++    // Fallback for specs that don't use the bold-field convention.
++    const fieldLine = body
++      .split(/\r?\n/)
++      .find((l) => /\*\*tier\*\*/i.test(l) || /^\s*[-*]\s*tier\b/i.test(l));
++    haystacks.push(fieldLine ?? body);
++  }
+   for (const text of haystacks) {
+     // Skip the template's enum hint "(prohibited / high / limited / minimal)".
+     const cleaned = text.replace(/\((?:[^)]*\/){2,}[^)]*\)/g, '');
+@@ -87,10 +170,21 @@ function extractTier(body: string): RiskTier | null {
+   return null;
+ }
+ 
+-function answeredText(body: string): string {
++function extractSignoff(body: string, fields: FieldEntry[]): string {
++  const signoffField = fields.find((f) => /^sign[- ]?off\b/i.test(f.label));
++  if (signoffField) return signoffField.text;
++  // Fallback for specs that don't use the bold-field convention.
++  const signoffLine = body
++    .split(/\r?\n/)
++    .find((l) => /sign[- ]?off/i.test(l) && !EMPTY_FIELD.test(l));
++  return signoffLine ? signoffLine.split(':').slice(1).join(':').trim() : '';
++}
++
++function answeredText(body: string, fields: FieldEntry[]): string {
++  const emptyRawLines = new Set(fields.filter((f) => f.isEmpty).map((f) => f.raw));
+   return body
+     .split(/\r?\n/)
+-    .filter((l) => !EMPTY_FIELD.test(l))
++    .filter((l) => !emptyRawLines.has(l))
+     .join('\n')
+     .trim();
+ }
+@@ -126,7 +220,8 @@ export function validateSpec(markdown: string): GateResult {
+     }
+ 
+     const body = section.body;
+-    const answered = answeredText(body);
++    const fields = parseFields(body);
++    const answered = answeredText(body, fields);
+ 
+     if (!answered) {
+       findings.push({
+@@ -145,12 +240,20 @@ export function validateSpec(markdown: string): GateResult {
+         source: 'validator'
+       });
+     }
+-    const emptyFields = body.split(/\r?\n/).filter((l) => EMPTY_FIELD.test(l));
+-    for (const line of emptyFields) {
++    for (const field of fields.filter((f) => f.isEmpty)) {
++      findings.push({
++        checkId: check.id,
++        severity: 'block',
++        message: `Unanswered field in "${check.title}": ${field.raw.trim()}`,
++        source: 'validator'
++      });
++    }
++    const needsHumanInput = body.split(/\r?\n/).filter((l) => NEEDS_HUMAN_INPUT.test(l));
++    for (const line of needsHumanInput) {
+       findings.push({
+         checkId: check.id,
+         severity: 'block',
+-        message: `Unanswered field in "${check.title}": ${line.trim()}`,
++        message: `"${check.title}" has an unresolved NEEDS HUMAN INPUT item: ${line.trim()}`,
+         source: 'validator'
+       });
+     }
+@@ -164,7 +267,7 @@ export function validateSpec(markdown: string): GateResult {
+     }
+ 
+     if (check.id === 'risk-tier') {
+-      tier = extractTier(body);
++      tier = extractTier(body, fields);
+       if (!tier) {
+         findings.push({
+           checkId: check.id,
+@@ -180,10 +283,7 @@ export function validateSpec(markdown: string): GateResult {
+           source: 'validator'
+         });
+       } else if (tier === 'high') {
+-        const signoffLine = body
+-          .split(/\r?\n/)
+-          .find((l) => /sign[- ]?off/i.test(l) && !EMPTY_FIELD.test(l));
+-        const signoffValue = signoffLine ? signoffLine.split(':').slice(1).join(':').trim() : '';
++        const signoffValue = extractSignoff(body, fields);
+         if (!signoffValue || /not\s+required/i.test(signoffValue)) {
+           findings.push({
+             checkId: check.id,

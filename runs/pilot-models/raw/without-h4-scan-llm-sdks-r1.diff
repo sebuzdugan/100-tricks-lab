@@ -1,0 +1,254 @@
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..b947aff 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -227,6 +227,14 @@ function summarizeScanResult(scan: ScanResult | null) {
+ }
+ 
+ function runScanCommand({ root = process.cwd(), ci = false, json = false, silent = false }: ScanOptions) {
++  // Validate root directory exists
++  if (!fs.existsSync(root)) {
++    if (!json && !silent) {
++      log.error(`Directory not found: ${root}`);
++    }
++    process.exit(2);
++  }
++
+   const result = Scanners.scanCodebase({ root });
+ 
+   if (json) {
+@@ -640,12 +648,13 @@ async function main() {
+     });
+ 
+   program
+-    .command('scan')
+-    .description('Scan the current codebase for AI/ML artefacts.')
++    .command('scan [directory]')
++    .description('Scan a codebase for AI/ML artefacts.')
+     .option('--ci', 'Run in CI mode')
+     .option('--json', 'Print raw JSON results')
+-    .action((options: { ci?: boolean; json?: boolean }) => {
++    .action((directory: string | undefined, options: { ci?: boolean; json?: boolean }) => {
+       runScanCommand({
++        root: directory ? path.resolve(process.cwd(), directory) : process.cwd(),
+         ci: Boolean(options.ci),
+         json: Boolean(options.json),
+         silent: false
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..c10e49e 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -13,7 +13,11 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.py',
+   '.ipynb',
+   '.js',
++  '.mjs',
++  '.cjs',
+   '.ts',
++  '.mts',
++  '.cts',
+   '.jsx',
+   '.tsx',
+   '.r',
+@@ -23,6 +27,12 @@ export const DEFAULT_CODE_EXTENSIONS = [
+ ];
+ 
+ export const DEFAULT_AI_LIBRARIES = [
++  // LLM SDKs
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // Python ML/AI libraries
+   'sklearn',
+   'scikit-learn',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..8d85db9 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -13,9 +13,18 @@ const uniqPush = (store, key, value) => {
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    // Remove comments from content for reliable matching
++    // Handle JS/TS style comments (// and /* */) and Python style comments (#)
++    let cleanedContent = content;
++
++    // Remove single-line comments (// and #)
++    cleanedContent = cleanedContent.replace(/(?:\/\/|#).*/g, '');
++
++    // Remove multi-line JS comments (/* ... */)
++    cleanedContent = cleanedContent.replace(/\/\*[\s\S]*?\*\//g, '');
++
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
++      if (isLibraryImported(cleanedContent, library)) {
+         uniqPush(result.aiLibraryMatches, filePath, library);
+         result.markAiFile(filePath);
+       }
+@@ -23,6 +32,48 @@ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   }
+ });
+ 
++function isLibraryImported(content, library) {
++  // Escape special regex characters in library name, but preserve @ and /
++  const escapedLibrary = library.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
++
++  // Check for scoped packages like @anthropic-ai/sdk or @langchain/...
++  if (library.startsWith('@')) {
++    // For @namespace/package, match the exact scope/package or @namespace/* variants
++    if (library.includes('/')) {
++      // Check if this is an @namespace match that should be mapped to the base @namespace
++      if (library === '@langchain' || library.startsWith('@langchain/')) {
++        const langchainPattern = /['"`]\s*@langchain(?:\/[a-zA-Z0-9\-]+)?\s*['"`]/;
++        return langchainPattern.test(content);
++      }
++
++      // For other scoped packages, match exactly (in quotes only)
++      const exactPattern = new RegExp(
++        `['"\`]\\s*${escapedLibrary}(?:\\/[a-zA-Z0-9\\-\\.]+)?\\s*['"\`]`,
++        'g'
++      );
++      return exactPattern.test(content);
++    }
++  }
++
++  // For regular packages, check both JS/TS style (in quotes) and Python style (bare imports)
++  // But Python style should be context-aware to avoid false positives
++  const jsPattern = new RegExp(`['"]\s*${escapedLibrary}(?:\\/[a-zA-Z0-9\\-\\.]+)?\s*['"\`]`, 'g');
++
++  // Check JS/TS style first
++  if (jsPattern.test(content)) {
++    return true;
++  }
++
++  // For Python style, only match if it appears in import/from contexts
++  // Patterns: "import X", "from X", "from X.Y", "import X.Y", etc.
++  const pythonPattern = new RegExp(
++    `(?:^|\\n|;)\\s*(?:import|from)\\s+${escapedLibrary}(?:\\.|\\s|$|,)`,
++    'gm'
++  );
++
++  return pythonPattern.test(content);
++}
++
+ export const createFunctionDetector = (functions = DEFAULT_AI_FUNCTIONS) => ({
+   id: 'functions',
+   analyze({ content, filePath, result }) {
+diff --git a/packages/frai-core/src/scanners/scan-codebase.test.js b/packages/frai-core/src/scanners/scan-codebase.test.js
+index 2ff26f0..d138aaa 100644
+--- a/packages/frai-core/src/scanners/scan-codebase.test.js
++++ b/packages/frai-core/src/scanners/scan-codebase.test.js
+@@ -21,6 +21,110 @@ describe('scanCodebase', () => {
+     expect(libraryMatches.some((lib) => lib.includes('tensorflow'))).toBe(true);
+   });
+ 
++  it('detects LLM SDKs (openai, anthropic, langchain)', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-llm-'));
++    try {
++      // Test openai detection
++      fs.writeFileSync(path.join(tmpDir, 'openai.js'), "import OpenAI from 'openai';");
++
++      // Test anthropic detection
++      fs.writeFileSync(path.join(tmpDir, 'anthropic.js'), "import Anthropic from '@anthropic-ai/sdk';");
++
++      // Test langchain detection
++      fs.writeFileSync(path.join(tmpDir, 'langchain.js'), "import { LLMChain } from '@langchain/core';");
++
++      // Test commonjs require
++      fs.writeFileSync(path.join(tmpDir, 'require.js'), "const openai = require('openai');");
++
++      // Test commented line (should be ignored)
++      fs.writeFileSync(path.join(tmpDir, 'commented.js'), "// import OpenAI from 'openai';\nconsole.log('not openai');");
++
++      const results = scanCodebase({ root: tmpDir, extensions: ['.js'] });
++
++      expect(results.aiFiles.length).toBe(4); // All except commented.js
++
++      const libraries = Object.values(results.aiLibraryMatches).flat();
++      expect(libraries).toContain('openai');
++      expect(libraries).toContain('@anthropic-ai/sdk');
++      expect(libraries).toContain('@langchain');
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++
++  it('detects LLM SDKs in various import styles', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-styles-'));
++    try {
++      // ES6 default import
++      fs.writeFileSync(path.join(tmpDir, 'default.js'), "import OpenAI from 'openai';");
++
++      // ES6 named import
++      fs.writeFileSync(path.join(tmpDir, 'named.js'), "import { Configuration } from 'openai';");
++
++      // ES6 namespace import
++      fs.writeFileSync(path.join(tmpDir, 'namespace.js'), "import * as openai from 'openai';");
++
++      // ES6 dynamic import
++      fs.writeFileSync(path.join(tmpDir, 'dynamic.js'), "const openai = import('openai');");
++
++      // CommonJS require
++      fs.writeFileSync(path.join(tmpDir, 'cjs.js'), "const OpenAI = require('openai');");
++
++      // Export from
++      fs.writeFileSync(path.join(tmpDir, 'export.js'), "export { OpenAI } from 'openai';");
++
++      // Multi-line import
++      fs.writeFileSync(path.join(tmpDir, 'multiline.js'), "import {\n  OpenAI,\n  Configuration\n} from 'openai';");
++
++      const results = scanCodebase({ root: tmpDir, extensions: ['.js'] });
++
++      expect(results.aiFiles.length).toBe(7);
++
++      const libraries = Object.values(results.aiLibraryMatches).flat();
++      expect(libraries.filter(l => l === 'openai').length).toBe(7);
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++
++  it('does not match similar package names', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-similar-'));
++    try {
++      // Should not match 'openai-mock' as 'openai'
++      fs.writeFileSync(path.join(tmpDir, 'mock.js'), "import mock from 'openai-mock';");
++
++      // Should not match relative imports
++      fs.writeFileSync(path.join(tmpDir, 'relative.js'), "import utils from './openai-helper';");
++
++      // Should match openai package
++      fs.writeFileSync(path.join(tmpDir, 'real.js'), "import OpenAI from 'openai';");
++
++      const results = scanCodebase({ root: tmpDir, extensions: ['.js'] });
++
++      expect(results.aiFiles.length).toBe(1); // Only real.js
++      expect(results.aiFiles[0]).toContain('real.js');
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++
++  it('scans .mjs, .cjs, .mts, .cts files', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-ext-'));
++    try {
++      fs.writeFileSync(path.join(tmpDir, 'module.mjs'), "import OpenAI from 'openai';");
++      fs.writeFileSync(path.join(tmpDir, 'common.cjs'), "const OpenAI = require('openai');");
++      fs.writeFileSync(path.join(tmpDir, 'module.mts'), "import OpenAI from 'openai';");
++      fs.writeFileSync(path.join(tmpDir, 'common.cts'), "const OpenAI = require('openai');");
++
++      const results = scanCodebase({ root: tmpDir, extensions: ['.mjs', '.cjs', '.mts', '.cts'] });
++
++      expect(results.aiFiles.length).toBe(4);
++      expect(results.totalFiles).toBe(4);
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++
+   it('supports custom detectors via createScanner', () => {
+     const detectorInvocations = [];
+     const customScanner = createScanner({

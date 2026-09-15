@@ -1,0 +1,241 @@
+diff --git a/packages/frai-gate/src/gate/validate.test.ts b/packages/frai-gate/src/gate/validate.test.ts
+index 4a7eff8..df48d39 100644
+--- a/packages/frai-gate/src/gate/validate.test.ts
++++ b/packages/frai-gate/src/gate/validate.test.ts
+@@ -187,4 +187,93 @@ describe('validateSpec', () => {
+       result.findings.some((f) => f.checkId === 'evaluation' && f.severity === 'warn')
+     ).toBe(true);
+   });
++
++  it('accepts the "Label:" bold-colon style, including for tier and sign-off', () => {
++    const result = validateSpec(
++      fullSpec({
++        tier: `### 5.1 Risk tier
++
++- **Tier:** **high**
++- **Justification:** Screens job applications automatically.
++- **Sign-off:** Ana Pop (Head of Compliance), 2026-08-01`
++      })
++    );
++    expect(result.tier).toBe('high');
++    expect(result.findings.filter((f) => f.checkId === 'risk-tier')).toEqual([]);
++  });
++
++  it('treats an empty "Label:" bold-colon field as unanswered', () => {
++    const result = validateSpec(
++      fullSpec({
++        data: `### 5.2 Data provenance & privacy
++
++- **Data sources:** internal policy docs
++- **PII involved?:** no
++- **Retention:**
++- **Used for training?:** no`
++      })
++    );
++    expect(
++      result.findings.some(
++        (f) => f.checkId === 'data-privacy' && f.message.includes('Unanswered field')
++      )
++    ).toBe(true);
++  });
++
++  it('accepts an answer given as an indented block below its field, not on the same line', () => {
++    const result = validateSpec(
++      fullSpec({
++        evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**:
++
++  | Metric | Threshold |
++  |---|---|
++  | groundedness | >= 0.85 |
++
++- **Eval dataset**: eval/policy-qa.jsonl, 300 questions
++- **Who runs it and when**: CI on every prompt change`
++      })
++    );
++    expect(result.findings.filter((f) => f.checkId === 'evaluation')).toEqual([]);
++  });
++
++  it('accepts tier and sign-off values given on an indented line below the field', () => {
++    const result = validateSpec(
++      fullSpec({
++        tier: `### 5.1 Risk tier
++
++- **Tier**:
++
++  high
++
++- **Justification**: Screens job applications automatically.
++- **Sign-off**:
++
++  Ana Pop (Head of Compliance), 2026-08-01`
++      })
++    );
++    expect(result.tier).toBe('high');
++    expect(result.findings.filter((f) => f.checkId === 'risk-tier')).toEqual([]);
++  });
++
++  it('blocks a subsection with an unresolved NEEDS HUMAN INPUT item', () => {
++    const result = validateSpec(
++      fullSpec({
++        data: `### 5.2 Data provenance & privacy
++
++- **Data sources**: internal policy docs
++- **PII involved?**: no
++- **Retention**: 30 days
++  - **NEEDS HUMAN INPUT**: what is the exact deletion mechanism?
++- **Used for training?**: no`
++      })
++    );
++    expect(result.verdict).toBe('BLOCK');
++    expect(
++      result.findings.some(
++        (f) => f.checkId === 'data-privacy' && f.message.includes('NEEDS HUMAN INPUT')
++      )
++    ).toBe(true);
++  });
+ });
+diff --git a/packages/frai-gate/src/gate/validate.ts b/packages/frai-gate/src/gate/validate.ts
+index 9862788..30773eb 100644
+--- a/packages/frai-gate/src/gate/validate.ts
++++ b/packages/frai-gate/src/gate/validate.ts
+@@ -9,8 +9,50 @@ import {
+ } from './schema.js';
+ 
+ const PLACEHOLDER = /\b(TBD|TODO|FIXME|XXX)\b|\bfill\s+(this\s+)?in\b/i;
+-/** A template field line whose value was never filled in, e.g. `- **Retention**:` */
+-const EMPTY_FIELD = /^\s*[-*]\s*\*\*[^*]+\*\*.*:\s*$/;
++const NEEDS_HUMAN_INPUT = /needs\s+human\s+input/i;
++/** A field line whose label ends before the colon, e.g. `- **Retention**:` (value, if any, follows the colon). */
++const EMPTY_FIELD_LABEL_COLON = /^\s*[-*]\s*\*\*[^*]+\*\*.*:\s*$/;
++/** A field line whose colon sits inside the bold markers, e.g. `- **Retention:**` with nothing after it. */
++const EMPTY_FIELD_COLON_IN_LABEL = /^\s*[-*]\s*\*\*[^*]+:\*\*\s*$/;
++
++function indentOf(line: string): number {
++  return line.match(/^\s*/)?.[0]?.length ?? 0;
++}
++
++/** Collects the indented continuation lines that sit below `lines[index]` (its "answer block"), stopping at the next line of equal-or-lesser indentation. Blank lines in between are kept. */
++function collectNestedBlock(lines: string[], index: number): string {
++  const indent = indentOf(lines[index]);
++  const collected: string[] = [];
++  for (let i = index + 1; i < lines.length; i += 1) {
++    const line = lines[i];
++    if (line.trim() === '') {
++      collected.push(line);
++      continue;
++    }
++    if (indentOf(line) <= indent) break;
++    collected.push(line);
++  }
++  return collected.join('\n');
++}
++
++function hasNestedContentBelow(lines: string[], index: number): boolean {
++  return collectNestedBlock(lines, index).trim() !== '';
++}
++
++/** Field lines that look unanswered on their own line, but whose value actually sits in an indented block below (nested bullets, a table, a paragraph) are not unanswered. */
++function findEmptyFieldLines(body: string): string[] {
++  const lines = body.split(/\r?\n/);
++  const empty: string[] = [];
++  for (let i = 0; i < lines.length; i += 1) {
++    const line = lines[i];
++    const isCandidate =
++      EMPTY_FIELD_LABEL_COLON.test(line) || EMPTY_FIELD_COLON_IN_LABEL.test(line);
++    if (isCandidate && !hasNestedContentBelow(lines, i)) {
++      empty.push(line);
++    }
++  }
++  return empty;
++}
+ 
+ interface Section {
+   heading: string;
+@@ -68,10 +110,20 @@ function splitSubsections(gateSection: string): Section[] {
+ function extractTier(body: string): RiskTier | null {
+   // When an explicit "Tier" field line exists, it is authoritative - a fallback body
+   // search would pick up incidental mentions like "(tier below high)" in the sign-off.
+-  const fieldLine = body
+-    .split(/\r?\n/)
+-    .find((l) => /\*\*tier\*\*/i.test(l) || /^\s*[-*]\s*tier\b/i.test(l));
+-  const haystacks = fieldLine ? [fieldLine] : [body];
++  const lines = body.split(/\r?\n/);
++  const fieldIndex = lines.findIndex(
++    (l) => /^\s*[-*]\s*\*\*tier:?\*\*/i.test(l) || /^\s*[-*]\s*tier\b/i.test(l)
++  );
++  let haystacks: string[];
++  if (fieldIndex === -1) {
++    haystacks = [body];
++  } else {
++    // The tier value may sit on the field line itself, or in an indented block below it.
++    const fieldText = hasNestedContentBelow(lines, fieldIndex)
++      ? `${lines[fieldIndex]}\n${collectNestedBlock(lines, fieldIndex)}`
++      : lines[fieldIndex];
++    haystacks = [fieldText];
++  }
+   for (const text of haystacks) {
+     // Skip the template's enum hint "(prohibited / high / limited / minimal)".
+     const cleaned = text.replace(/\((?:[^)]*\/){2,}[^)]*\)/g, '');
+@@ -88,9 +140,10 @@ function extractTier(body: string): RiskTier | null {
+ }
+ 
+ function answeredText(body: string): string {
++  const empty = new Set(findEmptyFieldLines(body));
+   return body
+     .split(/\r?\n/)
+-    .filter((l) => !EMPTY_FIELD.test(l))
++    .filter((l) => !empty.has(l))
+     .join('\n')
+     .trim();
+ }
+@@ -145,7 +198,7 @@ export function validateSpec(markdown: string): GateResult {
+         source: 'validator'
+       });
+     }
+-    const emptyFields = body.split(/\r?\n/).filter((l) => EMPTY_FIELD.test(l));
++    const emptyFields = findEmptyFieldLines(body);
+     for (const line of emptyFields) {
+       findings.push({
+         checkId: check.id,
+@@ -154,6 +207,14 @@ export function validateSpec(markdown: string): GateResult {
+         source: 'validator'
+       });
+     }
++    if (NEEDS_HUMAN_INPUT.test(body)) {
++      findings.push({
++        checkId: check.id,
++        severity: 'block',
++        message: `"${check.title}" has an unresolved "NEEDS HUMAN INPUT" item. Resolve it before this can pass.`,
++        source: 'validator'
++      });
++    }
+     if (check.expectsNumbers && !/\d/.test(answered)) {
+       findings.push({
+         checkId: check.id,
+@@ -180,10 +241,20 @@ export function validateSpec(markdown: string): GateResult {
+           source: 'validator'
+         });
+       } else if (tier === 'high') {
+-        const signoffLine = body
+-          .split(/\r?\n/)
+-          .find((l) => /sign[- ]?off/i.test(l) && !EMPTY_FIELD.test(l));
+-        const signoffValue = signoffLine ? signoffLine.split(':').slice(1).join(':').trim() : '';
++        const lines = body.split(/\r?\n/);
++        const emptyLines = new Set(findEmptyFieldLines(body));
++        let signoffIndex = lines.findIndex((l) => /^\s*[-*]\s*\*\*sign[- ]?off:?\*\*/i.test(l));
++        if (signoffIndex === -1) {
++          signoffIndex = lines.findIndex((l) => /sign[- ]?off/i.test(l) && !emptyLines.has(l));
++        }
++        let signoffValue = '';
++        if (signoffIndex !== -1) {
++          const line = lines[signoffIndex];
++          const lastColon = line.lastIndexOf(':');
++          const sameLine = lastColon === -1 ? '' : line.slice(lastColon + 1).replace(/\*/g, '').trim();
++          // The sign-off value may sit on the field line itself, or in an indented block below it.
++          signoffValue = sameLine || collectNestedBlock(lines, signoffIndex).trim();
++        }
+         if (!signoffValue || /not\s+required/i.test(signoffValue)) {
+           findings.push({
+             checkId: check.id,

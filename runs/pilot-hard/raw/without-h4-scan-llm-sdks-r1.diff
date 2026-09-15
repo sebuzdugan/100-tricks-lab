@@ -1,0 +1,754 @@
+diff --git a/packages/frai-agent/src/tools/scan-tool.ts b/packages/frai-agent/src/tools/scan-tool.ts
+index 57b2336..31f3695 100644
+--- a/packages/frai-agent/src/tools/scan-tool.ts
++++ b/packages/frai-agent/src/tools/scan-tool.ts
+@@ -21,7 +21,12 @@ export const scanRepositoryTool = new DynamicStructuredTool({
+   schema,
+   func: async ({ root }) => {
+     const cwd = resolveWorkingDirectory(root);
+-    const result = Scanners.scanCodebase({ root: cwd });
++    let result: ReturnType<typeof Scanners.scanCodebase>;
++    try {
++      result = Scanners.scanCodebase({ root: cwd });
++    } catch (error) {
++      return `Scan failed: ${error instanceof Error ? error.message : String(error)}`;
++    }
+ 
+     const aiFiles = result.aiFiles.map((file) => path.relative(cwd, file));
+     // aiLibraryMatches structure: { [filePath]: [library1, library2, ...] }
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..17b49e9 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -640,12 +640,24 @@ async function main() {
+     });
+ 
+   program
+-    .command('scan')
+-    .description('Scan the current codebase for AI/ML artefacts.')
++    .command('scan [directory]')
++    .description('Scan a directory (default: current directory) for AI/ML artefacts.')
+     .option('--ci', 'Run in CI mode')
+     .option('--json', 'Print raw JSON results')
+-    .action((options: { ci?: boolean; json?: boolean }) => {
++    .action((directory: string | undefined, options: { ci?: boolean; json?: boolean }) => {
++      const root = path.resolve(process.cwd(), directory ?? '.');
++      let stats: fs.Stats | undefined;
++      try {
++        stats = fs.statSync(root);
++      } catch {
++        stats = undefined;
++      }
++      if (!stats?.isDirectory()) {
++        log.error(stats ? `Not a directory: ${directory}` : `Directory not found: ${directory}`, { path: root });
++        process.exit(1);
++      }
+       runScanCommand({
++        root,
+         ci: Boolean(options.ci),
+         json: Boolean(options.json),
+         silent: false
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..4660670 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -16,6 +16,10 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.ts',
+   '.jsx',
+   '.tsx',
++  '.mjs',
++  '.cjs',
++  '.mts',
++  '.cts',
+   '.r',
+   '.rmd',
+   '.java',
+@@ -41,6 +45,12 @@ export const DEFAULT_AI_LIBRARIES = [
+   'fastai',
+   'opencv',
+   'cv2',
++  // LLM SDKs (Python and JavaScript)
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // JavaScript ML/AI libraries
+   '@tensorflow',
+   'ml5',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..3f19b3e 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -2,6 +2,7 @@ import {
+   DEFAULT_AI_FUNCTIONS,
+   DEFAULT_AI_LIBRARIES
+ } from './constants.js';
++import { extractImports, moduleMatchesLibrary } from './imports.js';
+ 
+ const uniqPush = (store, key, value) => {
+   const list = store[key] || (store[key] = []);
+@@ -13,9 +14,10 @@ const uniqPush = (store, key, value) => {
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    const modules = extractImports(content, filePath);
++    if (!modules.length) return;
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
++      if (modules.some((specifier) => moduleMatchesLibrary(specifier, library))) {
+         uniqPush(result.aiLibraryMatches, filePath, library);
+         result.markAiFile(filePath);
+       }
+diff --git a/packages/frai-core/src/scanners/imports.js b/packages/frai-core/src/scanners/imports.js
+new file mode 100644
+index 0000000..5e238ce
+--- /dev/null
++++ b/packages/frai-core/src/scanners/imports.js
+@@ -0,0 +1,426 @@
++import path from 'path';
++
++// Extracts the module specifiers a source file imports. Sources are tokenized
++// (strings, comments, template literals) rather than grepped, so commented-out
++// imports and import-like text inside string literals are ignored.
++
++const PYTHON_EXTENSIONS = new Set(['.py', '.pyw']);
++const R_EXTENSIONS = new Set(['.r', '.rmd']);
++const JVM_EXTENSIONS = new Set(['.java', '.scala']);
++
++const IDENTIFIER_START = /[A-Za-z_$-￿]/;
++const IDENTIFIER_PART = /[\w$-￿]/;
++
++// Tokens after which a `/` starts a regular expression literal rather than a division.
++const REGEX_PRECEDING_KEYWORDS = new Set([
++  'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void',
++  'throw', 'case', 'do', 'else', 'yield', 'await'
++]);
++
++const readQuoted = (source, start, quote) => {
++  let value = '';
++  let i = start + 1;
++  while (i < source.length) {
++    const char = source[i];
++    if (char === '\\') {
++      value += source[i + 1] ?? '';
++      i += 2;
++      continue;
++    }
++    if (char === quote) return { value, end: i + 1 };
++    // Unterminated single-line string: stop at the line break.
++    if (char === '\n') return { value, end: i };
++    value += char;
++    i += 1;
++  }
++  return { value, end: i };
++};
++
++const readIdentifier = (source, start) => {
++  let i = start + 1;
++  while (i < source.length && IDENTIFIER_PART.test(source[i])) i += 1;
++  return { value: source.slice(start, i), end: i };
++};
++
++/**
++ * Tokenizes C-family source (JavaScript, TypeScript, Java, Scala).
++ * Produces identifiers, string literals and single-character punctuators.
++ */
++export const tokenizeCLike = (source) => {
++  const tokens = [];
++  // Brace depth of each open `${` substitution, innermost last.
++  const templateStack = [];
++  let braceDepth = 0;
++  let i = 0;
++
++  const last = () => tokens[tokens.length - 1];
++
++  const regexAllowed = () => {
++    const prev = last();
++    if (!prev) return true;
++    if (prev.type === 'string' || prev.type === 'template') return false;
++    if (prev.type === 'identifier') return REGEX_PRECEDING_KEYWORDS.has(prev.value);
++    return ![')', ']', '}'].includes(prev.value);
++  };
++
++  // Reads template literal text from `start` (just after the opening backtick or
++  // closing `}` of a substitution) until the closing backtick or the next `${`.
++  const readTemplate = (start, continued) => {
++    let value = '';
++    let j = start;
++    while (j < source.length) {
++      const char = source[j];
++      if (char === '\\') {
++        value += source[j + 1] ?? '';
++        j += 2;
++        continue;
++      }
++      if (char === '`') {
++        tokens.push({ type: 'template', value, complete: !continued });
++        return j + 1;
++      }
++      if (char === '$' && source[j + 1] === '{') {
++        tokens.push({ type: 'template', value, complete: false });
++        templateStack.push(braceDepth);
++        return j + 2;
++      }
++      value += char;
++      j += 1;
++    }
++    tokens.push({ type: 'template', value, complete: false });
++    return j;
++  };
++
++  while (i < source.length) {
++    const char = source[i];
++    const next = source[i + 1];
++
++    if (/\s/.test(char)) {
++      i += 1;
++    } else if (char === '/' && next === '/') {
++      const end = source.indexOf('\n', i);
++      i = end === -1 ? source.length : end;
++    } else if (char === '/' && next === '*') {
++      const end = source.indexOf('*/', i + 2);
++      i = end === -1 ? source.length : end + 2;
++    } else if (char === '"' || char === "'") {
++      const { value, end } = readQuoted(source, i, char);
++      tokens.push({ type: 'string', value });
++      i = end;
++    } else if (char === '`') {
++      i = readTemplate(i + 1, false);
++    } else if (char === '/' && regexAllowed()) {
++      // Regular expression literal; they cannot span lines, so a missing
++      // terminator means this was a plain punctuator after all.
++      let j = i + 1;
++      let inClass = false;
++      while (j < source.length && source[j] !== '\n') {
++        if (source[j] === '\\') j += 1;
++        else if (source[j] === '[') inClass = true;
++        else if (source[j] === ']') inClass = false;
++        else if (source[j] === '/' && !inClass) break;
++        j += 1;
++      }
++      if (source[j] === '/') {
++        j += 1;
++        while (j < source.length && IDENTIFIER_PART.test(source[j])) j += 1;
++        tokens.push({ type: 'regex' });
++        i = j;
++      } else {
++        tokens.push({ type: 'punct', value: char });
++        i += 1;
++      }
++    } else if (IDENTIFIER_START.test(char)) {
++      const { value, end } = readIdentifier(source, i);
++      tokens.push({ type: 'identifier', value });
++      i = end;
++    } else if (/[0-9]/.test(char)) {
++      let j = i + 1;
++      while (j < source.length && /[\w.]/.test(source[j])) j += 1;
++      tokens.push({ type: 'number' });
++      i = j;
++    } else if (char === '{') {
++      braceDepth += 1;
++      tokens.push({ type: 'punct', value: char });
++      i += 1;
++    } else if (char === '}') {
++      if (templateStack.length && templateStack[templateStack.length - 1] === braceDepth) {
++        templateStack.pop();
++        i = readTemplate(i + 1, true);
++      } else {
++        braceDepth = Math.max(0, braceDepth - 1);
++        tokens.push({ type: 'punct', value: char });
++        i += 1;
++      }
++    } else {
++      tokens.push({ type: 'punct', value: char });
++      i += 1;
++    }
++  }
++
++  return tokens;
++};
++
++/**
++ * Tokenizes Python source. Produces identifiers, string literals, punctuators and
++ * `newline` tokens marking the end of logical lines.
++ */
++export const tokenizePython = (source) => {
++  const tokens = [];
++  let bracketDepth = 0;
++  let i = 0;
++
++  while (i < source.length) {
++    const char = source[i];
++
++    if (char === '\n') {
++      if (bracketDepth === 0) tokens.push({ type: 'newline' });
++      i += 1;
++    } else if (char === '\\' && source[i + 1] === '\n') {
++      i += 2;
++    } else if (/\s/.test(char)) {
++      i += 1;
++    } else if (char === '#') {
++      const end = source.indexOf('\n', i);
++      i = end === -1 ? source.length : end;
++    } else if (char === '"' || char === "'") {
++      const triple = source.startsWith(char.repeat(3), i);
++      if (triple) {
++        const delimiter = char.repeat(3);
++        let j = i + 3;
++        while (j < source.length && !source.startsWith(delimiter, j)) {
++          j += source[j] === '\\' ? 2 : 1;
++        }
++        tokens.push({ type: 'string', value: source.slice(i + 3, j) });
++        i = Math.min(source.length, j + 3);
++      } else {
++        const { value, end } = readQuoted(source, i, char);
++        tokens.push({ type: 'string', value });
++        i = end;
++      }
++    } else if (IDENTIFIER_START.test(char)) {
++      const { value, end } = readIdentifier(source, i);
++      tokens.push({ type: 'identifier', value });
++      i = end;
++    } else if (/[0-9]/.test(char)) {
++      let j = i + 1;
++      while (j < source.length && /[\w.]/.test(source[j])) j += 1;
++      tokens.push({ type: 'number' });
++      i = j;
++    } else {
++      if ('([{'.includes(char)) bracketDepth += 1;
++      if (')]}'.includes(char)) bracketDepth = Math.max(0, bracketDepth - 1);
++      tokens.push({ type: 'punct', value: char });
++      i += 1;
++    }
++  }
++
++  return tokens;
++};
++
++const isPunct = (token, value) => token?.type === 'punct' && token.value === value;
++const isIdentifier = (token, value) =>
++  token?.type === 'identifier' && (value === undefined || token.value === value);
++const isStaticString = (token) =>
++  token?.type === 'string' || (token?.type === 'template' && token.complete);
++
++// Reads `a.b.c` starting at `start`; `allowRelative` accepts leading dots.
++const readDottedName = (tokens, start, { allowRelative = false } = {}) => {
++  let i = start;
++  let prefix = '';
++  while (allowRelative && isPunct(tokens[i], '.')) {
++    prefix += '.';
++    i += 1;
++  }
++  if (!isIdentifier(tokens[i])) {
++    return prefix ? { name: prefix, end: i } : null;
++  }
++  const parts = [tokens[i].value];
++  i += 1;
++  while (isPunct(tokens[i], '.') && isIdentifier(tokens[i + 1])) {
++    parts.push(tokens[i + 1].value);
++    i += 2;
++  }
++  return { name: prefix + parts.join('.'), end: i };
++};
++
++export const extractJavaScriptImports = (source) => {
++  const tokens = tokenizeCLike(source);
++  const modules = [];
++
++  tokens.forEach((token, index) => {
++    if (token.type !== 'identifier') return;
++    const next = tokens[index + 1];
++    const previous = tokens[index - 1];
++    const memberAccess = isPunct(previous, '.') && !isPunct(tokens[index - 2], '.');
++
++    if (token.value === 'from' && isStaticString(next)) {
++      // `import … from '…'` and `export … from '…'`
++      modules.push(next.value);
++    } else if (token.value === 'import' && isStaticString(next) && !memberAccess) {
++      // `import '…'`
++      modules.push(next.value);
++    } else if (
++      (token.value === 'import' || token.value === 'require') &&
++      !memberAccess &&
++      isPunct(next, '(') &&
++      isStaticString(tokens[index + 2])
++    ) {
++      // `import('…')` and `require('…')`
++      modules.push(tokens[index + 2].value);
++    }
++  });
++
++  return modules;
++};
++
++export const extractJvmImports = (source) => {
++  const tokens = tokenizeCLike(source);
++  const modules = [];
++  tokens.forEach((token, index) => {
++    if (!isIdentifier(token, 'import')) return;
++    let start = index + 1;
++    if (isIdentifier(tokens[start], 'static')) start += 1;
++    const dotted = readDottedName(tokens, start);
++    if (dotted) modules.push(dotted.name);
++  });
++  return modules;
++};
++
++export const extractPythonImports = (source) => {
++  const tokens = tokenizePython(source);
++  const modules = [];
++
++  tokens.forEach((token, index) => {
++    if (token.type !== 'identifier') return;
++    if (isPunct(tokens[index - 1], '.')) return;
++
++    if (token.value === 'import') {
++      // `import a, b.c as d`; the `import` of `from … import …` is handled below.
++      if (isIdentifier(tokens[findStatementStart(tokens, index)], 'from')) return;
++      let i = index + 1;
++      while (true) {
++        const dotted = readDottedName(tokens, i);
++        if (!dotted) break;
++        i = dotted.end;
++        modules.push(dotted.name);
++        if (isIdentifier(tokens[i], 'as') && isIdentifier(tokens[i + 1])) i += 2;
++        if (!isPunct(tokens[i], ',')) break;
++        i += 1;
++      }
++    } else if (token.value === 'from') {
++      // `from pkg.sub import x, y` — `raise … from …` and `yield from …` have no `import`.
++      const dotted = readDottedName(tokens, index + 1, { allowRelative: true });
++      if (!dotted || !isIdentifier(tokens[dotted.end], 'import')) return;
++      if (dotted.name.startsWith('.')) return;
++      modules.push(dotted.name);
++
++      let i = dotted.end + 1;
++      if (isPunct(tokens[i], '(')) i += 1;
++      while (isIdentifier(tokens[i])) {
++        modules.push(`${dotted.name}.${tokens[i].value}`);
++        i += 1;
++        if (isIdentifier(tokens[i], 'as') && isIdentifier(tokens[i + 1])) i += 2;
++        if (!isPunct(tokens[i], ',')) break;
++        i += 1;
++      }
++    } else if (
++      (token.value === '__import__' || token.value === 'import_module') &&
++      isPunct(tokens[index + 1], '(') &&
++      tokens[index + 2]?.type === 'string'
++    ) {
++      modules.push(tokens[index + 2].value);
++    }
++  });
++
++  return modules;
++};
++
++function findStatementStart(tokens, index) {
++  let i = index;
++  while (i > 0 && tokens[i - 1].type !== 'newline' && !isPunct(tokens[i - 1], ';')) {
++    i -= 1;
++  }
++  return i;
++}
++
++export const extractRImports = (source) => {
++  const modules = [];
++  const pattern = /\b(?:library|require|requireNamespace)\s*\(\s*(['"]?)([A-Za-z][\w.]*)\1/g;
++  for (const rawLine of source.split('\n')) {
++    const line = stripRComment(rawLine);
++    for (const match of line.matchAll(pattern)) {
++      modules.push(match[2]);
++    }
++    for (const match of line.matchAll(/\b([A-Za-z][\w.]*):::?[A-Za-z.]/g)) {
++      modules.push(match[1]);
++    }
++  }
++  return modules;
++};
++
++function stripRComment(line) {
++  let quote = null;
++  for (let i = 0; i < line.length; i += 1) {
++    const char = line[i];
++    if (quote) {
++      if (char === '\\') i += 1;
++      else if (char === quote) quote = null;
++    } else if (char === '"' || char === "'") {
++      quote = char;
++    } else if (char === '#') {
++      return line.slice(0, i);
++    }
++  }
++  return line;
++}
++
++const notebookSource = (content) => {
++  try {
++    const notebook = JSON.parse(content);
++    if (!Array.isArray(notebook?.cells)) return null;
++    return notebook.cells
++      .filter((cell) => cell.cell_type === 'code')
++      .map((cell) => (Array.isArray(cell.source) ? cell.source.join('') : String(cell.source ?? '')))
++      // IPython magics and shell escapes are not Python syntax.
++      .map((code) => code.replace(/^\s*[!%].*$/gm, ''))
++      .join('\n');
++  } catch {
++    return null;
++  }
++};
++
++/**
++ * Returns the module specifiers imported by a file, choosing the syntax from its
++ * extension. Relative imports are dropped.
++ */
++export const extractImports = (content, filePath = '') => {
++  const ext = path.extname(filePath).toLowerCase();
++  let modules;
++
++  if (PYTHON_EXTENSIONS.has(ext)) {
++    modules = extractPythonImports(content);
++  } else if (ext === '.ipynb') {
++    modules = extractPythonImports(notebookSource(content) ?? content);
++  } else if (R_EXTENSIONS.has(ext)) {
++    modules = extractRImports(content);
++  } else if (JVM_EXTENSIONS.has(ext)) {
++    modules = extractJvmImports(content);
++  } else {
++    // JavaScript/TypeScript, and the fallback for custom extension lists.
++    modules = extractJavaScriptImports(content);
++  }
++
++  return modules
++    .map((specifier) => specifier.trim())
++    .filter((specifier) => specifier && !specifier.startsWith('.') && !specifier.startsWith('/'));
++};
++
++/**
++ * Whether `specifier` is `library` itself or one of its sub-modules
++ * (`openai/resources`, `@langchain/openai`, `torch.nn`).
++ */
++export const moduleMatchesLibrary = (specifier, library) =>
++  specifier === library ||
++  specifier.startsWith(`${library}/`) ||
++  specifier.startsWith(`${library}.`);
+diff --git a/packages/frai-core/src/scanners/index.js b/packages/frai-core/src/scanners/index.js
+index da38640..7452883 100644
+--- a/packages/frai-core/src/scanners/index.js
++++ b/packages/frai-core/src/scanners/index.js
+@@ -53,6 +53,10 @@ export function scanCodebase(options = {}) {
+     try {
+       entries = fsModule.readdirSync(dir, { withFileTypes: true });
+     } catch (error) {
++      // A missing or unreadable root must not look like a clean scan.
++      if (dir === root) {
++        throw new Error(`Cannot scan ${root}: ${error.message}`);
++      }
+       console.error(`Error scanning directory ${dir}: ${error.message}`);
+       return;
+     }
+@@ -107,8 +111,14 @@ export function createScanner(config = {}) {
+   return (overrides = {}) => scanCodebase({ ...config, ...overrides });
+ }
+ 
+-export { DEFAULT_DETECTORS } from './detectors.js';
+ export {
++  DEFAULT_DETECTORS,
++  createFunctionDetector,
++  createLibraryDetector
++} from './detectors.js';
++export {
++  DEFAULT_AI_LIBRARIES,
+   DEFAULT_CODE_EXTENSIONS,
+   DEFAULT_EXCLUDED_DIRS
+ } from './constants.js';
++export { extractImports } from './imports.js';
+diff --git a/packages/frai-core/src/scanners/library-detector.test.js b/packages/frai-core/src/scanners/library-detector.test.js
+new file mode 100644
+index 0000000..5fc172c
+--- /dev/null
++++ b/packages/frai-core/src/scanners/library-detector.test.js
+@@ -0,0 +1,182 @@
++import fs from 'fs';
++import os from 'os';
++import path from 'path';
++import { afterEach, describe, expect, it } from 'vitest';
++import { fileURLToPath } from 'url';
++
++import { createLibraryDetector } from './detectors.js';
++import { extractImports } from './imports.js';
++import { scanCodebase } from './index.js';
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++const DEMO_DIR = path.resolve(__dirname, '../../../../examples/support-triage-demo');
++
++const detect = (filePath, content, libraries) => {
++  const result = { aiLibraryMatches: {}, aiFiles: [], markAiFile: (file) => result.aiFiles.push(file) };
++  createLibraryDetector(libraries).analyze({ filePath, content, result });
++  return result.aiLibraryMatches[filePath] ?? [];
++};
++
++describe('library detector: JavaScript/TypeScript', () => {
++  it.each([
++    ["import OpenAI from 'openai';", ['openai']],
++    ['import Anthropic from "@anthropic-ai/sdk";', ['@anthropic-ai/sdk']],
++    ["import type { MessageParam } from '@anthropic-ai/sdk/resources';", ['@anthropic-ai/sdk']],
++    ["import {\n  ChatOpenAI,\n  OpenAIEmbeddings,\n} from '@langchain/openai';", ['@langchain']],
++    ["import '@langchain/core';", ['@langchain']],
++    ["export { ChatAnthropic } from '@langchain/anthropic';", ['@langchain']],
++    ["export * from 'langchain/chains';", ['langchain']],
++    ["const OpenAI = require('openai');", ['openai']],
++    ['const { OpenAI } = require ( "openai/resources" );', ['openai']],
++    ["const sdk = await import('@anthropic-ai/sdk');", ['@anthropic-ai/sdk']],
++    ['const sdk = await import(`openai`);', ['openai']],
++    ["import * as tf from '@tensorflow/tfjs';", ['@tensorflow']]
++  ])('detects %j', (content, expected) => {
++    expect(detect('/repo/src/file.mts', content)).toEqual(expected);
++  });
++
++  it.each([
++    ["import mock from 'openai-mock';"],
++    ["import { thing } from './openai';"],
++    ["import { thing } from '../langchain/index.js';"],
++    ["// import OpenAI from 'openai';"],
++    ["/*\nimport OpenAI from 'openai';\n*/"],
++    ["const help = \"run: import OpenAI from 'openai'\";"],
++    ["const url = 'https://example.com//'; // require('openai')"],
++    ["jest.mock('openai');"],
++    ["import { x } from '@langchainx/openai';"],
++    ["import sdk from '@anthropic-ai/sdk-mock';"]
++  ])('ignores %j', (content) => {
++    expect(detect('/repo/src/file.ts', content)).toEqual([]);
++  });
++
++  it('reports each library once per file', () => {
++    const content = [
++      "import OpenAI from 'openai';",
++      "import { toFile } from 'openai/uploads';",
++      "import { ChatOpenAI } from '@langchain/openai';",
++      "import { ChatAnthropic } from '@langchain/anthropic';"
++    ].join('\n');
++    expect(detect('/repo/a.ts', content)).toEqual(['openai', '@langchain']);
++  });
++
++  it('is not confused by regex literals, templates and strings containing comment markers', () => {
++    const content = [
++      "const re = /['\"]/g;",
++      'const t = `// ${value} /* not a comment`;',
++      "const s = '/* also not a comment';",
++      "import OpenAI from 'openai';"
++    ].join('\n');
++    expect(detect('/repo/a.js', content)).toEqual(['openai']);
++  });
++});
++
++describe('library detector: Python', () => {
++  it.each([
++    ['import openai', ['openai']],
++    ['import os, anthropic as ant', ['anthropic']],
++    ['import torch.nn as nn', ['torch']],
++    ['from openai import OpenAI', ['openai']],
++    ['from langchain.chains import LLMChain', ['langchain']],
++    ['from sklearn.model_selection import (\n    train_test_split,\n)', ['sklearn']],
++    ['if USE_LLM:\n    import anthropic', ['anthropic']]
++  ])('detects %j', (content, expected) => {
++    expect(detect('/repo/app.py', content)).toEqual(expected);
++  });
++
++  it.each([
++    ['import caretaker'],
++    ['import openai_mock'],
++    ['from . import openai'],
++    ['from .openai import client'],
++    ['# import openai'],
++    ['"""\nimport openai\n"""'],
++    ['raise RuntimeError("x") from openai_error']
++  ])('ignores %j', (content) => {
++    expect(detect('/repo/app.py', content)).toEqual([]);
++  });
++
++  it('reads code cells from notebooks', () => {
++    const notebook = JSON.stringify({
++      cells: [
++        { cell_type: 'markdown', source: ['import torch\n'] },
++        { cell_type: 'code', source: ['!pip install openai\n', 'from openai import OpenAI\n'] }
++      ]
++    });
++    expect(detect('/repo/nb.ipynb', notebook)).toEqual(['openai']);
++  });
++});
++
++describe('library detector: R', () => {
++  it('detects library() calls but not prefixes or comments', () => {
++    expect(detect('/repo/model.R', 'library(caret)\n# library(nnet)\nlibrary(caretEnsemble)')).toEqual([
++      'caret'
++    ]);
++  });
++});
++
++describe('createLibraryDetector', () => {
++  it('accepts custom library lists', () => {
++    const content = "import { GoogleGenerativeAI } from '@google/generative-ai';\nimport OpenAI from 'openai';";
++    expect(detect('/repo/a.ts', content, ['@google/generative-ai', 'cohere-ai'])).toEqual([
++      '@google/generative-ai'
++    ]);
++  });
++
++  it('matches `from pkg import sub` against dotted custom libraries', () => {
++    expect(detect('/repo/a.py', 'from google import generativeai as genai', ['google.generativeai'])).toEqual([
++      'google.generativeai'
++    ]);
++  });
++});
++
++describe('extractImports', () => {
++  it('drops relative specifiers', () => {
++    expect(extractImports("import a from './a';\nimport b from 'b';", 'x.js')).toEqual(['b']);
++  });
++});
++
++describe('scanCodebase with LLM applications', () => {
++  let tmpDir;
++
++  afterEach(() => {
++    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
++    tmpDir = undefined;
++  });
++
++  it('detects the OpenAI-backed support triage demo', () => {
++    const result = scanCodebase({ root: DEMO_DIR });
++    const triage = path.join(DEMO_DIR, 'src', 'triage.js');
++    expect(result.aiFiles).toContain(triage);
++    expect(result.aiLibraryMatches[triage]).toEqual(['openai']);
++  });
++
++  it('scans .mjs, .cjs, .mts and .cts files', () => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-ext-'));
++    const files = {
++      'a.mjs': "import OpenAI from 'openai';",
++      'b.cjs': "const Anthropic = require('@anthropic-ai/sdk');",
++      'c.mts': "import { ChatOpenAI } from '@langchain/openai';",
++      'd.cts': "import Anthropic = require('@anthropic-ai/sdk');"
++    };
++    for (const [name, content] of Object.entries(files)) {
++      fs.writeFileSync(path.join(tmpDir, name), content);
++    }
++
++    const result = scanCodebase({ root: tmpDir });
++
++    expect(result.totalFiles).toBe(4);
++    expect(result.aiLibraryMatches).toEqual({
++      [path.join(tmpDir, 'a.mjs')]: ['openai'],
++      [path.join(tmpDir, 'b.cjs')]: ['@anthropic-ai/sdk'],
++      [path.join(tmpDir, 'c.mts')]: ['@langchain'],
++      [path.join(tmpDir, 'd.cts')]: ['@anthropic-ai/sdk']
++    });
++  });
++
++  it('throws when the root directory does not exist', () => {
++    const missing = path.join(os.tmpdir(), 'frai-scan-does-not-exist-9f2c');
++    expect(() => scanCodebase({ root: missing })).toThrow(/Cannot scan/);
++  });
++});

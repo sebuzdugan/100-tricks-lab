@@ -38,14 +38,19 @@ ALLOWED_TOOLS = ",".join([
     "Bash(pnpm *)", "Bash(npx *)", "Bash(node *)",
     "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)",
     "Bash(ls *)", "Bash(cat *)", "Bash(mkdir *)",
+    # harmless shell glue agents chain into commands (day 1 logs: most denials were cd, echo, head, grep, find)
+    "Bash(cd *)", "Bash(echo *)", "Bash(printf *)", "Bash(head *)", "Bash(tail *)", "Bash(grep *)",
+    "Bash(find *)", "Bash(wc *)", "Bash(sort *)", "Bash(pwd)", "Bash(mktemp *)", "Bash(test *)",
 ])
 # Best-effort guard: runs happen in /private/tmp, so nothing under ~/Personal (this lab's hidden tests and
 # reference fixes, other frai checkouts) is needed. Built-in read tools are denied there; plain shell reads too.
 DENIED_TOOLS = ",".join([
     "Read(~/Personal/**)", "Edit(~/Personal/**)", "Write(~/Personal/**)",
     "Bash(cat /Users/*)", "Bash(ls /Users/*)", "Bash(cat ~*)", "Bash(ls ~*)",
+    "Bash(head /Users/*)", "Bash(tail /Users/*)", "Bash(grep * /Users/*)", "Bash(find /Users/*)", "Bash(wc /Users/*)",
+    "Bash(cd /Users/*)", "Bash(cd ~*)", "Bash(find ~*)", "Bash(grep * ~*)",
 ])
-INFRA_MARKERS = ("usage limit", "rate limit", "not logged in", "please run /login", "overloaded", "api error", "credit balance")
+INFRA_MARKERS = ("usage limit", "session limit", "weekly limit", "rate limit", "hit your", "not logged in", "please run /login", "overloaded", "api error", "credit balance")
 CSV_FIELDS = ["trick", "side", "task", "run", "passed", "grade_reason", "infra_error", "timeout",
               "duration_min", "cost_usd", "turns", "input_tokens", "output_tokens", "cache_read_tokens",
               "models", "permission_denials", "files_changed", "insertions", "deletions", "extra", "started_at"]
@@ -93,6 +98,13 @@ def apply_overlay(trick_dir: Path, side_cfg: dict, work: Path):
         if not src.is_dir():
             sys.exit(f"overlay folder missing: {src}")
         shutil.copytree(src, work, dirs_exist_ok=True)
+        # Fold the overlay into the copy's single baseline commit and move lab-base there, so graders, checkers,
+        # diffs and files_changed see only the agent's own changes (an overlay CLAUDE.md inside packages/frai-gate
+        # would otherwise fail t1's "frai-gate untouched" check). The copy still shows one commit, no history.
+        git = lambda *a: subprocess.run(["git", "-C", str(work), *a], capture_output=True, text=True, check=True)
+        git("add", "-A")
+        git("-c", "user.name=lab", "-c", "user.email=lab@localhost", "commit", "--amend", "--no-edit", "--allow-empty")
+        git("tag", "-f", "lab-base")
 
 
 def grade(task: str, work: Path):
@@ -113,7 +125,8 @@ def diffstat(work: Path):
 
 
 def agent_env(extra=None):
-    env = {k: v for k, v in os.environ.items() if not (k.startswith("CLAUDE_CODE_") or k == "CLAUDECODE")}
+    # Drop every variable a parent Claude session sets (CLAUDE*, ANTHROPIC*): inherited ones made nested runs hang.
+    env = {k: v for k, v in os.environ.items() if not (k.startswith("CLAUDE") or k.startswith("ANTHROPIC"))}
     if os.environ.get("LAB_CLAUDE_CONFIG_DIR"):
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(os.environ["LAB_CLAUDE_CONFIG_DIR"])
     env["CI"] = "true"  # keeps vitest and similar tools out of watch mode
@@ -134,12 +147,24 @@ def call_claude(cmd, work, timeout_s, env_extra=None):
     try:
         r = subprocess.run(cmd, cwd=work, env=agent_env(env_extra), capture_output=True, text=True,
                            stdin=subprocess.DEVNULL, timeout=timeout_s)
+        out, timed_out = r.stdout, False
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        r, timed_out = None, True
+    # stream-json: one event per line (every tool call and result), the last "result" event is the summary.
+    events = []
+    for line in out.splitlines():
         try:
-            return json.loads(r.stdout), False
+            events.append(json.loads(line))
         except json.JSONDecodeError:
-            return {"is_error": True, "result": (r.stdout + r.stderr)[-2000:]}, False
-    except subprocess.TimeoutExpired:
-        return {}, True
+            pass
+    result = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if result is None and not timed_out:
+        # No result event at all: Claude Code itself crashed or never started (not the agent failing the task).
+        result = {"is_error": True, "infra_crash": True, "result": (out + (r.stderr if r else ""))[-2000:]}
+    data = dict(result or {})
+    data["_events"] = events
+    return data, timed_out
 
 
 def save_diff(work: Path, dest: Path):
@@ -161,7 +186,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     prompt = build_prompt(tdir, side_cfg, task)
     turns = side_cfg.get("turns") or []
     allowed = ",".join([ALLOWED_TOOLS] + list(side_cfg.get("allowed_tools_extra") or []))
-    base_flags = ["--output-format", "json", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
+    base_flags = ["--output-format", "stream-json", "--verbose", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
                   "--allowedTools", allowed, "--disallowedTools", DENIED_TOOLS,
                   "--setting-sources", "project,local", "--strict-mcp-config"]
     if not turns:
@@ -215,7 +240,8 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             data["calls"] = len(calls)
         wall = (time.time() - t0) / 60
         text = str(data.get("result", "")).lower()
-        if data.get("is_error") and any(m in text for m in INFRA_MARKERS):
+        if data.get("is_error") and (data.get("infra_crash") or any(m in text for m in INFRA_MARKERS) or data.get("terminal_reason") == "api_error"
+                                     or str(data.get("api_error_status") or "") in ("429", "500", "502", "503", "529")):
             infra = text[:160]
         usage = data.get("usage") or {}
         row.update(duration_min=round((data.get("duration_ms") or wall * 60000) / 60000, 2),
@@ -230,11 +256,18 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
         chk = subprocess.run([str(tdir / trick["extra_check"]), str(work), side, task], capture_output=True, text=True, timeout=300)
         extra = (chk.stdout.strip().splitlines() or [""])[-1][:200]
     passed, reason = (False, "infra error, not graded") if infra else grade(task, work)
+    if timeout and not infra:  # PROTOCOL: a timeout counts as a failed run, whatever state the repo was left in
+        passed, reason = False, f"FAIL timeout after {trick.get('timeout_min', 20)} min (grader alone said: {reason})"
     row.update(passed=passed, grade_reason=reason, infra_error=infra, timeout=timeout,
                files_changed=files, insertions=ins, deletions=dels, extra=extra)
     if not dry:
         raw.parent.mkdir(parents=True, exist_ok=True)
         save_diff(work, raw.with_suffix(".diff"))
+        events = [e for c in calls for e in (c.get("_events") or [])]
+        with open(raw.with_suffix(".events.jsonl"), "w") as fh:
+            for e in events:
+                fh.write(json.dumps(e) + "\n")
+        data = {k: v for k, v in data.items() if k != "_events"}
         raw.write_text(json.dumps({"row": row, "claude": data, "cmd": cmd[:2] + ["<prompt>"] + cmd[3:]}, indent=2))
         with lock:
             new = not (out_dir / "runs.csv").exists()

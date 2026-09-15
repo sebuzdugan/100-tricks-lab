@@ -1,0 +1,466 @@
+diff --git a/docs/rai-gate-design.md b/docs/rai-gate-design.md
+index 2467d13..59bf8ff 100644
+--- a/docs/rai-gate-design.md
++++ b/docs/rai-gate-design.md
+@@ -41,8 +41,11 @@ Verdicts: **PASS** (all checks complete) / **WARN** (complete but weak answers)
+ Two layers so it is useful with or without an API key:
+ 
+ - **Deterministic layer (no key needed):** parses the spec markdown, verifies every gate
+-  subsection exists and is answered (no `TBD`/placeholder text), enforces the high-risk
+-  sign-off rule. Powers `frai-gate check` and CI.
++  subsection exists and is answered (no `TBD`/placeholder text, no unresolved
++  `NEEDS HUMAN INPUT` left by the drafter), enforces the high-risk sign-off rule. Field
++  labels may be written `**Label**: value` or `**Label:** value`, and an answer may sit on
++  indented lines below its label (nested bullets, tables, paragraphs). Powers
++  `frai-gate check` and CI.
+ - **Smart layer (Claude Agent SDK):** `query()` from `@anthropic-ai/claude-agent-sdk` with
+   read-only tools (`Read`, `Glob`, `Grep`) scoped to the repo:
+   - `frai-gate draft` - scans the codebase for AI indicators, then drafts a filled-in
+diff --git a/packages/frai-gate/src/gate/validate.formatting.test.ts b/packages/frai-gate/src/gate/validate.formatting.test.ts
+new file mode 100644
+index 0000000..e78b991
+--- /dev/null
++++ b/packages/frai-gate/src/gate/validate.formatting.test.ts
+@@ -0,0 +1,256 @@
++import { describe, expect, it } from 'vitest';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { validateSpec } from './validate.js';
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.join(here, '../../../..');
++const read = (relative: string) => fs.readFileSync(path.join(repoRoot, relative), 'utf8');
++
++const SECTIONS = {
++  tier: `### Risk tier
++
++- **Tier:** limited
++- **Justification:** Chatbot answering policy questions; no automated decisions about people.
++- **Sign-off:** not required (tier below high)`,
++  data: `### Data & privacy
++
++- **Data sources:** internal policy docs; user questions at runtime
++- **PII involved?** no
++- **Retention:** prompts kept 30 days, then hard-deleted
++- **Used for training?** no`,
++  oversight: `### Human oversight
++
++- **Automation level:** assistive
++- **Override path:** support team via admin panel
++- **Kill switch:** feature flag chat_enabled, off within 5 minutes`,
++  evaluation: `### Evaluation plan
++
++- **Metrics:** groundedness >= 0.85
++- **Eval dataset:** eval/policy-qa.jsonl, 300 questions
++- **Who runs it:** CI on every prompt change`,
++  bias: `### Bias & fairness
++
++- **Groups:** non-native English speakers
++- **Mitigations:** multilingual eval slice
++- **How tested:** disaggregated groundedness by language`,
++  monitoring: `### Monitoring & rollback
++
++- **Signals:** thumbs-down rate
++- **Degradation:** thumbs-down > 10% over 24h
++- **Rollback:** on-call flips chat_enabled`,
++  transparency: `### Transparency & incident response
++
++- **Disclosure:** "AI assistant" label in chat header
++- **Incident owner:** Dana Rivers
++- **Path:** in-chat report -> triage -> fix within 24h`
++};
++
++function spec(overrides: Partial<typeof SECTIONS> = {}): string {
++  return `# Spec\n\n## FRAI Gate\n\n${Object.values({ ...SECTIONS, ...overrides }).join('\n\n')}\n`;
++}
++
++describe('validateSpec - label styles and nested answers', () => {
++  it('passes a gate written with the colon inside the bold label', () => {
++    const result = validateSpec(spec());
++    expect(result.findings).toEqual([]);
++    expect(result.tier).toBe('limited');
++  });
++
++  it('accepts a bold tier value', () => {
++    const result = validateSpec(
++      spec({ tier: SECTIONS.tier.replace('**Tier:** limited', '**Tier:** **limited**') })
++    );
++    expect(result.findings).toEqual([]);
++    expect(result.tier).toBe('limited');
++  });
++
++  it('flags an empty field in either label style', () => {
++    const result = validateSpec(
++      spec({
++        data: `### Data & privacy
++
++- **Data sources:**
++- **Retention**:
++- **Used for training?** no`
++      })
++    );
++    const unanswered = result.findings.filter((f) => f.message.startsWith('Unanswered field'));
++    expect(unanswered.map((f) => f.message)).toEqual([
++      'Unanswered field in "Data & privacy": - **Data sources:**',
++      'Unanswered field in "Data & privacy": - **Retention**:'
++    ]);
++    expect(result.verdict).toBe('BLOCK');
++  });
++
++  it('accepts answers indented below the field: nested bullets, tables, paragraphs, blank lines', () => {
++    const result = validateSpec(
++      spec({
++        evaluation: `### Evaluation plan
++
++- **Metrics** (thresholds):
++
++  | Metric | Threshold |
++  |---|---|
++  | recall | >= 0.95 |
++
++- **Eval dataset:**
++  - path: eval/policy-qa.jsonl
++  - size: 300 questions
++- **Who runs it**:
++
++  CI runs it on every prompt change.`
++      })
++    );
++    expect(result.findings).toEqual([]);
++  });
++
++  it('still flags a field whose next line is a sibling, not nested', () => {
++    const result = validateSpec(
++      spec({
++        bias: `### Bias & fairness
++
++- **Groups:**
++
++- **Mitigations:** multilingual eval slice
++- **How tested:** disaggregated groundedness by language`
++      })
++    );
++    expect(result.findings.map((f) => f.message)).toEqual([
++      'Unanswered field in "Bias & fairness": - **Groups:**'
++    ]);
++  });
++
++  it('reads tier and sign-off values from indented lines', () => {
++    const result = validateSpec(
++      spec({
++        tier: `### Risk tier
++
++- **Tier:**
++
++  high
++- **Justification:** Screens job applications automatically.
++- **Sign-off:**
++  - Ana Pop (Head of Compliance), 2026-08-01`
++      })
++    );
++    expect(result.tier).toBe('high');
++    expect(result.findings).toEqual([]);
++  });
++
++  it('prefers the first nested line naming a tier when the explanation mentions others', () => {
++    const result = validateSpec(
++      spec({
++        tier: `### Risk tier
++
++- **Tier:**
++  - limited
++  - not high: no decisions about people; not minimal: users talk to the model
++- **Sign-off:** not required (tier below high)`
++      })
++    );
++    expect(result.tier).toBe('limited');
++  });
++
++  it('blocks high tier when the sign-off field is empty or says not required, in either style', () => {
++    for (const signoff of ['- **Sign-off:**', '- **Sign-off:** not required (tier below high)']) {
++      const result = validateSpec(
++        spec({
++          tier: `### Risk tier
++
++- **Tier:** high
++- **Justification:** Screens job applications; a human must sign off.
++${signoff}`
++        })
++      );
++      expect(result.findings.some((f) => f.message.includes('named human sign-off'))).toBe(true);
++    }
++  });
++
++  it('reads a sign-off after the template hint, even when the hint contains colons and parens', () => {
++    const result = validateSpec(
++      spec({
++        tier: `### Risk tier
++
++- **Tier** (prohibited / high / limited / minimal): high
++- **Why this tier**: screens job applications
++- **Sign-off** (high tier: name + date; otherwise "not required (tier below high)"): Ana Pop, 2026-08-01`
++      })
++    );
++    expect(result.tier).toBe('high');
++    expect(result.findings).toEqual([]);
++  });
++});
++
++describe('validateSpec - NEEDS HUMAN INPUT', () => {
++  it('blocks the check containing an unresolved marker, wherever it sits', () => {
++    const result = validateSpec(
++      spec({
++        data: `### Data & privacy
++
++- **Data sources:** runtime user questions
++- **PII involved?** no
++- **Retention:** prompts kept 30 days
++  - **NEEDS HUMAN INPUT:** confirm the provider retention setting.
++- **Used for training?** no`,
++        transparency: `${SECTIONS.transparency}
++
++NEEDS HUMAN INPUT: who owns the disclosure copy?`
++      })
++    );
++    expect(result.verdict).toBe('BLOCK');
++    expect(result.findings.map((f) => [f.checkId, f.severity])).toEqual([
++      ['data-privacy', 'block'],
++      ['transparency', 'block']
++    ]);
++    expect(result.findings[0].message).toContain('NEEDS HUMAN INPUT');
++  });
++});
++
++describe('validateSpec - real files', () => {
++  const draft = read('examples/support-triage-demo/rai-gate-draft.reference.md');
++
++  it('reports only the unresolved NEEDS HUMAN INPUT items on the reference draft', () => {
++    const result = validateSpec(draft);
++    expect(result.tier).toBe('limited');
++    expect(result.verdict).toBe('BLOCK');
++    expect(result.findings.length).toBe((draft.match(/NEEDS HUMAN INPUT/g) ?? []).length);
++    expect(result.findings.every((f) => f.message.startsWith('Unresolved NEEDS HUMAN INPUT'))).toBe(
++      true
++    );
++  });
++
++  it('passes the reference draft once every NEEDS HUMAN INPUT item is resolved', () => {
++    const resolved = draft.replace(/NEEDS HUMAN INPUT/g, 'Resolved');
++    const result = validateSpec(resolved);
++    expect(result.findings).toEqual([]);
++    expect(result.verdict).toBe('PASS');
++    expect(result.tier).toBe('limited');
++  });
++
++  it('reports exactly the same findings on the untouched template', () => {
++    const result = validateSpec(read('packages/frai-gate/assets/rai-spec-template.md'));
++    expect(result.tier).toBeNull();
++    expect(result.findings.map((f) => `${f.checkId}: ${f.message}`)).toEqual([
++      'risk-tier: "Risk tier" is present but empty.',
++      'data-privacy: "Data & privacy" is present but empty.',
++      'oversight: "Human oversight" is present but empty.',
++      'evaluation: "Evaluation plan" is present but empty.',
++      'bias: "Bias & fairness" is present but empty.',
++      'monitoring: "Monitoring & rollback" is present but empty.',
++      'transparency: Unanswered field in "Transparency & incidents": - **How users know AI is involved**:',
++      'transparency: Unanswered field in "Transparency & incidents": - **Incident owner** (a name, not "the team"):',
++      'transparency: Unanswered field in "Transparency & incidents": - **Report → fix path** (with a target response time):'
++    ]);
++  });
++
++  it.each(['examples/frai-spec-example.md', 'examples/support-triage-demo/FRAI-SPEC.md'])(
++    'still passes %s',
++    (file) => {
++      const result = validateSpec(read(file));
++      expect(result.findings).toEqual([]);
++      expect(result.verdict).toBe('PASS');
++    }
++  );
++});
+diff --git a/packages/frai-gate/src/gate/validate.ts b/packages/frai-gate/src/gate/validate.ts
+index 9862788..dc60cac 100644
+--- a/packages/frai-gate/src/gate/validate.ts
++++ b/packages/frai-gate/src/gate/validate.ts
+@@ -9,8 +9,19 @@ import {
+ } from './schema.js';
+ 
+ const PLACEHOLDER = /\b(TBD|TODO|FIXME|XXX)\b|\bfill\s+(this\s+)?in\b/i;
+-/** A template field line whose value was never filled in, e.g. `- **Retention**:` */
+-const EMPTY_FIELD = /^\s*[-*]\s*\*\*[^*]+\*\*.*:\s*$/;
++/** The marker `frai-gate draft` leaves wherever a human decision is still owed. */
++const NEEDS_HUMAN_INPUT = /\bNEEDS\s+HUMAN\s+INPUT\b/;
++/**
++ * A field line with nothing after its label, in either style:
++ * `- **Retention**:` / `- **Retention** (hint):` or `- **Retention:**`.
++ * It still counts as answered when indented content follows (see unansweredFieldLines).
++ */
++const EMPTY_FIELD = /^\s*[-*]\s*\*\*(?:[^*]+\*\*.*:|[^*]+:\*\*)\s*$/;
++/** A bold-labelled field line: captures the label and everything after it. */
++const FIELD_LINE = /^\s*[-*]\s*\*\*([^*]+)\*\*(.*)$/;
++const TIER_FIELD = /\*\*\s*(?:risk\s+)?tier\s*(?:\([^)]*\))?\s*:?\s*\*\*/i;
++const SIGNOFF_FIELD = /^\s*[-*]\s*\*\*\s*sign[- ]?off\b[^*]*\*\*/i;
++const MAX_QUOTE = 160;
+ 
+ interface Section {
+   heading: string;
+@@ -65,36 +76,104 @@ function splitSubsections(gateSection: string): Section[] {
+   return sections;
+ }
+ 
++function indentOf(line: string): number {
++  return (line.match(/^\s*/)?.[0] ?? '').replace(/\t/g, '    ').length;
++}
++
++/** Non-blank lines indented under `lines[index]` (nested bullets, tables, paragraphs), blank lines skipped. */
++function nestedLines(lines: string[], index: number): string[] {
++  const own = indentOf(lines[index]);
++  const nested: string[] = [];
++  for (let i = index + 1; i < lines.length; i += 1) {
++    if (!lines[i].trim()) continue;
++    if (indentOf(lines[i]) <= own) break;
++    nested.push(lines[i]);
++  }
++  return nested;
++}
++
++/** Field lines with no value on the line and nothing indented below them. */
++function unansweredFieldLines(lines: string[]): Set<number> {
++  const unanswered = new Set<number>();
++  lines.forEach((line, i) => {
++    if (EMPTY_FIELD.test(line) && nestedLines(lines, i).length === 0) unanswered.add(i);
++  });
++  return unanswered;
++}
++
++/** The answer of the field at `lines[index]`: text after its label (and hint), plus any nested lines. */
++function fieldValue(lines: string[], index: number): string {
++  const line = lines[index];
++  const m = line.match(FIELD_LINE);
++  let inline: string;
++  if (!m) {
++    inline = line.split(':').slice(1).join(':');
++  } else if (m[1].trim().endsWith(':')) {
++    inline = m[2]; // `- **Label:** value`
++  } else {
++    // `- **Label** (hint, may contain "a: b" or nested parens): value`
++    inline = m[2].replace(/^\s*(?:\((?:[^()]|\([^()]*\))*\))?\s*:?/, '');
++  }
++  return [inline, ...nestedLines(lines, index)].join('\n').trim();
++}
++
++function tiersIn(text: string): RiskTier[] {
++  return RISK_TIERS.filter((t) => new RegExp(`\\b${t}\\b`, 'i').test(text));
++}
++
+ function extractTier(body: string): RiskTier | null {
++  // Skip the template's enum hint "(prohibited / high / limited / minimal)".
++  const clean = (text: string) => text.replace(/\((?:[^)]*\/){2,}[^)]*\)/g, '');
++  const lines = body.split(/\r?\n/);
+   // When an explicit "Tier" field line exists, it is authoritative - a fallback body
+   // search would pick up incidental mentions like "(tier below high)" in the sign-off.
+-  const fieldLine = body
+-    .split(/\r?\n/)
+-    .find((l) => /\*\*tier\*\*/i.test(l) || /^\s*[-*]\s*tier\b/i.test(l));
+-  const haystacks = fieldLine ? [fieldLine] : [body];
+-  for (const text of haystacks) {
+-    // Skip the template's enum hint "(prohibited / high / limited / minimal)".
+-    const cleaned = text.replace(/\((?:[^)]*\/){2,}[^)]*\)/g, '');
+-    const found = RISK_TIERS.filter((t) => new RegExp(`\\b${t}\\b`, 'i').test(cleaned));
++  const fieldIndex = lines.findIndex((l) => TIER_FIELD.test(l) || /^\s*[-*]\s*tier\b/i.test(l));
++  if (fieldIndex === -1) {
++    const cleaned = clean(body);
++    const found = tiersIn(cleaned);
+     if (found.length === 1) return found[0];
+     if (found.length > 1) {
+-      // Ambiguous mention; prefer the value after a colon on the field line.
+-      const afterColon = cleaned.split(':').slice(1).join(':');
+-      const inValue = RISK_TIERS.filter((t) => new RegExp(`\\b${t}\\b`, 'i').test(afterColon));
++      const inValue = tiersIn(cleaned.split(':').slice(1).join(':'));
+       if (inValue.length === 1) return inValue[0];
+     }
++    return null;
++  }
++
++  const fieldLine = clean(lines[fieldIndex]);
++  const onLine = tiersIn(fieldLine);
++  if (onLine.length === 1) return onLine[0];
++  if (onLine.length > 1) {
++    // Ambiguous mention; prefer the value after a colon on the field line.
++    const inValue = tiersIn(fieldLine.split(':').slice(1).join(':'));
++    return inValue.length === 1 ? inValue[0] : null;
++  }
++  // No tier on the field line: the value sits on the lines indented below it.
++  const nested = nestedLines(lines, fieldIndex).map(clean);
++  const found = tiersIn(nested.join('\n'));
++  if (found.length === 1) return found[0];
++  // Ambiguous; the first nested line naming a tier wins (e.g. "limited" above "- not high because ...").
++  for (const line of nested) {
++    const inLine = tiersIn(line);
++    if (inLine.length === 1) return inLine[0];
++    if (inLine.length > 1) break;
+   }
+   return null;
+ }
+ 
+ function answeredText(body: string): string {
+-  return body
+-    .split(/\r?\n/)
+-    .filter((l) => !EMPTY_FIELD.test(l))
++  const lines = body.split(/\r?\n/);
++  const unanswered = unansweredFieldLines(lines);
++  return lines
++    .filter((_, i) => !unanswered.has(i))
+     .join('\n')
+     .trim();
+ }
+ 
++function quote(line: string): string {
++  const text = line.trim();
++  return text.length > MAX_QUOTE ? `${text.slice(0, MAX_QUOTE - 1)}…` : text;
++}
++
+ export function validateSpec(markdown: string): GateResult {
+   const findings: Finding[] = [];
+   const clean = stripComments(markdown);
+@@ -145,12 +224,20 @@ export function validateSpec(markdown: string): GateResult {
+         source: 'validator'
+       });
+     }
+-    const emptyFields = body.split(/\r?\n/).filter((l) => EMPTY_FIELD.test(l));
+-    for (const line of emptyFields) {
++    const lines = body.split(/\r?\n/);
++    for (const i of unansweredFieldLines(lines)) {
++      findings.push({
++        checkId: check.id,
++        severity: 'block',
++        message: `Unanswered field in "${check.title}": ${lines[i].trim()}`,
++        source: 'validator'
++      });
++    }
++    for (const line of lines.filter((l) => NEEDS_HUMAN_INPUT.test(l))) {
+       findings.push({
+         checkId: check.id,
+         severity: 'block',
+-        message: `Unanswered field in "${check.title}": ${line.trim()}`,
++        message: `Unresolved NEEDS HUMAN INPUT in "${check.title}": ${quote(line)}`,
+         source: 'validator'
+       });
+     }
+@@ -180,10 +267,12 @@ export function validateSpec(markdown: string): GateResult {
+           source: 'validator'
+         });
+       } else if (tier === 'high') {
+-        const signoffLine = body
+-          .split(/\r?\n/)
+-          .find((l) => /sign[- ]?off/i.test(l) && !EMPTY_FIELD.test(l));
+-        const signoffValue = signoffLine ? signoffLine.split(':').slice(1).join(':').trim() : '';
++        // Prefer the Sign-off field itself over prose that merely mentions sign-off.
++        let signoffIndex = lines.findIndex((l) => SIGNOFF_FIELD.test(l));
++        if (signoffIndex === -1) {
++          signoffIndex = lines.findIndex((l) => /sign[- ]?off/i.test(l) && !EMPTY_FIELD.test(l));
++        }
++        const signoffValue = signoffIndex === -1 ? '' : fieldValue(lines, signoffIndex);
+         if (!signoffValue || /not\s+required/i.test(signoffValue)) {
+           findings.push({
+             checkId: check.id,

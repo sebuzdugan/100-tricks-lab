@@ -1,0 +1,216 @@
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..3ed9ff7 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -227,31 +227,38 @@ function summarizeScanResult(scan: ScanResult | null) {
+ }
+ 
+ function runScanCommand({ root = process.cwd(), ci = false, json = false, silent = false }: ScanOptions) {
+-  const result = Scanners.scanCodebase({ root });
+-
+-  if (json) {
+-    console.log(JSON.stringify(result, null, 2));
+-    return result;
+-  }
++  try {
++    const result = Scanners.scanCodebase({ root });
+ 
+-  if (!silent) {
+-    log.info('Scan completed.', {
+-      totalFiles: result.totalFiles,
+-      aiFiles: result.aiFiles.length
+-    });
+-    if (result.aiFiles.length) {
+-      console.log('AI-related files:');
+-      result.aiFiles.forEach((file) => console.log(`  - ${path.relative(root, file)}`));
++    if (json) {
++      console.log(JSON.stringify(result, null, 2));
++      return result;
+     }
+-    if (!result.aiFiles.length) {
+-      log.info('No AI indicators detected in scope.');
+-    }
+-    if (ci) {
+-      log.info('CI mode: exiting after scan.');
++
++    if (!silent) {
++      log.info('Scan completed.', {
++        totalFiles: result.totalFiles,
++        aiFiles: result.aiFiles.length
++      });
++      if (result.aiFiles.length) {
++        console.log('AI-related files:');
++        result.aiFiles.forEach((file) => console.log(`  - ${path.relative(root, file)}`));
++      }
++      if (!result.aiFiles.length) {
++        log.info('No AI indicators detected in scope.');
++      }
++      if (ci) {
++        log.info('CI mode: exiting after scan.');
++      }
+     }
+-  }
+ 
+-  return result;
++    return result;
++  } catch (error) {
++    log.error('Scan failed.', {
++      error: error instanceof Error ? error.message : String(error)
++    });
++    process.exit(1);
++  }
+ }
+ 
+ type FetchLike = (input: unknown, init?: unknown) => Promise<unknown>;
+@@ -640,12 +647,13 @@ async function main() {
+     });
+ 
+   program
+-    .command('scan')
+-    .description('Scan the current codebase for AI/ML artefacts.')
++    .command('scan [directory]')
++    .description('Scan a codebase for AI/ML artefacts.')
+     .option('--ci', 'Run in CI mode')
+     .option('--json', 'Print raw JSON results')
+-    .action((options: { ci?: boolean; json?: boolean }) => {
++    .action((directory: string | undefined, options: { ci?: boolean; json?: boolean }) => {
+       runScanCommand({
++        root: directory ? path.resolve(directory) : process.cwd(),
+         ci: Boolean(options.ci),
+         json: Boolean(options.json),
+         silent: false
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..0976bee 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -16,6 +16,10 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.ts',
+   '.jsx',
+   '.tsx',
++  '.mjs',
++  '.cjs',
++  '.mts',
++  '.cts',
+   '.r',
+   '.rmd',
+   '.java',
+@@ -47,6 +51,12 @@ export const DEFAULT_AI_LIBRARIES = [
+   'brain.js',
+   'synaptic',
+   '@huggingface',
++  // LLM SDKs
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // R packages
+   'caret',
+   'randomForest',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..4b1298b 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -10,13 +10,84 @@ const uniqPush = (store, key, value) => {
+   }
+ };
+ 
++const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++
++const removeComments = (code) => {
++  return code
++    .split('\n')
++    .map((line) => {
++      const hashIndex = line.indexOf('#');
++      const slashIndex = line.indexOf('//');
++      if (hashIndex === -1 && slashIndex === -1) return line;
++      const minIndex = Math.min(
++        hashIndex === -1 ? Infinity : hashIndex,
++        slashIndex === -1 ? Infinity : slashIndex
++      );
++      return minIndex === Infinity ? line : line.substring(0, minIndex);
++    })
++    .join('\n');
++};
++
++const findJSImports = (code, library) => {
++  const cleaned = removeComments(code);
++  const libraryEscaped = escapeRegex(library);
++  const patterns = [
++    new RegExp(`import\\s+(?:type\\s+)?(?:(?:\\{[^}]*\\}|\\*\\s+as\\s+\\w+|[\\w$]+)\\s+from\\s+)?['\`]${libraryEscaped}(?:/[^'"\`]+)?['\`]`),
++    new RegExp(`import\\s+['\`]${libraryEscaped}(?:/[^'"\`]+)?['\`]`),
++    new RegExp(`require\\s*\\(\\s*['\`]${libraryEscaped}(?:/[^'"\`]+)?['\`]\\s*\\)`),
++    new RegExp(`import\\s*\\(\\s*['\`]${libraryEscaped}(?:/[^'"\`]+)?['\`]\\s*\\)`),
++    new RegExp(`export\\s+(?:(?:\\{[^}]*\\}|\\*|type\\s+[^}]+)\\s+from\\s+|[\\w$]+\\s+from\\s+)['\`]${libraryEscaped}(?:/[^'"\`]+)?['\`]`),
++  ];
++  for (const pattern of patterns) {
++    if (pattern.test(cleaned)) return true;
++  }
++  return false;
++};
++
++const findPythonImports = (code, library) => {
++  const cleaned = removeComments(code);
++  const libraryEscaped = escapeRegex(library);
++  const patterns = [
++    new RegExp(`\\bimport\\s+${libraryEscaped}(?:\\s*,|\\s|$)`),
++    new RegExp(`\\bimport\\s+${libraryEscaped}\\s*as\\s+\\w+`),
++    new RegExp(`\\bimport\\s+${libraryEscaped}\\.\\w+`),
++    new RegExp(`\\bfrom\\s+${libraryEscaped}(?:\\.\\w+)*\\s+import\\s+`),
++  ];
++  for (const pattern of patterns) {
++    if (pattern.test(cleaned)) return true;
++  }
++  return false;
++};
++
++const normalizeLibraryName = (library, matchedName) => {
++  if (library === '@langchain' && matchedName.startsWith('@langchain/')) {
++    return '@langchain';
++  }
++  return library;
++};
++
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    const fileName = filePath.split('/').pop().toLowerCase();
++    const isPython = fileName.endsWith('.py') || fileName.endsWith('.ipynb');
++
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
+-        uniqPush(result.aiLibraryMatches, filePath, library);
++      let matched = false;
++      if (isPython) {
++        matched = findPythonImports(content, library);
++      } else {
++        matched = findJSImports(content, library);
++        if (!matched && library === '@langchain') {
++          matched = findJSImports(content, '@langchain/');
++        }
++      }
++
++      if (matched) {
++        const normalizedLib = library === '@langchain' && content.includes('@langchain/')
++          ? '@langchain'
++          : library;
++        uniqPush(result.aiLibraryMatches, filePath, normalizedLib);
+         result.markAiFile(filePath);
+       }
+     }
+diff --git a/packages/frai-core/src/scanners/index.js b/packages/frai-core/src/scanners/index.js
+index da38640..590767d 100644
+--- a/packages/frai-core/src/scanners/index.js
++++ b/packages/frai-core/src/scanners/index.js
+@@ -46,6 +46,10 @@ export function scanCodebase(options = {}) {
+     fs: fsModule
+   } = config;
+ 
++  if (!fsModule.existsSync(root)) {
++    throw new Error(`Directory not found: ${root}`);
++  }
++
+   const result = createResult();
+ 
+   function scanDirectory(dir) {

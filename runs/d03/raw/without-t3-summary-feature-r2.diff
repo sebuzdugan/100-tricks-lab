@@ -1,0 +1,162 @@
+diff --git a/packages/frai-gate/src/cli.ts b/packages/frai-gate/src/cli.ts
+index 1765ae1..4e5ae0b 100644
+--- a/packages/frai-gate/src/cli.ts
++++ b/packages/frai-gate/src/cli.ts
+@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { validateSpec } from './gate/validate.js';
+-import { renderJson, renderText } from './gate/report.js';
++import { renderJson, renderText, renderSummary } from './gate/report.js';
+ import { verdictFrom } from './gate/schema.js';
+ import { draftGateSection, smartReview } from './pipeline/agent.js';
+ 
+@@ -35,6 +35,7 @@ Usage:
+   frai-gate check <spec.md> [options]    Validate the spec's Responsible AI Gate
+       --smart                            Add an AI quality review of the gate answers (Claude Agent SDK)
+       --json                             Machine-readable output
++      --summary                          Print only the summary line (e.g., "PASS 7/7" or "BLOCK 5/7: evaluation, transparency")
+   frai-gate draft [--out <file>] [--print]
+                                          Scan this repo with a read-only agent and draft a filled-in
+                                          gate section grounded in the code (default out: rai-gate-draft.md)
+@@ -104,7 +105,7 @@ async function cmdInit(args: Args): Promise<number> {
+ async function cmdCheck(args: Args): Promise<number> {
+   const specPath = args.positional[0];
+   if (!specPath) {
+-    console.error('Usage: frai-gate check <spec.md> [--smart] [--json]');
++    console.error('Usage: frai-gate check <spec.md> [--smart] [--json] [--summary]');
+     return 2;
+   }
+   const markdown = await fs.readFile(path.resolve(process.cwd(), specPath), 'utf8');
+@@ -118,7 +119,13 @@ async function cmdCheck(args: Args): Promise<number> {
+     console.error('Skipping smart review: no gate section to review.');
+   }
+ 
+-  console.log(args.flags.has('json') ? renderJson(result, specPath) : renderText(result, specPath));
++  if (args.flags.has('json')) {
++    console.log(renderJson(result, specPath));
++  } else if (args.flags.has('summary')) {
++    console.log(renderSummary(result));
++  } else {
++    console.log(renderText(result, specPath));
++  }
+   return result.verdict === 'BLOCK' ? 1 : 0;
+ }
+ 
+diff --git a/packages/frai-gate/src/gate/report.ts b/packages/frai-gate/src/gate/report.ts
+index d83a05a..42ed18c 100644
+--- a/packages/frai-gate/src/gate/report.ts
++++ b/packages/frai-gate/src/gate/report.ts
+@@ -1,4 +1,4 @@
+-import { Finding, GateResult } from './schema.js';
++import { Finding, GateResult, GATE_CHECKS } from './schema.js';
+ 
+ const VERDICT_ICON: Record<GateResult['verdict'], string> = {
+   PASS: '✅',
+@@ -44,3 +44,27 @@ export function renderJson(result: GateResult, specPath: string): string {
+     2
+   );
+ }
++
++export function renderSummary(result: GateResult): string {
++  const blockFindings = result.findings.filter((f) => f.severity === 'block');
++  const structureBlocked = blockFindings.some((f) => f.checkId === 'structure');
++
++  if (structureBlocked) {
++    return 'BLOCK 0/7: structure';
++  }
++
++  const blockByCheckId = new Set(blockFindings.map((f) => f.checkId));
++  const answeredCount = GATE_CHECKS.filter((check) => !blockByCheckId.has(check.id)).length;
++  const total = GATE_CHECKS.length;
++
++  let summary = `${result.verdict} ${answeredCount}/${total}`;
++
++  if (blockByCheckId.size > 0) {
++    const blockedIds = GATE_CHECKS.filter((check) => blockByCheckId.has(check.id))
++      .map((check) => check.id)
++      .join(', ');
++    summary += `: ${blockedIds}`;
++  }
++
++  return summary;
++}
+diff --git a/packages/frai-gate/src/gate/validate.test.ts b/packages/frai-gate/src/gate/validate.test.ts
+index 4a7eff8..b497281 100644
+--- a/packages/frai-gate/src/gate/validate.test.ts
++++ b/packages/frai-gate/src/gate/validate.test.ts
+@@ -3,6 +3,7 @@ import fs from 'node:fs';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { validateSpec } from './validate.js';
++import { renderSummary } from './report.js';
+ 
+ const here = path.dirname(fileURLToPath(import.meta.url));
+ 
+@@ -188,3 +189,55 @@ describe('validateSpec', () => {
+     ).toBe(true);
+   });
+ });
++
++describe('renderSummary', () => {
++  it('returns PASS 7/7 for a fully answered gate', () => {
++    const result = validateSpec(fullSpec());
++    expect(renderSummary(result)).toBe('PASS 7/7');
++  });
++
++  it('returns BLOCK 0/7: structure when gate section is missing', () => {
++    const result = validateSpec('# Spec\n\n## Objective\n\nBuild a thing.');
++    expect(renderSummary(result)).toBe('BLOCK 0/7: structure');
++  });
++
++  it('returns BLOCK and lists blocked check ids in GATE_CHECKS order', () => {
++    const result = validateSpec(
++      fullSpec({
++        evaluation: '',
++        transparency: ''
++      })
++    );
++    const summary = renderSummary(result);
++    expect(summary).toMatch(/^BLOCK 5\/7:/);
++    expect(summary).toContain('evaluation');
++    expect(summary).toContain('transparency');
++    // Check order: evaluation comes before transparency in GATE_CHECKS
++    expect(summary.indexOf('evaluation') < summary.indexOf('transparency')).toBe(true);
++  });
++
++  it('returns WARN with answered count when there are warnings', () => {
++    const result = validateSpec(
++      fullSpec({
++        evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: we will check answers look good
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release`
++      })
++    );
++    expect(result.verdict).toBe('WARN');
++    expect(renderSummary(result)).toBe('WARN 7/7');
++  });
++
++  it('includes each blocked check id only once', () => {
++    const result = validateSpec(
++      fullSpec({
++        data: ''
++      })
++    );
++    const summary = renderSummary(result);
++    const dataMatches = summary.match(/data-privacy/g) || [];
++    expect(dataMatches).toHaveLength(1);
++  });
++});
+diff --git a/packages/frai-gate/src/index.ts b/packages/frai-gate/src/index.ts
+index 91b6147..dfa7516 100644
+--- a/packages/frai-gate/src/index.ts
++++ b/packages/frai-gate/src/index.ts
+@@ -1,5 +1,5 @@
+ export { validateSpec, extractGateSection } from './gate/validate.js';
+-export { renderText, renderJson } from './gate/report.js';
++export { renderText, renderJson, renderSummary } from './gate/report.js';
+ export { draftGateSection, smartReview } from './pipeline/agent.js';
+ export {
+   GATE_CHECKS,

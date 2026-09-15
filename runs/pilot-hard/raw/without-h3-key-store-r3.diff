@@ -1,0 +1,323 @@
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..ff4225a 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -601,6 +601,9 @@ async function main() {
+     .name('frai')
+     .description('Responsible AI toolkit for documentation, scanning, evaluation, and governance.')
+     .version(pkg.version ?? '0.0.0')
++    // Root options are only parsed before a subcommand, so `frai setup --key …` reaches `setup`
++    // instead of being swallowed by the legacy root flags of the same name.
++    .enablePositionalOptions()
+     .option('--scan', 'Run code scanning before documentation generation')
+     .option('--ci', 'Run in CI mode (scan + exit if no AI indicators)')
+     .option('--setup', 'Shortcut to open API key setup flow')
+diff --git a/packages/frai-core/src/config/key-store.js b/packages/frai-core/src/config/key-store.js
+index 3c07391..bb3fb30 100644
+--- a/packages/frai-core/src/config/key-store.js
++++ b/packages/frai-core/src/config/key-store.js
+@@ -2,6 +2,11 @@ import fs from 'fs';
+ 
+ import { resolveGlobalConfigDir, resolveGlobalConfigPath, resolveLocalEnvPath } from './paths.js';
+ 
++const API_KEY_NAME = 'OPENAI_API_KEY';
++
++// Matches `[export ]OPENAI_API_KEY=<rest>`; commented-out lines never match.
++const ENV_DEFINITION_PATTERN = new RegExp(`^(\\s*(?:export\\s+)?${API_KEY_NAME}\\s*=[ \\t]*)(.*)$`);
++
+ const ensureDir = (dirPath) => {
+   if (!fs.existsSync(dirPath)) {
+     fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+@@ -9,30 +14,121 @@ const ensureDir = (dirPath) => {
+ };
+ 
+ const sanitizeValue = (value) => {
+-  if (!value) return null;
+-  return value.trim().replace(/^['"]|['"]$/g, '');
++  if (typeof value !== 'string') return null;
++  const sanitized = value.trim().replace(/^['"]|['"]$/g, '').trim();
++  return sanitized || null;
++};
++
++const assertValidKey = (key) => {
++  if (!key) throw new Error('API key is required');
++  if (/[\r\n]/.test(key)) throw new Error('API key must not contain line breaks');
++};
++
++/**
++ * Splits the raw text after `=` into the value and the surrounding bytes, so a
++ * definition can be rewritten without touching its quotes or trailing comment.
++ */
++const parseEnvValue = (raw) => {
++  const quote = raw[0];
++  if (quote === '"' || quote === "'") {
++    const body = quote === '"' ? /^"((?:\\.|[^"\\])*)"/.exec(raw) : /^'([^']*)'/.exec(raw);
++    if (body) {
++      const suffix = raw.slice(body[0].length);
++      if (/^\s*(#.*)?$/.test(suffix)) {
++        const value = quote === '"' ? body[1].replace(/\\(["\\])/g, '$1') : body[1];
++        return { value, quote, suffix };
++      }
++    }
++  }
++
++  const commentStart = raw.search(/(^|\s)#/);
++  const valuePart = commentStart === -1 ? raw : raw.slice(0, commentStart);
++  const value = valuePart.trimEnd();
++  return { value, quote: '', suffix: raw.slice(value.length) };
++};
++
++const splitLines = (content) => {
++  const lines = content.split('\n');
++  return lines.map((line, index) => {
++    const hasCarriageReturn = line.endsWith('\r') && index < lines.length - 1;
++    return {
++      text: hasCarriageReturn ? line.slice(0, -1) : line,
++      eol: index < lines.length - 1 ? (hasCarriageReturn ? '\r\n' : '\n') : ''
++    };
++  });
++};
++
++const findLastDefinition = (lines) => {
++  for (let index = lines.length - 1; index >= 0; index -= 1) {
++    const match = ENV_DEFINITION_PATTERN.exec(lines[index].text);
++    if (match) {
++      return { index, prefix: match[1], ...parseEnvValue(match[2]) };
++    }
++  }
++  return null;
+ };
+ 
+-export const hasLocalApiKey = (cwd = process.cwd()) => fs.existsSync(resolveLocalEnvPath(cwd));
++const formatEnvValue = (key, preferredQuote) => {
++  const needsDoubleQuotes =
++    (preferredQuote === '' && /^['"]|\s|#/.test(key)) || (preferredQuote === "'" && key.includes("'"));
++  const quote = needsDoubleQuotes ? '"' : preferredQuote;
++  if (quote === '"') return `"${key.replace(/(["\\])/g, '\\$1')}"`;
++  if (quote === "'") return `'${key}'`;
++  return key;
++};
++
++const readJsonConfig = (configPath) => {
++  const content = fs.readFileSync(configPath, 'utf8');
++  let parsed;
++  try {
++    parsed = JSON.parse(content);
++  } catch (error) {
++    throw new Error(`Global config at ${configPath} is not valid JSON: ${error.message}`);
++  }
++  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
++    throw new Error(`Global config at ${configPath} must contain a JSON object`);
++  }
++  return parsed;
++};
++
++export const hasLocalApiKey = (cwd = process.cwd()) => Boolean(getLocalApiKey(cwd));
+ 
+ export const getLocalApiKey = (cwd = process.cwd()) => {
+   const envPath = resolveLocalEnvPath(cwd);
+   if (!fs.existsSync(envPath)) return null;
+   const content = fs.readFileSync(envPath, 'utf8');
+-  const match = content.match(/^\s*OPENAI_API_KEY\s*=\s*(.+)\s*$/m);
+-  return match ? sanitizeValue(match[1]) : null;
++  const definition = findLastDefinition(splitLines(content));
++  if (!definition) return null;
++  return definition.value.trim() || null;
+ };
+ 
+ export const setLocalApiKey = (key, cwd = process.cwd()) => {
+-  if (!key) throw new Error('API key is required');
++  assertValidKey(key);
+   const envPath = resolveLocalEnvPath(cwd);
+-  const content = `OPENAI_API_KEY=${key}\n`;
+-  fs.writeFileSync(envPath, content, { encoding: 'utf8', mode: 0o600 });
++  const content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
++  const lines = splitLines(content);
++  const definition = findLastDefinition(lines);
++
++  let nextContent;
++  if (definition) {
++    const line = lines[definition.index];
++    const value = formatEnvValue(key, definition.quote);
++    // An unquoted value needs whitespace before its comment, e.g. `OPENAI_API_KEY=# todo`.
++    const separator = definition.quote === '' && /^#/.test(definition.suffix) ? ' ' : '';
++    line.text = `${definition.prefix}${value}${separator}${definition.suffix}`;
++    nextContent = lines.map(({ text, eol }) => `${text}${eol}`).join('');
++  } else {
++    const eol = content.includes('\r\n') ? '\r\n' : '\n';
++    const separator = content && !content.endsWith('\n') ? eol : '';
++    nextContent = `${content}${separator}${API_KEY_NAME}=${formatEnvValue(key, '')}${eol}`;
++  }
++
++  fs.writeFileSync(envPath, nextContent, { encoding: 'utf8', mode: 0o600 });
+   return envPath;
+ };
+ 
+ export const hasGlobalApiKey = (homeDir = process.env.HOME || process.env.USERPROFILE) =>
+-  fs.existsSync(resolveGlobalConfigPath(homeDir));
++  Boolean(getGlobalApiKey(homeDir));
+ 
+ export const getGlobalApiKey = (homeDir = process.env.HOME || process.env.USERPROFILE) => {
+   const configPath = resolveGlobalConfigPath(homeDir);
+@@ -40,18 +136,18 @@ export const getGlobalApiKey = (homeDir = process.env.HOME || process.env.USERPR
+   const content = fs.readFileSync(configPath, 'utf8');
+   try {
+     const parsed = JSON.parse(content);
+-    return sanitizeValue(parsed.OPENAI_API_KEY);
++    return sanitizeValue(parsed?.[API_KEY_NAME]);
+   } catch (error) {
+     return null;
+   }
+ };
+ 
+ export const setGlobalApiKey = (key, homeDir = process.env.HOME || process.env.USERPROFILE) => {
+-  if (!key) throw new Error('API key is required');
+-  const configDir = resolveGlobalConfigDir(homeDir);
+-  ensureDir(configDir);
++  assertValidKey(key);
+   const configPath = resolveGlobalConfigPath(homeDir);
+-  const payload = JSON.stringify({ OPENAI_API_KEY: key }, null, 2);
++  const existing = fs.existsSync(configPath) ? readJsonConfig(configPath) : {};
++  ensureDir(resolveGlobalConfigDir(homeDir));
++  const payload = JSON.stringify({ ...existing, [API_KEY_NAME]: key }, null, 2);
+   fs.writeFileSync(configPath, payload, { encoding: 'utf8', mode: 0o600 });
+   return configPath;
+ };
+diff --git a/packages/frai-core/src/config/key-store.test.js b/packages/frai-core/src/config/key-store.test.js
+index d75d8c2..2763435 100644
+--- a/packages/frai-core/src/config/key-store.test.js
++++ b/packages/frai-core/src/config/key-store.test.js
+@@ -54,4 +54,133 @@ describe('config key store', () => {
+     const content = fs.readFileSync(configPath, 'utf8');
+     expect(JSON.parse(content).OPENAI_API_KEY).toBe('global-key');
+   });
++
++  const writeEnv = (content) => fs.writeFileSync(resolveLocalEnvPath(tmpCwd), content, 'utf8');
++  const readEnv = () => fs.readFileSync(resolveLocalEnvPath(tmpCwd), 'utf8');
++
++  describe('local .env parsing', () => {
++    it.each([
++      ['OPENAI_API_KEY=sk-plain', 'sk-plain'],
++      ['export OPENAI_API_KEY="sk-abc" # rotated', 'sk-abc'],
++      ["OPENAI_API_KEY='sk-single'#note", 'sk-single'],
++      ['  OPENAI_API_KEY = sk-spaced   # comment', 'sk-spaced'],
++      ['OPENAI_API_KEY=sk-hash#inside', 'sk-hash#inside'],
++      ['OPENAI_API_KEY=sk-crlf\r\nOTHER=1\r\n', 'sk-crlf'],
++      ['OPENAI_API_KEY=sk-old\nOPENAI_API_KEY=sk-new\n', 'sk-new']
++    ])('reads %j', (content, expected) => {
++      writeEnv(content);
++      expect(getLocalApiKey(tmpCwd)).toBe(expected);
++      expect(hasLocalApiKey(tmpCwd)).toBe(true);
++    });
++
++    it.each([
++      ['OTHER=1\n'],
++      ['# OPENAI_API_KEY=sk-commented\n'],
++      ['OPENAI_API_KEY=\n'],
++      ['OPENAI_API_KEY=""\n'],
++      ['OPENAI_API_KEY= # not set\n'],
++      ['OPENAI_API_KEY=sk-old\nOPENAI_API_KEY=\n'],
++      ['OPENAI_API_KEY_BACKUP=sk-other\n']
++    ])('treats %j as unconfigured', (content) => {
++      writeEnv(content);
++      expect(getLocalApiKey(tmpCwd)).toBeNull();
++      expect(hasLocalApiKey(tmpCwd)).toBe(false);
++    });
++  });
++
++  describe('setLocalApiKey', () => {
++    it('appends the key and preserves every other line', () => {
++      const original = '# app settings\n\nDATABASE_URL=postgres://x\n# OPENAI_API_KEY=sk-commented\nDEBUG=true\n';
++      writeEnv(original);
++
++      setLocalApiKey('sk-new', tmpCwd);
++
++      expect(readEnv()).toBe(`${original}OPENAI_API_KEY=sk-new\n`);
++      expect(getLocalApiKey(tmpCwd)).toBe('sk-new');
++    });
++
++    it('adds a line break before appending when the file lacks a trailing newline', () => {
++      writeEnv('A=1');
++      setLocalApiKey('sk-new', tmpCwd);
++      expect(readEnv()).toBe('A=1\nOPENAI_API_KEY=sk-new\n');
++    });
++
++    it('keeps CRLF line endings', () => {
++      writeEnv('A=1\r\nB=2\r\n');
++      setLocalApiKey('sk-new', tmpCwd);
++      expect(readEnv()).toBe('A=1\r\nB=2\r\nOPENAI_API_KEY=sk-new\r\n');
++    });
++
++    it('updates an existing definition in place, keeping export, quotes and comment', () => {
++      writeEnv('A=1\nexport OPENAI_API_KEY="sk-old" # rotated\r\nB=2');
++
++      setLocalApiKey('sk-new', tmpCwd);
++
++      expect(readEnv()).toBe('A=1\nexport OPENAI_API_KEY="sk-new" # rotated\r\nB=2');
++      expect(getLocalApiKey(tmpCwd)).toBe('sk-new');
++    });
++
++    it('updates only the last of duplicate definitions', () => {
++      writeEnv('OPENAI_API_KEY=sk-first\nA=1\nOPENAI_API_KEY=sk-second # current\n');
++
++      setLocalApiKey('sk-new', tmpCwd);
++
++      expect(readEnv()).toBe('OPENAI_API_KEY=sk-first\nA=1\nOPENAI_API_KEY=sk-new # current\n');
++    });
++
++    it('keeps an unquoted value separated from a comment that directly follows `=`', () => {
++      writeEnv('OPENAI_API_KEY=# fill me in\n');
++      setLocalApiKey('sk-new', tmpCwd);
++      expect(readEnv()).toBe('OPENAI_API_KEY=sk-new # fill me in\n');
++      expect(getLocalApiKey(tmpCwd)).toBe('sk-new');
++    });
++
++    it('creates the file with owner-only permissions', () => {
++      setLocalApiKey('sk-new', tmpCwd);
++      expect(readEnv()).toBe('OPENAI_API_KEY=sk-new\n');
++      if (process.platform !== 'win32') {
++        expect(fs.statSync(resolveLocalEnvPath(tmpCwd)).mode & 0o777).toBe(0o600);
++      }
++    });
++
++    it('rejects keys that would break the file', () => {
++      writeEnv('A=1\n');
++      expect(() => setLocalApiKey('sk-a\nB=2', tmpCwd)).toThrow();
++      expect(readEnv()).toBe('A=1\n');
++    });
++  });
++
++  describe('global config', () => {
++    const writeConfig = (content) => {
++      fs.mkdirSync(path.dirname(resolveGlobalConfigPath(tmpHome)), { recursive: true });
++      fs.writeFileSync(resolveGlobalConfigPath(tmpHome), content, 'utf8');
++    };
++
++    it('preserves other fields when storing the key', () => {
++      writeConfig(JSON.stringify({ theme: 'dark', OPENAI_API_KEY: 'sk-old', nested: { a: 1 } }));
++
++      setGlobalApiKey('sk-new', tmpHome);
++
++      expect(JSON.parse(fs.readFileSync(resolveGlobalConfigPath(tmpHome), 'utf8'))).toEqual({
++        theme: 'dark',
++        OPENAI_API_KEY: 'sk-new',
++        nested: { a: 1 }
++      });
++    });
++
++    it('fails without touching a config that is not valid JSON', () => {
++      writeConfig('{ theme: dark');
++      expect(() => setGlobalApiKey('sk-new', tmpHome)).toThrow(/not valid JSON/);
++      expect(fs.readFileSync(resolveGlobalConfigPath(tmpHome), 'utf8')).toBe('{ theme: dark');
++    });
++
++    it('only reports a configured key when it is non-empty', () => {
++      writeConfig(JSON.stringify({ theme: 'dark' }));
++      expect(hasGlobalApiKey(tmpHome)).toBe(false);
++
++      writeConfig(JSON.stringify({ OPENAI_API_KEY: '' }));
++      expect(hasGlobalApiKey(tmpHome)).toBe(false);
++      expect(getGlobalApiKey(tmpHome)).toBeNull();
++    });
++  });
+ });

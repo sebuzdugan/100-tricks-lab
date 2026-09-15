@@ -1,0 +1,152 @@
+diff --git a/README.md b/README.md
+index 18fb328..9af8297 100644
+--- a/README.md
++++ b/README.md
+@@ -99,7 +99,7 @@ Generated artefacts live in your current working directory. Supplementary comman
+ |---------|---------|
+ | `frai [options]` | Interactive documentation workflow with backward-compatible shortcut flags. |
+ | `frai generate [options]` | Explicit interactive workflow command. |
+-| `frai scan [--ci] [--json]` | Scan the repository for AI/ML indicators. |
++| `frai scan [dir] [--ci] [--json]` | Scan the repository (or a directory) for AI/ML indicators. |
+ | `frai setup [--key <apiKey>] [--global]` | Store an OpenAI API key locally or globally. |
+ | `frai config` | Show key configuration status. |
+ | `frai docs list` / `frai docs clean` / `frai docs export` | Manage generated documentation. |
+@@ -124,7 +124,7 @@ Runs the interactive documentation flow. Optional flags add shortcuts:
+ Same workflow as the default command, but scoped to documentation only. Options mirror the defaults: `--scan`, `--ci`, `--key`, `--global`, `--export-pdf`, and `--show-config`.
+ 
+ ### `frai scan`
+-Scans the repository for AI-related libraries, functions, and files. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
++Scans the current directory, or the directory given as `frai scan <dir>`, for AI-related libraries (including LLM SDKs such as OpenAI, Anthropic and LangChain), functions, and files. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
+ 
+ ### `frai setup`
+ Guided API key storage. Supply `--key <apiKey>` for headless use and `--global` to persist at `~/.config/frai/config`.
+diff --git a/packages/frai-cli/README.md b/packages/frai-cli/README.md
+index ce5733b..f4590d5 100644
+--- a/packages/frai-cli/README.md
++++ b/packages/frai-cli/README.md
+@@ -79,7 +79,7 @@ Generated artefacts live in your current working directory. Supplementary comman
+ |---------|---------|
+ | `frai [options]` | Interactive documentation workflow with backward-compatible shortcut flags. |
+ | `frai generate [options]` | Explicit interactive workflow command. |
+-| `frai scan [--ci] [--json]` | Scan the repository for AI/ML indicators. |
++| `frai scan [dir] [--ci] [--json]` | Scan the repository (or a directory) for AI/ML indicators. |
+ | `frai setup [--key <apiKey>] [--global]` | Store an OpenAI API key locally or globally. |
+ | `frai config` | Show key configuration status. |
+ | `frai docs list` / `frai docs clean` / `frai docs export` | Manage generated documentation. |
+@@ -103,7 +103,7 @@ Runs the interactive documentation flow. Optional flags add shortcuts:
+ Same workflow as the default command, but scoped to documentation only. Options mirror the defaults: `--scan`, `--ci`, `--key`, `--global`, `--export-pdf`, and `--show-config`.
+ 
+ ### `frai scan`
+-Scans the repository for AI-related libraries, functions, and files. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
++Scans the current directory, or the directory given as `frai scan <dir>`, for AI-related libraries (including LLM SDKs such as OpenAI, Anthropic and LangChain), functions, and files. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
+ 
+ ### `frai setup`
+ Guided API key storage. Supply `--key <apiKey>` for headless use and `--global` to persist at `~/.config/frai/config`.
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..7f065e3 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -13,7 +13,11 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.py',
+   '.ipynb',
+   '.js',
++  '.mjs',
++  '.cjs',
+   '.ts',
++  '.mts',
++  '.cts',
+   '.jsx',
+   '.tsx',
+   '.r',
+@@ -41,6 +45,12 @@ export const DEFAULT_AI_LIBRARIES = [
+   'fastai',
+   'opencv',
+   'cv2',
++  // LLM SDKs and frameworks
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // JavaScript ML/AI libraries
+   '@tensorflow',
+   'ml5',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..0ae581d 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -10,12 +10,72 @@ const uniqPush = (store, key, value) => {
+   }
+ };
+ 
++const IMPORT_CLAUSE = String.raw`[\w\s{},*$]*?`;
++const QUOTED = String.raw`['"\`]([^'"\`\n]+)['"\`]`;
++
++/** JS/TS module specifiers, keyed by how they are imported. */
++const JS_IMPORT_PATTERNS = [
++  new RegExp(String.raw`\bimport\s+${IMPORT_CLAUSE}\bfrom\s*${QUOTED}`, 'g'), // import x / { a } / * as x / type { T } from 'm'
++  new RegExp(String.raw`\bexport\s+${IMPORT_CLAUSE}\bfrom\s*${QUOTED}`, 'g'), // export { a } / * from 'm'
++  new RegExp(String.raw`\bimport\s*${QUOTED}`, 'g'), // import 'm'
++  new RegExp(String.raw`\bimport\s*\(\s*${QUOTED}\s*\)`, 'g'), // import('m')
++  new RegExp(String.raw`\brequire\s*\(\s*${QUOTED}\s*\)`, 'g') // require('m')
++];
++
++/** `import a, b.c as d` on its own line (an optional trailing comment is fine). */
++const PY_IMPORT = /^[ \t]*import[ \t]+([\w.]+(?:[ \t]+as[ \t]+\w+)?(?:[ \t]*,[ \t]*[\w.]+(?:[ \t]+as[ \t]+\w+)?)*)[ \t]*(?:#.*)?$/gm;
++/** `from a.b import c` - relative imports (`from .x import y`) start with a dot and never match a library. */
++const PY_FROM_IMPORT = /^[ \t]*from[ \t]+([\w.]+)[ \t]+import\b/gm;
++
++/** Blanks out whole-line comments so commented-out imports don't count. */
++const stripCommentLines = (content) =>
++  content
++    .split('\n')
++    .map((line) => (/^\s*(\/\/|#|\*|\/\*)/.test(line) ? '' : line))
++    .join('\n');
++
++/** Notebook cells hold their code as JSON strings; scan the code, not the JSON. */
++const notebookSource = (content) => {
++  try {
++    const notebook = JSON.parse(content);
++    return (notebook.cells ?? [])
++      .map((cell) => (Array.isArray(cell.source) ? cell.source.join('') : String(cell.source ?? '')))
++      .join('\n');
++  } catch {
++    return content;
++  }
++};
++
++export function extractModuleSpecifiers(content, filePath = '') {
++  const source = stripCommentLines(filePath.toLowerCase().endsWith('.ipynb') ? notebookSource(content) : content);
++  const js = new Set();
++  const py = new Set();
++  for (const pattern of JS_IMPORT_PATTERNS) {
++    for (const match of source.matchAll(pattern)) js.add(match[1].trim());
++  }
++  for (const match of source.matchAll(PY_IMPORT)) {
++    for (const part of match[1].split(',')) py.add(part.trim().split(/\s+/)[0]);
++  }
++  for (const match of source.matchAll(PY_FROM_IMPORT)) py.add(match[1]);
++  return { js: [...js], py: [...py] };
++}
++
++/** A library matches its own module or a sub-module: `openai`, `openai/resources`, `torch.nn` - never `openai-mock`. */
++const matchesLibrary = (library, specifier, separator) => {
++  const lib = library.toLowerCase();
++  const spec = specifier.toLowerCase();
++  return spec === lib || spec.startsWith(`${lib}${separator}`);
++};
++
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    const { js, py } = extractModuleSpecifiers(content, filePath);
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
++      const found =
++        js.some((specifier) => matchesLibrary(library, specifier, '/')) ||
++        py.some((specifier) => matchesLibrary(library, specifier, '.'));
++      if (found) {
+         uniqPush(result.aiLibraryMatches, filePath, library);
+         result.markAiFile(filePath);
+       }

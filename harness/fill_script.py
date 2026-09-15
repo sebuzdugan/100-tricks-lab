@@ -164,7 +164,8 @@ def main():
         if summary["verdict"] == "inconclusive":
             sys.exit("verdict is inconclusive: rerun before scripting the result")
 
-    key = a.variant or (VERDICT_KEY.get(summary["verdict"]) if s.get("variant_rule", "standard verdict") == "standard verdict" else None)
+    standard = str(s.get("variant_rule", "standard verdict")).lower().startswith("standard verdict")
+    key = a.variant or (VERDICT_KEY.get(summary["verdict"]) if standard else None)
     if not key:
         sys.exit(f"{tid} needs --variant. Rule: {s.get('variant_rule')}. Keys: {', '.join(s['takeaways'])}")
     if key not in s["takeaways"]:

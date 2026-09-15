@@ -271,14 +271,14 @@ def decide(w, o):
         return "works", f"{dp} more passing runs with the trick"
     if dp <= -2:
         return "hurts", f"{-dp} fewer passing runs with the trick"
+    if w["passed"] == 0 and o["passed"] == 0:
+        return "no difference", "nothing passed on either side: the tasks may be too hard for this setup"
     ratio = lambda a, b: a / b if b else 1.0
     t, c = ratio(w["avg_minutes"], o["avg_minutes"]), ratio(w["avg_cost_usd"], o["avg_cost_usd"])
     if dp >= 0 and (t <= 0.75 or c <= 0.75) and t < 1.25 and c < 1.25:
         return "works", "same or better pass count, at least 25% faster or cheaper"
     if dp <= 0 and t >= 1.25 and c >= 1.25:
         return "hurts", "same or worse pass count, at least 25% slower and costlier"
-    if w["passed"] == 0 and o["passed"] == 0:
-        return "no difference", "nothing passed on either side: the tasks may be too hard for this setup"
     return "no difference", "pass counts within 1 and no 25% time or cost gap"
 
 

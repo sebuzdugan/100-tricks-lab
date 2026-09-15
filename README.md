@@ -24,6 +24,13 @@ python3 harness/run.py d01 --summarize-only   # re-print the summary
 
 Run it from a normal terminal, not from inside another Claude Code session.
 
+After the runs, fill the day's Short script with the real numbers (scripts are private until posted):
+
+```bash
+python3 harness/fill_script.py d01            # picks the takeaway from the verdict, writes private/out/d01/
+python3 harness/fill_script.py d01 --preview works   # rehearse before results exist
+```
+
 When the verdict is in, publish the raw runs before the post goes out (the post links to them):
 
 ```bash

@@ -1,0 +1,259 @@
+diff --git a/packages/frai-gate/src/cli.ts b/packages/frai-gate/src/cli.ts
+index 1765ae1..b73c319 100644
+--- a/packages/frai-gate/src/cli.ts
++++ b/packages/frai-gate/src/cli.ts
+@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { validateSpec } from './gate/validate.js';
+-import { renderJson, renderText } from './gate/report.js';
++import { renderJson, renderSummary, renderText } from './gate/report.js';
+ import { verdictFrom } from './gate/schema.js';
+ import { draftGateSection, smartReview } from './pipeline/agent.js';
+ 
+@@ -35,6 +35,7 @@ Usage:
+   frai-gate check <spec.md> [options]    Validate the spec's Responsible AI Gate
+       --smart                            Add an AI quality review of the gate answers (Claude Agent SDK)
+       --json                             Machine-readable output
++      --summary                          Print only the summary line (for CI logs)
+   frai-gate draft [--out <file>] [--print]
+                                          Scan this repo with a read-only agent and draft a filled-in
+                                          gate section grounded in the code (default out: rai-gate-draft.md)
+@@ -104,7 +105,7 @@ async function cmdInit(args: Args): Promise<number> {
+ async function cmdCheck(args: Args): Promise<number> {
+   const specPath = args.positional[0];
+   if (!specPath) {
+-    console.error('Usage: frai-gate check <spec.md> [--smart] [--json]');
++    console.error('Usage: frai-gate check <spec.md> [--smart] [--json] [--summary]');
+     return 2;
+   }
+   const markdown = await fs.readFile(path.resolve(process.cwd(), specPath), 'utf8');
+@@ -118,7 +119,15 @@ async function cmdCheck(args: Args): Promise<number> {
+     console.error('Skipping smart review: no gate section to review.');
+   }
+ 
+-  console.log(args.flags.has('json') ? renderJson(result, specPath) : renderText(result, specPath));
++  let output: string;
++  if (args.flags.has('json')) {
++    output = renderJson(result, specPath);
++  } else if (args.flags.has('summary')) {
++    output = renderSummary(result);
++  } else {
++    output = renderText(result, specPath);
++  }
++  console.log(output);
+   return result.verdict === 'BLOCK' ? 1 : 0;
+ }
+ 
+diff --git a/packages/frai-gate/src/gate/report.test.ts b/packages/frai-gate/src/gate/report.test.ts
+new file mode 100644
+index 0000000..7a26715
+--- /dev/null
++++ b/packages/frai-gate/src/gate/report.test.ts
+@@ -0,0 +1,155 @@
++import { describe, expect, it } from 'vitest';
++import { renderSummary } from './report.js';
++import { validateSpec } from './validate.js';
++
++function fullSpec(overrides: Partial<Record<string, string>> = {}): string {
++  const sections: Record<string, string> = {
++    tier: `### 5.1 Risk tier
++
++- **Tier**: limited
++- **Justification**: Chatbot answering policy questions; no automated decisions about people.
++- **Sign-off**: not required (tier below high)`,
++    data: `### 5.2 Data provenance & privacy
++
++- **Data sources**: internal policy docs; user questions at runtime
++- **PII involved?**: no
++- **Retention**: prompts kept 30 days, then hard-deleted
++- **Used for training?**: no; provider training disabled`,
++    oversight: `### 5.3 Human oversight
++
++- **Automation level**: assistive
++- **Override path**: support team can correct answers via admin panel
++- **Kill switch**: feature flag chat_enabled, ops on-call, off within 5 minutes`,
++    evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: groundedness >= 0.85; refusal rate <= 2%
++- **Eval dataset**: eval/policy-qa.jsonl, 300 questions from real support tickets
++- **Who runs it and when**: CI on every prompt change`,
++    bias: `### 5.5 Bias & fairness
++
++- **Groups at risk of disparate impact**: non-native English speakers
++- **Mitigations**: multilingual eval slice; simplified-language prompt rule
++- **How tested**: disaggregated groundedness by question language`,
++    monitoring: `### 5.6 Monitoring & rollback
++
++- **Production monitoring**: thumbs-down rate, refusal rate, latency
++- **Degradation definition**: thumbs-down > 10% over 24h
++- **Rollback trigger & procedure**: on-call flips chat_enabled off; users see the legacy FAQ`,
++    transparency: `### 5.7 Transparency & incident response
++
++- **User disclosure**: "AI assistant" label in the chat header
++- **Incident owner**: Dana Rivers (support-eng rotation)
++- **Incident path**: in-chat report -> triage queue -> fix or disable, response within 24h`
++  };
++  Object.assign(sections, overrides);
++  return `# Spec: Policy Chatbot
++
++## 1. Objective
++
++Answer policy questions.
++
++## 5. Responsible AI Gate
++
++${Object.values(sections).join('\n\n')}
++
++## 6. Rollout
++
++Later.`;
++}
++
++describe('renderSummary', () => {
++  it('returns PASS 7/7 when all checks pass', () => {
++    const result = validateSpec(fullSpec());
++    const summary = renderSummary(result);
++    expect(summary).toBe('PASS 7/7');
++  });
++
++  it('returns BLOCK 0/7: structure when gate section is missing', () => {
++    const result = validateSpec('# Spec\n\n## Objective\n\nBuild a thing.');
++    const summary = renderSummary(result);
++    expect(summary).toBe('BLOCK 0/7: structure');
++  });
++
++  it('returns BLOCK with specific check IDs when checks fail', () => {
++    const result = validateSpec(
++      fullSpec({
++        tier: `### 5.1 Risk tier
++
++- **Tier**: prohibited
++- **Justification**: Social scoring.
++- **Sign-off**: n/a`,
++        data: `### 5.2 Data provenance & privacy
++
++- **Data sources**: TBD
++- **PII involved?**: no
++- **Retention**: 30 days
++- **Used for training?**: no`
++      })
++    );
++    const summary = renderSummary(result);
++    expect(summary).toMatch(/^BLOCK 5\/7: /);
++    expect(summary).toContain('risk-tier');
++    expect(summary).toContain('data-privacy');
++  });
++
++  it('formats multiple blocked checks in GATE_CHECKS order', () => {
++    const result = validateSpec(
++      fullSpec({
++        evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: TBD
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release`,
++        transparency: `### 5.7 Transparency & incident response
++
++- **User disclosure**: TBD
++- **Incident owner**: TBD
++- **Incident path**: TBD`
++      })
++    );
++    const summary = renderSummary(result);
++    expect(summary).toContain('BLOCK');
++    expect(summary).toContain('evaluation');
++    expect(summary).toContain('transparency');
++  });
++
++  it('returns WARN when only warnings exist', () => {
++    const result = validateSpec(
++      fullSpec({
++        evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: we will check answers look good
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release`
++      })
++    );
++    const summary = renderSummary(result);
++    expect(summary).toBe('WARN 7/7');
++  });
++
++  it('includes all blocked checks in the list', () => {
++    const result = validateSpec(
++      fullSpec({
++        tier: `### 5.1 Risk tier
++
++- **Tier**: prohibited
++- **Justification**: Social scoring.
++- **Sign-off**: n/a`,
++        evaluation: `### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: we will check answers look good
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release`,
++        transparency: `### 5.7 Transparency & incident response
++
++- **User disclosure**: TBD
++- **Incident owner**: TBD
++- **Incident path**: TBD`
++      })
++    );
++    const summary = renderSummary(result);
++    expect(summary).toContain('risk-tier');
++    expect(summary).not.toContain('evaluation');
++    expect(summary).toContain('transparency');
++  });
++});
+diff --git a/packages/frai-gate/src/gate/report.ts b/packages/frai-gate/src/gate/report.ts
+index d83a05a..6e0992c 100644
+--- a/packages/frai-gate/src/gate/report.ts
++++ b/packages/frai-gate/src/gate/report.ts
+@@ -1,4 +1,4 @@
+-import { Finding, GateResult } from './schema.js';
++import { Finding, GateResult, GATE_CHECKS } from './schema.js';
+ 
+ const VERDICT_ICON: Record<GateResult['verdict'], string> = {
+   PASS: '✅',
+@@ -44,3 +44,29 @@ export function renderJson(result: GateResult, specPath: string): string {
+     2
+   );
+ }
++
++export function renderSummary(result: GateResult): string {
++  // Check if structure finding exists
++  if (result.findings.some((f) => f.checkId === 'structure' && f.severity === 'block')) {
++    return 'BLOCK 0/7: structure';
++  }
++
++  // Get all check IDs that have block findings
++  const blockedCheckIds = new Set<string>();
++  for (const finding of result.findings) {
++    if (finding.severity === 'block' && GATE_CHECKS.some((check) => check.id === finding.checkId)) {
++      blockedCheckIds.add(finding.checkId);
++    }
++  }
++
++  const answered = GATE_CHECKS.length - blockedCheckIds.size;
++  const verdict = result.verdict;
++
++  if (blockedCheckIds.size === 0) {
++    return `${verdict} ${answered}/7`;
++  }
++
++  // Format blocked check IDs in GATE_CHECKS order
++  const blockedIds = GATE_CHECKS.filter((check) => blockedCheckIds.has(check.id)).map((check) => check.id);
++  return `${verdict} ${answered}/7: ${blockedIds.join(', ')}`;
++}
+diff --git a/packages/frai-gate/src/index.ts b/packages/frai-gate/src/index.ts
+index 91b6147..dfa7516 100644
+--- a/packages/frai-gate/src/index.ts
++++ b/packages/frai-gate/src/index.ts
+@@ -1,5 +1,5 @@
+ export { validateSpec, extractGateSection } from './gate/validate.js';
+-export { renderText, renderJson } from './gate/report.js';
++export { renderText, renderJson, renderSummary } from './gate/report.js';
+ export { draftGateSection, smartReview } from './pipeline/agent.js';
+ export {
+   GATE_CHECKS,

@@ -1,89 +1,92 @@
-# 100 Tricks Lab
+<h1 align="center">100 AI coding tricks, tested</h1>
 
-100 viral AI coding tricks, tested on the same real tasks with and without each trick. The rules are in
-[PROTOCOL.md](PROTOCOL.md).
+<p align="center">
+One popular AI coding tip a day, for 100 days.<br>
+Run on real code with the trick and without it, graded by tests the agent never sees.<br>
+<b>Every run, diff and log in this repo.</b>
+</p>
 
-## One-time setup
+<p align="center">
+  <img src="assets/cards/d06.png" alt="Day 6 card" width="480">
+</p>
 
-```bash
-harness/setup_base.sh                         # rebuilds base/frai from the public frai repo (skip if it exists)
-CLAUDE_CONFIG_DIR=~/.claude-lab claude        # opens a clean Claude Code; run /login once, then exit
-export LAB_CLAUDE_CONFIG_DIR=~/.claude-lab    # add to your shell profile
+## Why
+
+Most AI coding advice is somebody's good day. This is a measurement: same repo, same tasks, same model, one thing changed.
+
+Nothing is cherry-picked. Days where the trick did nothing get posted too.
+
+## How one day works
+
+```mermaid
+flowchart LR
+  A["📌 One popular trick"] --> B["🧪 4 real tasks<br>in a real repo"]
+  B --> C["▶️ 12 runs WITH it"]
+  B --> D["▶️ 12 runs WITHOUT it"]
+  C --> E["🔒 Hidden tests<br>grade every run"]
+  D --> E
+  E --> F{"Verdict<br>rule fixed in advance"}
+  F -->|passes more| G["✅ KEEP"]
+  F -->|passes fewer| H["❌ CUT"]
+  F -->|same| I["🟡 OPTIONAL"]
+  G --> J["📘 The Playbook"]
+  H --> J
+  I --> J
 ```
 
-The clean config folder keeps your own hooks, plugins, agents, commands and memory out of the runs. No API key is
-involved: `/login` uses your normal Claude subscription.
+The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.md). Every change to it is dated in that file's log.
 
-## Every test day
+## The Playbook so far
 
-```bash
-python3 harness/run.py d01 --dry-run          # prepares the copies and confirms the graders fail on the baseline
-python3 harness/run.py d01                    # 18 runs, 3 at a time, then prints the verdict
-python3 harness/run.py d01 --summarize-only   # re-print the summary
+| Day | The trick | Result | Verdict |
+|---|---|---|---|
+| 1 | The viral 65-line rules file | 7/12 vs 7/12 | 🟡 optional |
+| 2 | Let `/init` write the rules file | 10/12 vs 10/12 | 🟡 optional |
+| 3 | Short rules file (49 lines) vs long (582) | 8/12 vs 8/12, short ran faster | ✅ keep |
+| 4 | The SuperClaude framework | 7/12 vs 9/12 | ❌ cut |
+| 5 | One rules file per package | 8/12 vs 8/12 | 🟡 optional |
+| 6 | An ARCHITECTURE.md map, read first | 9/12 vs 7/12 | ✅ keep |
+
+A new row lands here the day its post goes live.
+
+## The road
+
+```mermaid
+flowchart TB
+  M1["▶️ 1-10 · Setup<br>your rules file"] --> M2["11-20 · Planning"] --> M3["21-30 · Prompting"] --> M4["31-40 · Context"] --> M5["41-50 · Verification"]
+  M5 --> M6["51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
+  style M1 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
 ```
 
-Run it from a normal terminal, not from inside another Claude Code session.
+## What's in here
 
-After the runs, fill the day's Short script with the real numbers (scripts are private until posted):
-
-```bash
-python3 harness/fill_script.py d01            # picks the takeaway from the verdict, writes private/out/d01/
-python3 harness/fill_script.py d01 --preview works   # rehearse before results exist
-```
-
-Each real fill also records the day's rule in the Playbook: kept (works), cut (hurts) or optional (no difference).
-The tally and module recaps in the scripts and X drafts come only from those recorded results:
-
-```bash
-python3 harness/playbook.py                   # the Playbook so far, grouped by module
-python3 harness/playbook.py thread M2         # a module's X thread: opener, one line per day, recap
-```
-
-When the verdict is in, publish the raw runs before the post goes out (the post links to them):
-
-```bash
-harness/publish_day.sh d01                    # commits tricks/d01 and runs/d01, pushes, prints the link
-```
-
-Outputs land in `runs/d01/`: `runs.csv`, `raw/`, `summary.json` and `result_fragment.json`, which feeds the Notion
-scorecard row and the `test-result-crosspost` skill.
-
-## Adding a trick
-
-Create `tricks/dNN/trick.json` (copy `tricks/d01/trick.json`) and put the files that make up the trick in
-`tricks/dNN/with/` (or `without/`). Files in an overlay folder are copied into the repo copy before the agent starts.
-Use `prompt_prefix`, `model`, `effort` or `extra_args` on a side when the trick is a prompt, model or flag rather
-than a file. More side options:
-
-| Field | Use |
+| Folder | What you'll find |
 |---|---|
-| `prompt_prefix_by_task` | `{task: text}` added before one task's prompt |
-| `prompt_file_by_task` | `{task: path}` replaces that task's prompt with a file in the trick folder |
-| `turns` | follow-up calls in the same session: `[{"prompt": "...", "model": "sonnet"}]` (plan then execute, review then fix) |
-| `allowed_tools_extra` | extra tools, e.g. `["Agent"]` or `["WebFetch"]` |
-| `permission_mode` | defaults to `acceptEdits` |
-| `env` | extra environment, e.g. a local model: `{"ANTHROPIC_BASE_URL": "http://localhost:11434", "ANTHROPIC_AUTH_TOKEN": "ollama"}` |
+| `runs/dNN/` | every run of that day: the verdict, each diff, each step the agent took |
+| `tricks/dNN/` | the exact files that made up the trick |
+| `tasks/` | the four tasks, and the hidden tests that grade them |
+| `plan/` | all 100 days: the trick, the source, what to watch for |
+| `PROTOCOL.md` | the rules, including the verdict rule and every change to it |
 
-Trick-level: `tasks`, `runs`, `timeout_min`, `skills` (enables slash commands and skills), `extra_check` (script run on
-each finished repo copy, its last output line lands in the `extra` column), `fetch` (third-party files downloaded at a
-pinned URL and SHA-256 instead of being committed).
+**The setup:** an AI coding agent (Claude Code on Haiku 4.5) working headless in a copy of a real open-source repo, four tasks, three runs per task per side. A budget model on purpose: stronger models passed almost everything, so no trick could show a difference.
 
-`plan/briefs.json` holds the reviewed brief for every day: exact setup, caveats, clip plan, sources. Day cards live in
-`assets/cards/` (`python3 harness/render_cards.py` re-renders them; pips fill in once `runs/dNN/summary.json` exists).
-Icons: [Lucide](https://lucide.dev), ISC licence.
+<details>
+<summary><b>Run it yourself</b></summary>
 
-## Layout
-
+```bash
+harness/setup_base.sh                         # rebuild the baseline repo
+export LAB_CLAUDE_CONFIG_DIR=~/.claude-lab    # a clean agent config, so your own setup stays out of the runs
+python3 harness/run.py d01 --dry-run          # prepare the copies, confirm the graders fail on the baseline
+python3 harness/run.py d01                    # the day's runs, then the verdict
+harness/publish_day.sh d01                    # commit and push that day's raw runs
 ```
-PROTOCOL.md          the rules, including the pre-registered verdict rule
-harness/run.py       runner, grader and summariser
-harness/setup_base.sh
-tasks/<task>/        prompt.md, accept.sh, hidden/ acceptance tests
-reference/           known-good fixes used to validate the graders (never shown to agents)
-tricks/dNN/          one folder per day
-runs/dNN/            results
-base/frai            the baseline repo (rebuilt by setup_base.sh, not committed)
-plan/days.json       the 100-day plan: trick, test, run mode, runs, source
-plan/briefs.json     reviewed brief per day
-assets/cards/        day cards (PNG + SVG)
-```
+
+A day is defined by `tricks/dNN/trick.json`: the tasks, the model, and what each side gets (files copied into the repo copy, a prompt prefix, a different model, extra tools, an extra checker). Copy `tricks/d01/trick.json` to start one.
+
+</details>
+
+## Follow along
+
+The daily results go out as a 60-second video and a post with the numbers: [YouTube](https://sebuzdugan.com/l/yt) · [X](https://sebuzdugan.com/l/x) · [Medium](https://medium.com/@sebuzdugan)
+
+Day cards use [Lucide](https://lucide.dev) icons (ISC).

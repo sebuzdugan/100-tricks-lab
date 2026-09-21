@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Publish one finished day to GitHub: commits tricks/dNN, runs/dNN and plan changes, then pushes.
 # Usage: harness/publish_day.sh d01
+# Run it only once that day's post is live: GitHub never shows a day before X does.
+# Add the day's README row (and any log entry held in private/held/HELD.md) first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 id="${1:?usage: harness/publish_day.sh dNN}"

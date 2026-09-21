@@ -139,7 +139,13 @@ def build_prompt(tdir: Path, side_cfg: dict, task: str) -> str:
     by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
     body = (tdir / by_file).read_text() if by_file else (LAB / "tasks" / task / "prompt.md").read_text()
     prefix = (side_cfg.get("prompt_prefix") or "") + ((side_cfg.get("prompt_prefix_by_task") or {}).get(task) or "")
-    return prefix + body
+    return prefix + body + (side_cfg.get("prompt_suffix") or "")
+
+
+def task_text(tdir: Path, side_cfg: dict, task: str) -> str:
+    """The task's own prompt, without the side's prefix or suffix (for follow-up turn templates)."""
+    by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
+    return (tdir / by_file).read_text() if by_file else (LAB / "tasks" / task / "prompt.md").read_text()
 
 
 def call_claude(cmd, work, timeout_s, env_extra=None):
@@ -214,14 +220,20 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
         calls = [data]
         # Follow-up turns resume the same session (plan -> execute, review -> fix, /compact, retries).
         for turn in turns:
-            if timeout or data.get("is_error") or not data.get("session_id"):
+            fresh = bool(turn.get("fresh"))  # a new session in the same repo copy (spec -> fresh build), not --resume
+            if timeout or data.get("is_error") or (not fresh and not data.get("session_id")):
                 break
             left = timeout_s - (time.time() - t0)
             if left <= 0:
                 timeout = True
                 break
-            tp = turn.get("prompt") or (tdir / turn["prompt_file"]).read_text().replace("{task_prompt}", prompt)
-            tcmd = ["claude", "-p", tp, "--resume", data["session_id"]] + base_flags
+            tp = turn.get("prompt") or (tdir / turn["prompt_file"]).read_text()
+            tp = (tp.replace("{task_prompt}", prompt).replace("{task}", task_text(tdir, side_cfg, task))
+                    .replace("{prev_result}", str(data.get("result") or "").strip()))
+            tflags = list(base_flags)
+            if turn.get("permission_mode"):  # e.g. plan mode for the first call, acceptEdits to implement
+                i = tflags.index("--permission-mode"); tflags[i + 1] = turn["permission_mode"]
+            tcmd = ["claude", "-p", tp] + ([] if fresh else ["--resume", data["session_id"]]) + tflags
             if not trick.get("skills") and not turn.get("slash_commands"):
                 tcmd.append("--disable-slash-commands")
             if turn.get("model") or model:
@@ -238,6 +250,10 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             data["duration_ms"] = sum(float(c.get("duration_ms") or 0) for c in calls)
             data["num_turns"] = sum(int(c.get("num_turns") or 0) for c in calls)
             data["calls"] = len(calls)
+            # token counts summed over every step too (a plan step or a chat step is part of the cost of the trick)
+            data["usage"] = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in calls)
+                             for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
+            data["step_results"] = [str(c.get("result") or "")[:4000] for c in calls[:-1]]
         wall = (time.time() - t0) / 60
         text = str(data.get("result", "")).lower()
         if data.get("is_error") and (data.get("infra_crash") or any(m in text for m in INFRA_MARKERS) or data.get("terminal_reason") == "api_error"

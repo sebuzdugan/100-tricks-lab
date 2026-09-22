@@ -7,7 +7,7 @@ Run on real code with the trick and without it, graded by tests the agent never 
 </p>
 
 <p align="center">
-  <img src="assets/cards/d07.png" alt="Day 7 card" width="480">
+  <img src="assets/cards/d08.png" alt="Day 8 card" width="480">
 </p>
 
 ## Why
@@ -47,6 +47,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 5 | One rules file per package | 8/12 vs 8/12 | 🟡 optional |
 | 6 | An ARCHITECTURE.md map, read first | 9/12 vs 7/12 | ✅ keep |
 | 7 | Build and test commands in the rules file | 10/12 vs 7/12 | ✅ keep |
+| 8 | Four "NEVER do X" rules | 10/12 vs 8/12, but 5 rule breaks either way | 🟡 optional |
 
 A new row lands here the day its post goes live.
 

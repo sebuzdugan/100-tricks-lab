@@ -7,7 +7,7 @@ Run on real code with the trick and without it, graded by tests the agent never 
 </p>
 
 <p align="center">
-  <img src="assets/cards/d10.png" alt="Day 10 card" width="480">
+  <img src="assets/cards/d11.png" alt="Day 11 card" width="480">
 </p>
 
 ## Why
@@ -50,6 +50,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 8 | Four "NEVER do X" rules | 10/12 vs 8/12, but 5 rule breaks either way | 🟡 optional |
 | 9 | An 11-month-old rules file vs none | 9/12 vs 8/12 | 🟡 optional |
 | 10 | A hook that blocks the action vs a written rule | 7/12 vs 7/12 | 🟡 optional |
+| 11 | Plan mode first, then approve | 6/12 vs 8/12 | ❌ cut |
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 

@@ -7,7 +7,7 @@ Run on real code with the trick and without it, graded by tests the agent never 
 </p>
 
 <p align="center">
-  <img src="assets/cards/d12.png" alt="Day 12 card" width="480">
+  <img src="assets/cards/d13.png" alt="Day 13 card" width="480">
 </p>
 
 ## Why
@@ -52,6 +52,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 10 | A hook that blocks the action vs a written rule | 7/12 vs 7/12 | 🟡 optional |
 | 11 | Plan mode first, then approve | 6/12 vs 8/12 | ❌ cut |
 | 12 | Let the agent interview you first | 7/12 vs 9/12 | ❌ cut |
+| 13 | Write SPEC.md, then build in a fresh session | 8/12 vs 7/12 | 🟡 optional |
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 

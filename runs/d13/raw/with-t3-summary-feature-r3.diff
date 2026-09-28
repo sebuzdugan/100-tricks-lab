@@ -1,0 +1,461 @@
+diff --git a/SPEC.md b/SPEC.md
+new file mode 100644
+index 0000000..610a544
+--- /dev/null
++++ b/SPEC.md
+@@ -0,0 +1,106 @@
++# frai-gate: CI Summary Line Feature
++
++## Goal
++
++Add a one-line summary formatter and CLI flag to frai-gate to provide concise gate verdict reporting suitable for CI logs.
++
++## Interfaces & Data Flow
++
++**Input**: `GateResult` object (verdict, findings[], tier, gateSection) from `src/gate/schema.ts`
++
++**Output**: Single-line string from `renderSummary(result: GateResult): string`
++
++**GATE_CHECKS**: 7 checks defined in `src/gate/schema.ts`:
++- risk-tier, data-privacy, oversight, evaluation, bias, monitoring, transparency
++
++## Implementation Scope
++
++### 1. Add `renderSummary()` function to `src/gate/report.ts`
++
++**Signature**: `export function renderSummary(result: GateResult): string`
++
++**Format**: `<VERDICT> <answered>/<total>` where:
++- `<VERDICT>`: one of PASS, WARN, BLOCK
++- `<answered>`: count of GATE_CHECKS with no 'block'-severity findings
++- `<total>`: always 7
++- Warnings (severity='warn') do NOT reduce answered count
++
++**Block findings suffix**: If verdict is BLOCK, append `: checkId1, checkId2, …`
++- List only GATE_CHECKS that have block findings (not warnings)
++- Order by GATE_CHECKS array index
++- Each checkId appears once (deduplicated by checkId)
++- Comma-and-space separated
++
++**Special case—missing gate section**: If a `structure` finding exists (gateSection is null), return `BLOCK 0/7: structure`
++
++**Examples**:
++- Full pass: `PASS 7/7`
++- Warnings only: `WARN 6/7`
++- Block on evaluation and transparency: `BLOCK 5/7: evaluation, transparency`
++- Missing gate section: `BLOCK 0/7: structure`
++
++### 2. Add `--summary` flag to `frai-gate check` command in `src/cli.ts`
++
++**Behavior**:
++- Print only the summary line (from `renderSummary`) instead of full report
++- Exit code remains 1 for BLOCK, 0 for PASS/WARN (unchanged)
++- `--json` flag takes priority if both are provided (json output, not summary)
++- Add `--summary` to HELP text describing the flag
++
++**Modified `cmdCheck` logic**:
++- After calling `renderJson()` or `renderText()`, check for `--summary` flag
++- If present (and no `--json`), call `renderSummary()` instead and print that
++
++### 3. Tests for `renderSummary()` in `src/gate/report.test.ts` (new file)
++
++Use vitest (pattern from `src/gate/validate.test.ts`). Test cases:
++- PASS with no findings: `PASS 7/7`
++- WARN with one warn finding (e.g., on evaluation): `WARN 6/7`
++- BLOCK with single block finding: `BLOCK 6/7: evaluation`
++- BLOCK with multiple block findings in different checks: `BLOCK 4/7: data-privacy, evaluation, transparency` (in GATE_CHECKS order)
++- BLOCK from missing gate section (structure finding): `BLOCK 0/7: structure`
++- Mixed warn + block findings (block reduces answered, warn does not): e.g. warn on monitoring, block on evaluation → `BLOCK 6/7: evaluation`
++
++## Out of Scope
++
++- Changes to `GateResult`, `Finding`, or `GATE_CHECKS` schema
++- Changes to `renderText()` or `renderJson()` functions
++- New CLI commands or restructuring of argument parsing
++- Smart review or pipeline/agent integration
++
++## End-to-End Validation
++
++### Build
++```bash
++cd packages/frai-gate
++pnpm install
++pnpm build
++```
++✓ No TypeScript errors, dist/ artifacts produced
++
++### Test
++```bash
++pnpm test
++```
++✓ All tests pass, including new `renderSummary` test cases
++
++### Manual check with CLI
++```bash
++# Use a test spec (e.g., a fully passing one)
++npx frai-gate check <passing-spec>.md
++# Should print full report
++
++npx frai-gate check <passing-spec>.md --summary
++# Should print only: PASS 7/7
++
++npx frai-gate check <failing-spec>.md --summary
++# Should print only: BLOCK N/7: check-ids (as appropriate)
++
++npx frai-gate check <spec>.md --summary --json
++# Should print JSON (--json takes priority)
++```
++
++### Verify exit codes
++- PASS/WARN with `--summary`: exit 0 ✓
++- BLOCK with `--summary`: exit 1 ✓
++- Exit code same whether using `--summary` or full report ✓
+diff --git a/packages/frai-gate/src/cli.ts b/packages/frai-gate/src/cli.ts
+index 1765ae1..f10773c 100644
+--- a/packages/frai-gate/src/cli.ts
++++ b/packages/frai-gate/src/cli.ts
+@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { validateSpec } from './gate/validate.js';
+-import { renderJson, renderText } from './gate/report.js';
++import { renderJson, renderText, renderSummary } from './gate/report.js';
+ import { verdictFrom } from './gate/schema.js';
+ import { draftGateSection, smartReview } from './pipeline/agent.js';
+ 
+@@ -35,6 +35,7 @@ Usage:
+   frai-gate check <spec.md> [options]    Validate the spec's Responsible AI Gate
+       --smart                            Add an AI quality review of the gate answers (Claude Agent SDK)
+       --json                             Machine-readable output
++      --summary                          Print only a one-line summary (e.g., PASS 7/7)
+   frai-gate draft [--out <file>] [--print]
+                                          Scan this repo with a read-only agent and draft a filled-in
+                                          gate section grounded in the code (default out: rai-gate-draft.md)
+@@ -104,7 +105,7 @@ async function cmdInit(args: Args): Promise<number> {
+ async function cmdCheck(args: Args): Promise<number> {
+   const specPath = args.positional[0];
+   if (!specPath) {
+-    console.error('Usage: frai-gate check <spec.md> [--smart] [--json]');
++    console.error('Usage: frai-gate check <spec.md> [--smart] [--json] [--summary]');
+     return 2;
+   }
+   const markdown = await fs.readFile(path.resolve(process.cwd(), specPath), 'utf8');
+@@ -118,7 +119,15 @@ async function cmdCheck(args: Args): Promise<number> {
+     console.error('Skipping smart review: no gate section to review.');
+   }
+ 
+-  console.log(args.flags.has('json') ? renderJson(result, specPath) : renderText(result, specPath));
++  let output: string;
++  if (args.flags.has('json')) {
++    output = renderJson(result, specPath);
++  } else if (args.flags.has('summary')) {
++    output = renderSummary(result);
++  } else {
++    output = renderText(result, specPath);
++  }
++  console.log(output);
+   return result.verdict === 'BLOCK' ? 1 : 0;
+ }
+ 
+diff --git a/packages/frai-gate/src/gate/report.test.ts b/packages/frai-gate/src/gate/report.test.ts
+new file mode 100644
+index 0000000..f348551
+--- /dev/null
++++ b/packages/frai-gate/src/gate/report.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from 'vitest';
++import { renderSummary } from './report.js';
++import { GateResult } from './schema.js';
++
++function result(
++  verdict: GateResult['verdict'],
++  findings: Array<{ checkId: string; severity: 'block' | 'warn' }>,
++  gateSection: string | null = 'some gate section'
++): GateResult {
++  return {
++    verdict,
++    tier: null,
++    findings: findings.map((f) => ({
++      ...f,
++      message: 'test message',
++      source: 'validator' as const
++    })),
++    gateSection
++  };
++}
++
++describe('renderSummary', () => {
++  it('formats PASS with no findings', () => {
++    const res = result('PASS', []);
++    expect(renderSummary(res)).toBe('PASS 7/7');
++  });
++
++  it('formats WARN with one warning finding', () => {
++    const res = result('WARN', [{ checkId: 'evaluation', severity: 'warn' }]);
++    expect(renderSummary(res)).toBe('WARN 7/7');
++  });
++
++  it('formats BLOCK with single block finding', () => {
++    const res = result('BLOCK', [{ checkId: 'evaluation', severity: 'block' }]);
++    expect(renderSummary(res)).toBe('BLOCK 6/7: evaluation');
++  });
++
++  it('formats BLOCK with multiple block findings in GATE_CHECKS order', () => {
++    const res = result('BLOCK', [
++      { checkId: 'transparency', severity: 'block' },
++      { checkId: 'data-privacy', severity: 'block' },
++      { checkId: 'evaluation', severity: 'block' }
++    ]);
++    expect(renderSummary(res)).toBe('BLOCK 4/7: data-privacy, evaluation, transparency');
++  });
++
++  it('returns BLOCK 0/7: structure when gate section is missing', () => {
++    const res = result('BLOCK', [{ checkId: 'structure', severity: 'block' }], null);
++    expect(renderSummary(res)).toBe('BLOCK 0/7: structure');
++  });
++
++  it('counts only block findings when mixed with warnings', () => {
++    const res = result('BLOCK', [
++      { checkId: 'monitoring', severity: 'warn' },
++      { checkId: 'evaluation', severity: 'block' }
++    ]);
++    expect(renderSummary(res)).toBe('BLOCK 6/7: evaluation');
++  });
++
++  it('deduplicates block findings by checkId', () => {
++    const res = result('BLOCK', [
++      { checkId: 'evaluation', severity: 'block' },
++      { checkId: 'evaluation', severity: 'block' }
++    ]);
++    expect(renderSummary(res)).toBe('BLOCK 6/7: evaluation');
++  });
++});
+diff --git a/packages/frai-gate/src/gate/report.ts b/packages/frai-gate/src/gate/report.ts
+index d83a05a..a9906e3 100644
+--- a/packages/frai-gate/src/gate/report.ts
++++ b/packages/frai-gate/src/gate/report.ts
+@@ -1,4 +1,4 @@
+-import { Finding, GateResult } from './schema.js';
++import { Finding, GateResult, GATE_CHECKS } from './schema.js';
+ 
+ const VERDICT_ICON: Record<GateResult['verdict'], string> = {
+   PASS: '✅',
+@@ -44,3 +44,23 @@ export function renderJson(result: GateResult, specPath: string): string {
+     2
+   );
+ }
++
++export function renderSummary(result: GateResult): string {
++  // Special case: missing gate section
++  if (result.gateSection === null) {
++    return 'BLOCK 0/7: structure';
++  }
++
++  // Count checks that have NO block findings
++  const blockedCheckIds = new Set(
++    result.findings.filter((f) => f.severity === 'block').map((f) => f.checkId)
++  );
++  const answered = GATE_CHECKS.length - blockedCheckIds.size;
++
++  if (result.verdict === 'BLOCK') {
++    const checksWithBlocks = GATE_CHECKS.filter((c) => blockedCheckIds.has(c.id)).map((c) => c.id);
++    return `BLOCK ${answered}/${GATE_CHECKS.length}: ${checksWithBlocks.join(', ')}`;
++  }
++
++  return `${result.verdict} ${answered}/${GATE_CHECKS.length}`;
++}
+diff --git a/packages/frai-gate/test-failing-spec.md b/packages/frai-gate/test-failing-spec.md
+new file mode 100644
+index 0000000..42fb65b
+--- /dev/null
++++ b/packages/frai-gate/test-failing-spec.md
+@@ -0,0 +1,54 @@
++# Spec: Policy Chatbot
++
++## 1. Objective
++
++Answer policy questions.
++
++## 5. Responsible AI Gate
++
++### 5.1 Risk tier
++
++- **Tier**: limited
++- **Justification**: Chatbot answering policy questions; no automated decisions about people.
++- **Sign-off**: not required (tier below high)
++
++### 5.2 Data provenance & privacy
++
++- **Data sources**: TBD
++- **PII involved?**: no
++- **Retention**: 30 days
++- **Used for training?**: no
++
++### 5.3 Human oversight
++
++- **Automation level**: assistive
++- **Override path**: support team can correct answers via admin panel
++- **Kill switch**: feature flag chat_enabled, ops on-call, off within 5 minutes
++
++### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: we will check answers look good
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release
++
++### 5.5 Bias & fairness
++
++- **Groups at risk of disparate impact**: non-native English speakers
++- **Mitigations**: multilingual eval slice; simplified-language prompt rule
++- **How tested**: disaggregated groundedness by question language
++
++### 5.6 Monitoring & rollback
++
++- **Production monitoring**: thumbs-down rate, refusal rate, latency
++- **Degradation definition**: thumbs-down > 10% over 24h
++- **Rollback trigger & procedure**: on-call flips chat_enabled off; users see the legacy FAQ
++
++### 5.7 Transparency & incident response
++
++- **User disclosure**: "AI assistant" label in the chat header
++- **Incident owner**: Dana Rivers (support-eng rotation)
++- **Incident path**: in-chat report -> triage queue -> fix or disable, response within 24h
++
++## 6. Rollout
++
++Later.
+diff --git a/packages/frai-gate/test-no-gate-spec.md b/packages/frai-gate/test-no-gate-spec.md
+new file mode 100644
+index 0000000..a065158
+--- /dev/null
++++ b/packages/frai-gate/test-no-gate-spec.md
+@@ -0,0 +1,9 @@
++# Spec: Policy Chatbot
++
++## 1. Objective
++
++Answer policy questions.
++
++## 6. Rollout
++
++Later.
+diff --git a/packages/frai-gate/test-passing-spec.md b/packages/frai-gate/test-passing-spec.md
+new file mode 100644
+index 0000000..e74f3f6
+--- /dev/null
++++ b/packages/frai-gate/test-passing-spec.md
+@@ -0,0 +1,54 @@
++# Spec: Policy Chatbot
++
++## 1. Objective
++
++Answer policy questions.
++
++## 5. Responsible AI Gate
++
++### 5.1 Risk tier
++
++- **Tier**: limited
++- **Justification**: Chatbot answering policy questions; no automated decisions about people.
++- **Sign-off**: not required (tier below high)
++
++### 5.2 Data provenance & privacy
++
++- **Data sources**: internal policy docs; user questions at runtime
++- **PII involved?**: no
++- **Retention**: prompts kept 30 days, then hard-deleted
++- **Used for training?**: no; provider training disabled
++
++### 5.3 Human oversight
++
++- **Automation level**: assistive
++- **Override path**: support team can correct answers via admin panel
++- **Kill switch**: feature flag chat_enabled, ops on-call, off within 5 minutes
++
++### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: groundedness >= 0.85; refusal rate <= 2%
++- **Eval dataset**: eval/policy-qa.jsonl, 300 questions from real support tickets
++- **Who runs it and when**: CI on every prompt change
++
++### 5.5 Bias & fairness
++
++- **Groups at risk of disparate impact**: non-native English speakers
++- **Mitigations**: multilingual eval slice; simplified-language prompt rule
++- **How tested**: disaggregated groundedness by question language
++
++### 5.6 Monitoring & rollback
++
++- **Production monitoring**: thumbs-down rate, refusal rate, latency
++- **Degradation definition**: thumbs-down > 10% over 24h
++- **Rollback trigger & procedure**: on-call flips chat_enabled off; users see the legacy FAQ
++
++### 5.7 Transparency & incident response
++
++- **User disclosure**: "AI assistant" label in the chat header
++- **Incident owner**: Dana Rivers (support-eng rotation)
++- **Incident path**: in-chat report -> triage queue -> fix or disable, response within 24h
++
++## 6. Rollout
++
++Later.
+diff --git a/packages/frai-gate/test-warning-spec.md b/packages/frai-gate/test-warning-spec.md
+new file mode 100644
+index 0000000..a5f0243
+--- /dev/null
++++ b/packages/frai-gate/test-warning-spec.md
+@@ -0,0 +1,54 @@
++# Spec: Policy Chatbot
++
++## 1. Objective
++
++Answer policy questions.
++
++## 5. Responsible AI Gate
++
++### 5.1 Risk tier
++
++- **Tier**: limited
++- **Justification**: Chatbot answering policy questions; no automated decisions about people.
++- **Sign-off**: not required (tier below high)
++
++### 5.2 Data provenance & privacy
++
++- **Data sources**: internal policy docs; user questions at runtime
++- **PII involved?**: no
++- **Retention**: prompts kept 30 days, then hard-deleted
++- **Used for training?**: no; provider training disabled
++
++### 5.3 Human oversight
++
++- **Automation level**: assistive
++- **Override path**: support team can correct answers via admin panel
++- **Kill switch**: feature flag chat_enabled, ops on-call, off within 5 minutes
++
++### 5.4 Evaluation plan
++
++- **Pre-ship metrics & thresholds**: we will check answers look good
++- **Eval dataset**: some real questions
++- **Who runs it and when**: the team, before release
++
++### 5.5 Bias & fairness
++
++- **Groups at risk of disparate impact**: non-native English speakers
++- **Mitigations**: multilingual eval slice; simplified-language prompt rule
++- **How tested**: disaggregated groundedness by question language
++
++### 5.6 Monitoring & rollback
++
++- **Production monitoring**: thumbs-down rate, refusal rate, latency
++- **Degradation definition**: thumbs-down > 10% over 24h
++- **Rollback trigger & procedure**: on-call flips chat_enabled off; users see the legacy FAQ
++
++### 5.7 Transparency & incident response
++
++- **User disclosure**: "AI assistant" label in the chat header
++- **Incident owner**: Dana Rivers (support-eng rotation)
++- **Incident path**: in-chat report -> triage queue -> fix or disable, response within 24h
++
++## 6. Rollout
++
++Later.

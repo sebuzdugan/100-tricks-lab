@@ -7,7 +7,7 @@ Run on real code with the trick and without it, graded by tests the agent never 
 </p>
 
 <p align="center">
-  <img src="assets/cards/d14.png" alt="Day 14 card" width="480">
+  <img src="assets/cards/d15.png" alt="Day 15 card" width="480">
 </p>
 
 ## Why
@@ -54,6 +54,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 12 | Let the agent interview you first | 7/12 vs 9/12 | ❌ cut |
 | 13 | Write SPEC.md, then build in a fresh session | 8/12 vs 7/12 | 🟡 optional |
 | 14 | GitHub Spec Kit vs plan mode | 6/12 vs 6/12, 2.4x the time | ❌ cut |
+| 15 | Plan in a plain chat, build in a fresh agent | 6/12 vs 6/12, 45% cheaper | ✅ keep |
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 

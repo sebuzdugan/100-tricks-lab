@@ -1,0 +1,194 @@
+diff --git a/packages/frai-gate/src/cli.ts b/packages/frai-gate/src/cli.ts
+index 1765ae1..488e26a 100644
+--- a/packages/frai-gate/src/cli.ts
++++ b/packages/frai-gate/src/cli.ts
+@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
+ import path from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { validateSpec } from './gate/validate.js';
+-import { renderJson, renderText } from './gate/report.js';
++import { renderJson, renderText, renderSummary } from './gate/report.js';
+ import { verdictFrom } from './gate/schema.js';
+ import { draftGateSection, smartReview } from './pipeline/agent.js';
+ 
+@@ -35,6 +35,7 @@ Usage:
+   frai-gate check <spec.md> [options]    Validate the spec's Responsible AI Gate
+       --smart                            Add an AI quality review of the gate answers (Claude Agent SDK)
+       --json                             Machine-readable output
++      --summary                          Print only a one-line summary (format: VERDICT answered/total[:check-ids])
+   frai-gate draft [--out <file>] [--print]
+                                          Scan this repo with a read-only agent and draft a filled-in
+                                          gate section grounded in the code (default out: rai-gate-draft.md)
+@@ -118,7 +119,13 @@ async function cmdCheck(args: Args): Promise<number> {
+     console.error('Skipping smart review: no gate section to review.');
+   }
+ 
+-  console.log(args.flags.has('json') ? renderJson(result, specPath) : renderText(result, specPath));
++  if (args.flags.has('json')) {
++    console.log(renderJson(result, specPath));
++  } else if (args.flags.has('summary')) {
++    console.log(renderSummary(result));
++  } else {
++    console.log(renderText(result, specPath));
++  }
+   return result.verdict === 'BLOCK' ? 1 : 0;
+ }
+ 
+diff --git a/packages/frai-gate/src/gate/report.test.ts b/packages/frai-gate/src/gate/report.test.ts
+new file mode 100644
+index 0000000..b8907b2
+--- /dev/null
++++ b/packages/frai-gate/src/gate/report.test.ts
+@@ -0,0 +1,105 @@
++import { describe, expect, it } from 'vitest';
++import { renderSummary } from './report.js';
++import { GateResult, Finding } from './schema.js';
++
++function makeResult(verdict: GateResult['verdict'], findings: Finding[] = [], gateSection: string | null = '# Gate'): GateResult {
++  return {
++    verdict,
++    tier: verdict === 'PASS' || verdict === 'WARN' ? 'limited' : null,
++    findings,
++    gateSection
++  };
++}
++
++describe('renderSummary', () => {
++  it('shows PASS 7/7 when all checks are answered', () => {
++    const result = makeResult('PASS', []);
++    expect(renderSummary(result)).toBe('PASS 7/7');
++  });
++
++  it('shows WARN 7/7 when all checks are answered with warnings', () => {
++    const result = makeResult('WARN', [
++      { checkId: 'evaluation', severity: 'warn', message: 'No numbers', source: 'validator' }
++    ]);
++    expect(renderSummary(result)).toBe('WARN 7/7');
++  });
++
++  it('shows BLOCK 0/7: structure when gate section is missing', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'structure', severity: 'block', message: 'Missing gate section', source: 'validator' }
++    ], null);
++    expect(renderSummary(result)).toBe('BLOCK 0/7: structure');
++  });
++
++  it('shows BLOCK with check IDs when some checks have block findings', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'evaluation', severity: 'block', message: 'Missing thresholds', source: 'validator' },
++      { checkId: 'transparency', severity: 'block', message: 'Missing incident path', source: 'validator' }
++    ]);
++    expect(renderSummary(result)).toBe('BLOCK 5/7: evaluation, transparency');
++  });
++
++  it('lists each check ID only once even with multiple block findings', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'evaluation', severity: 'block', message: 'Missing thresholds', source: 'validator' },
++      { checkId: 'evaluation', severity: 'block', message: 'No numeric values', source: 'agent' },
++      { checkId: 'monitoring', severity: 'block', message: 'No degradation definition', source: 'validator' }
++    ]);
++    expect(renderSummary(result)).toBe('BLOCK 5/7: evaluation, monitoring');
++  });
++
++  it('counts checks with only warnings as answered', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'evaluation', severity: 'warn', message: 'No numbers', source: 'validator' },
++      { checkId: 'transparency', severity: 'block', message: 'Missing incident path', source: 'validator' }
++    ]);
++    expect(renderSummary(result)).toBe('BLOCK 6/7: transparency');
++  });
++
++  it('preserves GATE_CHECKS order in output', () => {
++    // Create findings in reverse order to verify ordering is applied
++    const result = makeResult('BLOCK', [
++      { checkId: 'transparency', severity: 'block', message: 'Missing incident path', source: 'validator' },
++      { checkId: 'evaluation', severity: 'block', message: 'Missing thresholds', source: 'validator' },
++      { checkId: 'risk-tier', severity: 'block', message: 'Missing justification', source: 'validator' }
++    ]);
++    // GATE_CHECKS order is: risk-tier, data-privacy, oversight, evaluation, bias, monitoring, transparency
++    expect(renderSummary(result)).toBe('BLOCK 4/7: risk-tier, evaluation, transparency');
++  });
++
++  it('shows answered count correctly with mixed findings', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'data-privacy', severity: 'warn', message: 'Generic PII retention', source: 'agent' },
++      { checkId: 'oversight', severity: 'block', message: 'No kill switch', source: 'validator' },
++      { checkId: 'bias', severity: 'block', message: 'No fairness analysis', source: 'validator' }
++    ]);
++    // GATE_CHECKS order: risk-tier, data-privacy, oversight, evaluation, bias, monitoring, transparency
++    expect(renderSummary(result)).toBe('BLOCK 5/7: oversight, bias');
++  });
++
++  it('handles no check IDs when BLOCK but finding is structure-only', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'structure', severity: 'block', message: 'Missing gate section', source: 'validator' }
++    ], null);
++    expect(renderSummary(result)).toBe('BLOCK 0/7: structure');
++  });
++
++  it('does not append check IDs for non-BLOCK verdicts', () => {
++    const result = makeResult('PASS', []);
++    expect(renderSummary(result)).toBe('PASS 7/7');
++    expect(renderSummary(result)).not.toContain(':');
++  });
++
++  it('all 7 gate checks can have block findings', () => {
++    const result = makeResult('BLOCK', [
++      { checkId: 'risk-tier', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'data-privacy', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'oversight', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'evaluation', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'bias', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'monitoring', severity: 'block', message: 'Missing', source: 'validator' },
++      { checkId: 'transparency', severity: 'block', message: 'Missing', source: 'validator' }
++    ]);
++    expect(renderSummary(result)).toBe('BLOCK 0/7: risk-tier, data-privacy, oversight, evaluation, bias, monitoring, transparency');
++  });
++});
+diff --git a/packages/frai-gate/src/gate/report.ts b/packages/frai-gate/src/gate/report.ts
+index d83a05a..f59d88f 100644
+--- a/packages/frai-gate/src/gate/report.ts
++++ b/packages/frai-gate/src/gate/report.ts
+@@ -1,4 +1,4 @@
+-import { Finding, GateResult } from './schema.js';
++import { Finding, GateResult, GATE_CHECKS } from './schema.js';
+ 
+ const VERDICT_ICON: Record<GateResult['verdict'], string> = {
+   PASS: '✅',
+@@ -44,3 +44,36 @@ export function renderJson(result: GateResult, specPath: string): string {
+     2
+   );
+ }
++
++export function renderSummary(result: GateResult): string {
++  // Special case: if gate section is missing (structure finding), return BLOCK 0/7: structure
++  if (result.findings.some((f) => f.checkId === 'structure')) {
++    return 'BLOCK 0/7: structure';
++  }
++
++  // Count answered checks: a check is answered if it has no block-severity findings
++  let answered = 0;
++  for (const check of GATE_CHECKS) {
++    if (!result.findings.some((f) => f.checkId === check.id && f.severity === 'block')) {
++      answered++;
++    }
++  }
++
++  // Build summary: "<VERDICT> <answered>/7"
++  let summary = `${result.verdict} ${answered}/7`;
++
++  // If BLOCK, append check IDs with block findings in GATE_CHECKS order
++  if (result.verdict === 'BLOCK') {
++    const blockCheckIds: string[] = [];
++    for (const check of GATE_CHECKS) {
++      if (result.findings.some((f) => f.checkId === check.id && f.severity === 'block')) {
++        blockCheckIds.push(check.id);
++      }
++    }
++    if (blockCheckIds.length > 0) {
++      summary += ': ' + blockCheckIds.join(', ');
++    }
++  }
++
++  return summary;
++}

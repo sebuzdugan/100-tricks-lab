@@ -18,7 +18,8 @@ from pathlib import Path
 LAB = Path(__file__).resolve().parent.parent
 TASK_PKGS = {"t1": {"frai-cli"}, "t2": {"frai-core"}, "t3": {"frai-gate"}, "h1": {"frai-gate"}, "h2": {"frai-core", "frai-cli"},
              "h3": {"frai-core", "frai-cli", "frai-agent"}, "h4": {"frai-core", "frai-cli", "frai-agent"}}
-TEST_RE = re.compile(r"\b(test|vitest|jest)\b")
+# a real test invocation (vitest/jest, or a package-manager "test" script), not any command with "test" in a path
+TEST_RE = re.compile(r"\b(vitest|jest)\b|\b(pnpm|npm|yarn)\b[^;&|]*?\s(run\s+)?test(?![\w-])|node\s+--test\b")
 BUILD_RE = re.compile(r"\b(build|tsc)\b")
 DONE_RE = re.compile(r"\b(all (tests|checks) pass|tests pass|passing|fixed|implemented|done|complete[ds]?)\b", re.I)
 

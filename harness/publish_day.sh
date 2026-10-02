@@ -11,7 +11,7 @@ id="${1:?usage: harness/publish_day.sh dNN}"
 if git ls-files --others --exclude-standard | grep -q '^private/'; then echo "private/ is not ignored, refusing"; exit 1; fi
 verdict=$(python3 -c "import json;print(json.load(open('runs/$id/summary.json'))['verdict'])")
 [ "$verdict" != "inconclusive" ] || { echo "verdict is inconclusive: rerun before publishing"; exit 1; }
-git add "tricks/$id" "runs/$id" plan PROTOCOL.md README.md
+git add "tricks/$id" "runs/$id" plan harness PROTOCOL.md README.md
 git commit -m "$id: $verdict" || echo "nothing new to commit"
 git push origin HEAD
 echo "https://github.com/sebuzdugan/100-tricks-lab/tree/main/runs/$id"

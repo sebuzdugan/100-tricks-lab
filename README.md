@@ -55,6 +55,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 13 | Write SPEC.md, then build in a fresh session | 8/12 vs 7/12 | 🟡 optional |
 | 14 | GitHub Spec Kit vs plan mode | 6/12 vs 6/12, 2.4x the time | ❌ cut |
 | 15 | Plan in a plain chat, build in a fresh agent | 6/12 vs 6/12, 45% cheaper | ✅ keep |
+| 16 | Type `ultrathink` before the task | 8/12 vs 7/12, 56% more thinking | 🟡 optional |
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 

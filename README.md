@@ -57,6 +57,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 15 | Plan in a plain chat, build in a fresh agent | 6/12 vs 6/12, 45% cheaper | ✅ keep |
 | 16 | Type `ultrathink` before the task | 8/12 vs 7/12, 56% more thinking | 🟡 optional |
 | 17 | Make the agent tick off a TASKS.md checklist | 10/12 vs 9/12, ticks didn't track passes | 🟡 optional |
+| 18 | BMAD Method's build workflow (plan, code, AI review) | 8/12 vs 7/12, 5x the time | 🟡 optional |
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 

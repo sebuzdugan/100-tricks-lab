@@ -59,6 +59,9 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 17 | Make the agent tick off a TASKS.md checklist | 10/12 vs 9/12, ticks didn't track passes | 🟡 optional |
 | 18 | BMAD Method's build workflow (plan, code, AI review) | 8/12 vs 7/12, 5x the time | 🟡 optional |
 | 19 | Ask for 3 approaches, then a fixed rule picks | 5/12 vs 6/12, rule skipped the spec | 🟡 optional |
+| 20 | Write the failing test first, then code | 6/9 vs 8/9, never ran its tests on 3 of 9 | ❌ cut |
+
+**Module 2, after 234 runs:** every build followed what was written first (plan, spec, answers, checklist, tests), right or wrong. No planning step clearly added passes; only the half-cent chat plan earned its cost.
 
 **Module 1, after 240 runs:** what changed the outcome was telling the agent how to build and test its own work. Not how strictly the rules were worded.
 
@@ -68,9 +71,10 @@ A new row lands here the day its post goes live.
 
 ```mermaid
 flowchart TB
-  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["▶️ 11-20 · Planning"] --> M3["21-30 · Prompting"] --> M4["31-40 · Context"] --> M5["41-50 · Verification"]
+  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["▶️ 21-30 · Prompting"] --> M4["31-40 · Context"] --> M5["41-50 · Verification"]
   M5 --> M6["51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
   style M1 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
+  style M2 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
 ```
 
 ## What's in here

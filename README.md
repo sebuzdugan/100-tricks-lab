@@ -60,6 +60,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 18 | BMAD Method's build workflow (plan, code, AI review) | 8/12 vs 7/12, 5x the time | 🟡 optional |
 | 19 | Ask for 3 approaches, then a fixed rule picks | 5/12 vs 6/12, rule skipped the spec | 🟡 optional |
 | 20 | Write the failing test first, then code | 6/9 vs 8/9, never ran its tests on 3 of 9 | ❌ cut |
+| 21 | "You are a senior engineer" role line | 6/12 vs 6/12, 33% costlier | ❌ cut |
 
 **Module 2, after 234 runs:** every build followed what was written first (plan, spec, answers, checklist, tests), right or wrong. No planning step clearly added passes; only the half-cent chat plan earned its cost.
 

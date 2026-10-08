@@ -68,13 +68,14 @@ def load_trick(tid):
     return t
 
 
-def clone_base(dest: Path):
+def clone_base(dest: Path, base: Path = BASE):
+    # base: the repo every run starts from; a trick can name another one under base/ (special-fixture days, e.g. "docs-aisdk7")
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(["cp", "-cR", str(BASE), str(dest)], capture_output=True, text=True)
+    r = subprocess.run(["cp", "-cR", str(base), str(dest)], capture_output=True, text=True)
     if r.returncode != 0:
-        subprocess.run(["cp", "-R", str(BASE), str(dest)], check=True)
+        subprocess.run(["cp", "-R", str(base), str(dest)], check=True)
 
 
 def ensure_fetched(trick: dict, trick_dir: Path):
@@ -139,6 +140,10 @@ def build_prompt(tdir: Path, side_cfg: dict, task: str) -> str:
     by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
     body = (tdir / by_file).read_text() if by_file else (LAB / "tasks" / task / "prompt.md").read_text()
     prefix = (side_cfg.get("prompt_prefix") or "") + ((side_cfg.get("prompt_prefix_by_task") or {}).get(task) or "")
+    # Prefixes too big for trick.json (day 40 pastes files into the prompt) live in files next to it, read the same way.
+    pf = side_cfg.get("prompt_prefix_file") or (side_cfg.get("prompt_prefix_file_by_task") or {}).get(task)
+    if pf:
+        prefix += (tdir / pf).read_text()
     return prefix + body + (side_cfg.get("prompt_suffix") or "")
 
 
@@ -173,6 +178,30 @@ def call_claude(cmd, work, timeout_s, env_extra=None):
     return data, timed_out
 
 
+def compactions(events):
+    """Every compact_boundary event in a run's stream (a manual /compact turn or Claude Code's auto-compaction),
+    with the context size in tokens before and after. Saved in each raw row; days 31-40 use it as a measure."""
+    out = []
+    for e in events:
+        if e.get("type") == "system" and e.get("subtype") == "compact_boundary":
+            m = e.get("compact_metadata") or {}
+            out.append({"trigger": m.get("trigger"), "pre_tokens": m.get("pre_tokens"), "post_tokens": m.get("post_tokens")})
+    return out
+
+
+def compaction_extra(extra: str, comp: list) -> str:
+    """Add the compaction count to the row's `extra` (merged into a checker's JSON line if there is one)."""
+    info = {"compacts": len(comp), "auto_compacts": sum(1 for c in comp if c.get("trigger") == "auto"),
+            "pre_tokens": comp[0]["pre_tokens"] if comp else None, "post_tokens": comp[0]["post_tokens"] if comp else None}
+    try:
+        d = json.loads(extra) if extra else {}
+        if isinstance(d, dict):
+            return json.dumps({**d, **info}, separators=(",", ":"))
+    except json.JSONDecodeError:
+        pass
+    return (extra + " " + json.dumps(info, separators=(",", ":"))).strip()
+
+
 def save_diff(work: Path, dest: Path):
     subprocess.run(["git", "-C", str(work), "add", "-A"], capture_output=True)
     d = subprocess.run(["git", "-C", str(work), "diff", "--cached", "lab-base", "--", ".", ":(exclude)node_modules", ":(exclude,glob)**/dist/**"],
@@ -187,7 +216,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     if raw.exists() and not dry:
         return json.loads(raw.read_text())
     work = WORK_ROOT / tid / side / task / f"r{n}"
-    clone_base(work)
+    clone_base(work, LAB / "base" / trick.get("base", "frai"))
     apply_overlay(tdir, side_cfg, work)
     prompt = build_prompt(tdir, side_cfg, task)
     turns = side_cfg.get("turns") or []
@@ -254,6 +283,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             data["usage"] = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in calls)
                              for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
             data["step_results"] = [str(c.get("result") or "")[:4000] for c in calls[:-1]]
+        data["compactions"] = compactions([e for c in calls for e in (c.get("_events") or [])])
         wall = (time.time() - t0) / 60
         text = str(data.get("result", "")).lower()
         if data.get("is_error") and (data.get("infra_crash") or any(m in text for m in INFRA_MARKERS) or data.get("terminal_reason") == "api_error"
@@ -271,6 +301,8 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     if trick.get("extra_check"):  # trick-specific measurement on the finished repo, before grading touches it
         chk = subprocess.run([str(tdir / trick["extra_check"]), str(work), side, task], capture_output=True, text=True, timeout=300)
         extra = (chk.stdout.strip().splitlines() or [""])[-1][:200]
+    if trick.get("record_compactions") and not dry:  # days 31-40: did /compact (or auto-compaction) actually happen
+        extra = compaction_extra(extra, data.get("compactions") or [])
     passed, reason = (False, "infra error, not graded") if infra else grade(task, work)
     if timeout and not infra:  # PROTOCOL: a timeout counts as a failed run, whatever state the repo was left in
         passed, reason = False, f"FAIL timeout after {trick.get('timeout_min', 20)} min (grader alone said: {reason})"
@@ -295,6 +327,124 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
         shutil.rmtree(work, ignore_errors=True)
     print(f"{'PASS' if passed else 'FAIL'} {side:<7} {task:<20} r{n}  {row.get('duration_min', 0)} min  ${row.get('cost_usd', 0)}  {reason}")
     return {"row": row}
+
+
+def tree_of(work: Path) -> str:
+    """A git tree object of the working copy as it is now (untracked files included), written through a temporary
+    index: no commit, no ref and the real index untouched, so the agent's `git status`/`git log` see nothing new."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(td, "index"))
+        g = lambda *a: subprocess.run(["git", "-C", str(work), *a], capture_output=True, text=True, env=env)
+        g("read-tree", "lab-base")
+        g("add", "-A")
+        return g("write-tree").stdout.strip()
+
+
+def run_sequence(trick, tid, side, n, out_dir, dry):
+    """Sequence mode (`"sequence": true`, day 32): one repo copy per run, the tasks in `tasks` order, one call per
+    task. A side's `session` is "fresh" (a new session per task: what /clear amounts to in headless runs) or "resume"
+    (every later task resumes the first task's session). After each call the copy is cloned (APFS) and that task's
+    own accept.sh grades the clone, so grading never touches the copy the next task works in, and no task's
+    changes can fail an earlier task's grader. Each task writes a normal row (task, run n), so summary, per-task
+    passes and the verdict count graded tasks exactly as on a standard day. Diffs, diffstat and events are per task:
+    what changed during that call. Each call has the day's full timeout. An infrastructure error stops the sequence;
+    the remaining tasks of that run are recorded as infra errors (rerun the whole sequence)."""
+    tdir = LAB / "tricks" / tid
+    side_cfg = trick["sides"][side]
+    tasks = trick["tasks"]
+    raws = [out_dir / "raw" / f"{side}-{t}-r{n}.json" for t in tasks]
+    if not dry and all(r.exists() for r in raws):
+        return
+    work = WORK_ROOT / tid / side / f"seq-r{n}"
+    clone_base(work, LAB / "base" / trick.get("base", "frai"))
+    apply_overlay(tdir, side_cfg, work)
+    resume = side_cfg.get("session", "fresh") == "resume"
+    allowed = ",".join([ALLOWED_TOOLS] + list(side_cfg.get("allowed_tools_extra") or []))
+    # Same flags as run_one, with sessions kept on disk (needed for --resume; harmless for fresh sessions).
+    flags = ["--output-format", "stream-json", "--verbose", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
+             "--allowedTools", allowed, "--disallowedTools", DENIED_TOOLS, "--setting-sources", "project,local", "--strict-mcp-config"]
+    if not trick.get("skills"):
+        flags.append("--disable-slash-commands")
+    model = side_cfg.get("model") or trick.get("model")
+    if model:
+        flags += ["--model", model]
+    effort = side_cfg.get("effort") or trick.get("effort")
+    if effort:
+        flags += ["--effort", effort]
+    flags += side_cfg.get("extra_args", [])
+    timeout_s = int(trick.get("timeout_min", 20)) * 60
+    session, prev_tree, stopped = None, "lab-base", ""
+    for pos, task in enumerate(tasks, 1):
+        prompt = build_prompt(tdir, side_cfg, task)
+        cmd = ["claude", "-p", prompt] + (["--resume", session] if resume and session else []) + flags
+        row = {"trick": tid, "side": side, "task": task, "run": n, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        data, timeout, infra = {}, False, ""
+        if dry:
+            row.update(duration_min=0, cost_usd=0, turns=0)
+            print("DRY", f"[{pos}/{len(tasks)} {'resume' if resume and pos > 1 else 'new session'}]",
+                  " ".join(c if len(c) < 60 else c[:57] + "..." for c in cmd), f"(cwd {work})")
+        elif stopped:
+            infra = f"sequence stopped after an infrastructure error on an earlier task: {stopped}"[:160]
+        else:
+            t0 = time.time()
+            data, timeout = call_claude(cmd, work, timeout_s, side_cfg.get("env"))
+            # the session id comes from the result, or from any event if the call timed out before its result
+            session = data.get("session_id") or next((e.get("session_id") for e in data.get("_events") or [] if e.get("session_id")), session)
+            data["compactions"] = compactions(data.get("_events") or [])
+            text = str(data.get("result", "")).lower()
+            if data.get("is_error") and (data.get("infra_crash") or any(m in text for m in INFRA_MARKERS) or data.get("terminal_reason") == "api_error"
+                                         or str(data.get("api_error_status") or "") in ("429", "500", "502", "503", "529")):
+                infra = stopped = text[:160] or "infrastructure error (no message)"
+            usage = data.get("usage") or {}
+            row.update(duration_min=round((data.get("duration_ms") or (time.time() - t0) * 1000) / 60000, 2),
+                       cost_usd=round(float(data.get("total_cost_usd") or 0), 4), turns=data.get("num_turns") or 0,
+                       input_tokens=usage.get("input_tokens", 0), output_tokens=usage.get("output_tokens", 0),
+                       cache_read_tokens=usage.get("cache_read_input_tokens", 0),
+                       models="|".join((data.get("modelUsage") or {}).keys()),
+                       permission_denials=len(data.get("permission_denials") or []))
+        cur_tree = tree_of(work)
+        st = subprocess.run(["git", "-C", str(work), "diff", "--shortstat", prev_tree, cur_tree], capture_output=True, text=True).stdout
+        num = lambda word: next((int(x.split()[0]) for x in st.split(",") if word in x), 0)
+        extra = ""
+        if trick.get("record_compactions") and not dry:
+            extra = compaction_extra("", data.get("compactions") or [])
+        snap = work.parent / f"seq-r{n}-after-{pos}-{task}"
+        if infra:
+            passed, reason = False, "infra error, not graded"
+        else:
+            if subprocess.run(["cp", "-cR", str(work), str(snap)], capture_output=True).returncode != 0:
+                subprocess.run(["cp", "-R", str(work), str(snap)], check=True)
+            passed, reason = grade(task, snap)
+            if timeout:
+                passed, reason = False, f"FAIL timeout after {trick.get('timeout_min', 20)} min (grader alone said: {reason})"
+        row.update(passed=passed, grade_reason=reason, infra_error=infra, timeout=timeout,
+                   files_changed=num("file"), insertions=num("insertion"), deletions=num("deletion"), extra=extra)
+        if not dry:
+            raw = out_dir / "raw" / f"{side}-{task}-r{n}.json"
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            d = subprocess.run(["git", "-C", str(work), "diff", prev_tree, cur_tree, "--", ".", ":(exclude)node_modules", ":(exclude,glob)**/dist/**"],
+                               capture_output=True, text=True).stdout
+            raw.with_suffix(".diff").write_text(d[:2_000_000])
+            with open(raw.with_suffix(".events.jsonl"), "w") as fh:
+                for e in data.get("_events") or []:
+                    fh.write(json.dumps(e) + "\n")
+            keep = {k: v for k, v in data.items() if k != "_events"}
+            raw.write_text(json.dumps({"row": row, "claude": keep, "cmd": cmd[:2] + ["<prompt>"] + cmd[3:],
+                                       "sequence": {"position": pos, "order": tasks, "session": "resume" if resume else "fresh",
+                                                    "tree_before": prev_tree, "tree_after": cur_tree}}, indent=2))
+            with lock:
+                new = not (out_dir / "runs.csv").exists()
+                with open(out_dir / "runs.csv", "a", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+                    if new:
+                        w.writeheader()
+                    w.writerow(row)
+        shutil.rmtree(snap, ignore_errors=True)
+        prev_tree = cur_tree
+        print(f"{'PASS' if passed else 'FAIL'} {side:<7} {task:<20} r{n} [{pos}/{len(tasks)}]  {row.get('duration_min', 0)} min  ${row.get('cost_usd', 0)}  {reason}")
+    if not dry:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def side_stats(rows):
@@ -371,6 +521,9 @@ def main():
     ap.add_argument("--only-task")
     a = ap.parse_args()
     trick = load_trick(a.trick)
+    if trick.get("marathon"):  # module 4 v2 marathon days: one long scripted session per run, run by harness/marathon.py
+        import marathon  # same folder; parses the same command line (--runs, --parallel, --dry-run, --summarize-only)
+        return marathon.main()
     ensure_fetched(trick, LAB / "tricks" / a.trick)
     out_dir = LAB / "runs" / a.trick
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -383,8 +536,11 @@ def main():
     runs = 1 if a.dry_run else (a.runs or trick.get("runs", 3))
     tasks = [a.only_task] if a.only_task else trick["tasks"]
     jobs = [(side, task, n) for n in range(1, runs + 1) for task in tasks for side in ("with", "without")]
+    if trick.get("sequence"):  # day 32: one job per side and run, covering every task in order (--only-task doesn't apply)
+        jobs = [(side, None, n) for n in range(1, runs + 1) for side in ("with", "without")]
     with ThreadPoolExecutor(max_workers=1 if a.dry_run else a.parallel) as ex:
-        futs = [ex.submit(run_one, trick, a.trick, s, t, n, out_dir, a.dry_run) for s, t, n in jobs]
+        futs = [ex.submit(run_sequence, trick, a.trick, s, n, out_dir, a.dry_run) if trick.get("sequence")
+                else ex.submit(run_one, trick, a.trick, s, t, n, out_dir, a.dry_run) for s, t, n in jobs]
         for f in as_completed(futs):
             f.result()
     if not a.dry_run:

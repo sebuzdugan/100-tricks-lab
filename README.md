@@ -62,6 +62,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 20 | Write the failing test first, then code | 6/9 vs 8/9, never ran its tests on 3 of 9 | ❌ cut |
 | 21 | "You are a senior engineer" role line | 6/12 vs 6/12, 33% costlier | ❌ cut |
 | 22 | One code example vs one sentence for a style | 7/12 vs 7/12, fully styled 25% vs 42% | 🟡 optional |
+| 23 | Wrap prompt sections in XML tags | 8/12 vs 8/12, same tasks passing | 🟡 optional |
 
 **Module 2, after 234 runs:** every build followed what was written first (plan, spec, answers, checklist, tests), right or wrong. No planning step clearly added passes; only the half-cent chat plan earned its cost.
 

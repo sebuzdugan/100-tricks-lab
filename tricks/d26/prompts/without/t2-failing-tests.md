@@ -1,0 +1,1 @@
+The frai-core tests fail (`pnpm --filter frai-core test`). Fix the source so the whole suite passes, keeping every public export working and without editing, skipping or deleting any `*.test.js` file.

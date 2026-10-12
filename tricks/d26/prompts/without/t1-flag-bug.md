@@ -1,0 +1,1 @@
+`frai gate init --ci` creates FRAI-SPEC.md but not `.github/workflows/rai-gate.yml`, while `frai-gate init --ci` works. Fix how the `frai` CLI in packages/frai-cli/src passes the flag through, without changing packages/frai-gate.

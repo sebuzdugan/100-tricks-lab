@@ -67,6 +67,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 25 | Write the key rule in ALL CAPS | 8/12 vs 7/12, comment breaks 0 vs 1 | 🟡 optional |
 | 26 | Detailed task prompt vs two sentences | 6/12 vs 5/12, same time and cost | 🟡 optional |
 | 27 | Guardrails as "don't" rules vs positive rules | 8/12 vs 10/12, rule breaks 4 vs 3 | 🟡 optional |
+| 28 | Paste the full failing output vs one sentence | 5/12 vs 2/12, same time and cost | ✅ keep |
 
 **Module 2, after 234 runs:** every build followed what was written first (plan, spec, answers, checklist, tests), right or wrong. No planning step clearly added passes; only the half-cent chat plan earned its cost.
 

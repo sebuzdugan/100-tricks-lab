@@ -69,7 +69,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 27 | Guardrails as "don't" rules vs positive rules | 8/12 vs 10/12, rule breaks 4 vs 3 | 🟡 optional |
 | 28 | Paste the full failing output vs one sentence | 5/12 vs 2/12, same time and cost | ✅ keep |
 | 29 | A "be concise" line before the task | 6/12 vs 7/12, 26% fewer output tokens | 🟡 optional |
-| 30 | Restate the task before coding | 8/12 vs 6/12, the gap is two runs on one task | 🟡 optional |
+| 30 | Restate the task before coding | 8/12 vs 6/12, the gap is two runs on one task | ✅ keep |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

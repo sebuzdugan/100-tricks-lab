@@ -1,0 +1,364 @@
+diff --git a/src/payments.js b/src/payments.js
+index 7d13f96..6897839 100644
+--- a/src/payments.js
++++ b/src/payments.js
+@@ -67,6 +67,9 @@ export function recordPayment(invoice, { amount, date }) {
+     status,
+     number: invoice.number,
+     lines: invoice.lines.map((line) => ({ ...line })),
++    ...(invoice.terms && { terms: invoice.terms }),
++    ...(invoice.dueDate && { dueDate: invoice.dueDate }),
++    ...(invoice.voucher && { voucher: invoice.voucher }),
+     payments,
+   });
+ }
+diff --git a/src/reports.js b/src/reports.js
+new file mode 100644
+index 0000000..189d999
+--- /dev/null
++++ b/src/reports.js
+@@ -0,0 +1,45 @@
++import { balanceDue } from './payments.js';
++import { daysBetween } from './dates.js';
++
++/**
++ * Find invoices that are overdue.
++ * @param {Array<{ customerId: string, number?: string, issueDate: string, dueDate?: string, status: string, lines: Array, payments?: Array, voucher?: { code: string, amount: number } }>} invoices
++ * @param {string} asOf Date in YYYY-MM-DD format
++ * @returns {Array<{ number: string, customerId: string, dueDate: string, daysOverdue: number, due: number }>}
++ */
++export function overdueInvoices(invoices, asOf) {
++  const overdue = invoices
++    .filter((inv) => {
++      // Must be issued or partially_paid
++      if (inv.status !== 'issued' && inv.status !== 'partially_paid') {
++        return false;
++      }
++
++      // Must have a due date
++      if (!inv.dueDate) {
++        return false;
++      }
++
++      // Due date must be before asOf
++      if (inv.dueDate >= asOf) {
++        return false;
++      }
++
++      return true;
++    })
++    .map((inv) => {
++      const daysOverdue = daysBetween(inv.dueDate, asOf);
++      const due = balanceDue(inv);
++
++      return {
++        number: inv.number,
++        customerId: inv.customerId,
++        dueDate: inv.dueDate,
++        daysOverdue,
++        due,
++      };
++    })
++    .sort((a, b) => b.daysOverdue - a.daysOverdue);
++
++  return overdue;
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+new file mode 100644
+index 0000000..e4869e1
+--- /dev/null
++++ b/test/reports.test.js
+@@ -0,0 +1,293 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { overdueInvoices } from '../src/reports.js';
++import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++function createTestInvoice(customerId, issueDate, terms = 'NET30') {
++  const draft = createInvoice({
++    customerId,
++    issueDate,
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++    terms,
++  });
++  if (!draft.ok) throw new Error('Failed to create draft invoice');
++  return issueInvoice(draft.value, []);
++}
++
++test('overdueInvoices returns empty array when no invoices', () => {
++  const result = overdueInvoices([], '2025-02-15');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices filters out paid invoices', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const { total } = invoiceTotals(inv.value);
++  const paid = recordPayment(inv.value, { amount: total, date: '2025-01-20' });
++  assert.equal(paid.ok, true);
++  assert.equal(paid.value.status, 'paid');
++
++  const result = overdueInvoices([paid.value], '2025-02-01');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices filters out draft invoices', () => {
++  const draft = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++    terms: 'NET14',
++  });
++  assert.equal(draft.ok, true);
++
++  const result = overdueInvoices([draft.value], '2025-02-01');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices returns invoice overdue by 1 day', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++  assert.equal(inv.value.dueDate, '2025-01-29');
++
++  const result = overdueInvoices([inv.value], '2025-01-30');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].number, inv.value.number);
++  assert.equal(result[0].customerId, 'C-001');
++  assert.equal(result[0].dueDate, '2025-01-29');
++  assert.equal(result[0].daysOverdue, 1);
++  assert(result[0].due > 0);
++});
++
++test('overdueInvoices returns invoice overdue by 30 days', () => {
++  const inv = createTestInvoice('C-001', '2025-01-01', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-02-14');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].daysOverdue, 30);
++});
++
++test('overdueInvoices filters out invoices on due date', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET30');
++  assert.equal(inv.ok, true);
++  assert.equal(inv.value.dueDate, '2025-02-14');
++
++  const result = overdueInvoices([inv.value], '2025-02-14');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices filters out invoices due in the future', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET30');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-02-13');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices sorts by most overdue first', () => {
++  const inv1 = createTestInvoice('C-001', '2025-01-01', 'NET14');
++  assert.equal(inv1.ok, true);
++
++  const inv2 = createTestInvoice('C-002', '2025-01-10', 'NET14');
++  assert.equal(inv2.ok, true);
++
++  const inv3 = createTestInvoice('C-003', '2025-01-20', 'NET14');
++  assert.equal(inv3.ok, true);
++
++  const result = overdueInvoices(
++    [inv3.value, inv1.value, inv2.value],
++    '2025-02-15'
++  );
++
++  assert.equal(result.length, 3);
++  assert.equal(result[0].daysOverdue, 31);
++  assert.equal(result[1].daysOverdue, 22);
++  assert.equal(result[2].daysOverdue, 12);
++});
++
++test('overdueInvoices includes partially_paid invoices', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const partial = recordPayment(inv.value, { amount: 50000, date: '2025-01-20' });
++  assert.equal(partial.ok, true);
++  assert.equal(partial.value.status, 'partially_paid');
++
++  const result = overdueInvoices([partial.value], '2025-02-01');
++  assert.equal(result.length, 1);
++});
++
++test('overdueInvoices includes issued invoices', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++  assert.equal(inv.value.status, 'issued');
++
++  const result = overdueInvoices([inv.value], '2025-02-01');
++  assert.equal(result.length, 1);
++});
++
++test('overdueInvoices due field is balance due', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const partial = recordPayment(inv.value, { amount: 50000, date: '2025-01-20' });
++  assert.equal(partial.ok, true);
++
++  const { total } = invoiceTotals(partial.value);
++  const result = overdueInvoices([partial.value], '2025-02-01');
++  assert.equal(result.length, 1);
++  assert(result[0].due > 0);
++  assert(result[0].due < total);
++});
++
++test('overdueInvoices filters invoices without due date', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15');
++  assert.equal(inv.ok, true);
++
++  const invNoDue = { ...inv.value, dueDate: undefined };
++
++  const result = overdueInvoices([invNoDue], '2025-02-15');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices with mixed statuses', () => {
++  const inv1 = createTestInvoice('C-001', '2025-01-01', 'NET14');
++  const inv2 = createTestInvoice('C-002', '2025-01-10', 'NET14');
++  const inv3 = createTestInvoice('C-003', '2025-01-20', 'NET14');
++
++  assert.equal(inv1.ok, true);
++  assert.equal(inv2.ok, true);
++  assert.equal(inv3.ok, true);
++
++  const { total: total2 } = invoiceTotals(inv2.value);
++  const paid2 = recordPayment(inv2.value, { amount: total2, date: '2025-01-25' });
++  assert.equal(paid2.ok, true);
++
++  const partial3 = recordPayment(inv3.value, { amount: 50000, date: '2025-01-25' });
++  assert.equal(partial3.ok, true);
++
++  const result = overdueInvoices(
++    [inv1.value, paid2.value, partial3.value],
++    '2025-02-15'
++  );
++
++  assert.equal(result.length, 2);
++  assert.equal(result[0].number, inv1.value.number);
++  assert.equal(result[1].number, inv3.value.number);
++});
++
++test('overdueInvoices with EOM terms', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'EOM');
++  assert.equal(inv.ok, true);
++  assert.equal(inv.value.dueDate, '2025-01-31');
++
++  const result = overdueInvoices([inv.value], '2025-02-01');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].daysOverdue, 1);
++});
++
++test('overdueInvoices with NET30 terms', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET30');
++  assert.equal(inv.ok, true);
++  assert.equal(inv.value.dueDate, '2025-02-14');
++
++  const result = overdueInvoices([inv.value], '2025-02-15');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].daysOverdue, 1);
++});
++
++test('overdueInvoices preserves customerId', () => {
++  const inv = createTestInvoice('C-005', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-02-01');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].customerId, 'C-005');
++});
++
++test('overdueInvoices returns correct structure', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-02-01');
++  assert.equal(result.length, 1);
++
++  const invoice = result[0];
++  assert(Object.keys(invoice).includes('number'));
++  assert(Object.keys(invoice).includes('customerId'));
++  assert(Object.keys(invoice).includes('dueDate'));
++  assert(Object.keys(invoice).includes('daysOverdue'));
++  assert(Object.keys(invoice).includes('due'));
++  assert.equal(Object.keys(invoice).length, 5);
++});
++
++test('overdueInvoices empty result when all invoices paid', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const { total } = invoiceTotals(inv.value);
++  const paid = recordPayment(inv.value, { amount: total, date: '2025-01-20' });
++  assert.equal(paid.ok, true);
++
++  const result = overdueInvoices([paid.value], '2025-02-01');
++  assert.deepEqual(result, []);
++});
++
++test('overdueInvoices handles multiple overdue invoices for same customer', () => {
++  const inv1 = createTestInvoice('C-001', '2025-01-01', 'NET14');
++  const inv2 = createTestInvoice('C-001', '2025-01-10', 'NET14');
++
++  assert.equal(inv1.ok, true);
++  assert.equal(inv2.ok, true);
++
++  const result = overdueInvoices([inv1.value, inv2.value], '2025-02-15');
++  assert.equal(result.length, 2);
++  assert.equal(result[0].customerId, 'C-001');
++  assert.equal(result[1].customerId, 'C-001');
++  assert(result[0].daysOverdue > result[1].daysOverdue);
++});
++
++test('overdueInvoices with highly overdue invoices', () => {
++  const inv = createTestInvoice('C-001', '2025-01-01', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-12-31');
++  assert.equal(result.length, 1);
++  assert(result[0].daysOverdue > 300);
++});
++
++test('overdueInvoices with invoice due yesterday', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const result = overdueInvoices([inv.value], '2025-01-30');
++  assert.equal(result.length, 1);
++  assert.equal(result[0].daysOverdue, 1);
++});
++
++test('overdueInvoices preserves invoice number correctly', () => {
++  const inv1 = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  const inv2 = createTestInvoice('C-001', '2025-01-20', 'NET14');
++
++  assert.equal(inv1.ok, true);
++  assert.equal(inv2.ok, true);
++
++  const result = overdueInvoices([inv1.value, inv2.value], '2025-02-15');
++  assert.equal(result[0].number, inv1.value.number);
++  assert.equal(result[1].number, inv2.value.number);
++});
++
++test('overdueInvoices with fully paid invoice shows zero due', () => {
++  const inv = createTestInvoice('C-001', '2025-01-15', 'NET14');
++  assert.equal(inv.ok, true);
++
++  const { total } = invoiceTotals(inv.value);
++  const paid = recordPayment(inv.value, { amount: total, date: '2025-01-20' });
++  assert.equal(paid.ok, true);
++
++  // Not in result because status is paid
++  const result = overdueInvoices([paid.value], '2025-02-01');
++  assert.deepEqual(result, []);
++});

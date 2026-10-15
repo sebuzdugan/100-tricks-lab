@@ -1,0 +1,397 @@
+diff --git a/src/errors.js b/src/errors.js
+index 72504d5..aab2318 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -8,6 +8,8 @@ export const ERRORS = {
+   LINE_NOT_FOUND: 'No line with that SKU on the invoice.',
+   NO_LINES: 'Invoice must have at least one line.',
+   NOT_DRAFT: 'Can only modify invoices with status "draft".',
++  NOT_ISSUED: 'Can only record payments on issued or partially paid invoices.',
++  OVERPAYMENT: 'Payment exceeds the amount still owed.',
+   QTY_INVALID: 'Quantity must be a positive integer.',
+   UNKNOWN_SKU: 'No product with that SKU in the catalogue.',
+ };
+diff --git a/src/payments.js b/src/payments.js
+new file mode 100644
+index 0000000..7d13f96
+--- /dev/null
++++ b/src/payments.js
+@@ -0,0 +1,72 @@
++import { ok, fail } from './result.js';
++import { invoiceTotals } from './invoices.js';
++
++/**
++ * Calculate the total amount paid on an invoice.
++ * @param {{ payments?: Array<{ amount: number, date: string }> }}
++ * @returns {number} Total paid in cents
++ */
++export function totalPaid(invoice) {
++  if (!invoice.payments || invoice.payments.length === 0) {
++    return 0;
++  }
++  return invoice.payments.reduce((sum, payment) => sum + payment.amount, 0);
++}
++
++/**
++ * Calculate the balance still owed on an invoice.
++ * @param {{ lines: Array, payments?: Array<{ amount: number, date: string }> }}
++ * @returns {number} Balance due in cents
++ */
++export function balanceDue(invoice) {
++  const { total } = invoiceTotals(invoice);
++  return Math.max(0, total - totalPaid(invoice));
++}
++
++/**
++ * Record a payment on an issued or partially paid invoice.
++ * @param {{ customerId: string, issueDate: string, status: string, lines: Array, payments?: Array<{ amount: number, date: string }> }} invoice
++ * @param {{ amount: number, date: string }}
++ * @returns {{ ok: true, value: { customerId: string, issueDate: string, status: string, lines: Array, payments: Array<{ amount: number, date: string }> } } | { ok: false, error: string }}
++ */
++export function recordPayment(invoice, { amount, date }) {
++  // Validate status is issued or partially_paid
++  if (invoice.status !== 'issued' && invoice.status !== 'partially_paid') {
++    return fail('NOT_ISSUED');
++  }
++
++  // Validate amount is a positive integer
++  if (!Number.isInteger(amount) || amount <= 0) {
++    return fail('AMOUNT_INVALID');
++  }
++
++  // Get invoice total and calculate balance due
++  const { total } = invoiceTotals(invoice);
++  const paid = totalPaid(invoice);
++  const stillOwed = total - paid;
++
++  // Check for overpayment
++  if (amount > stillOwed) {
++    return fail('OVERPAYMENT');
++  }
++
++  // Add payment to payments array
++  const payments = invoice.payments ? [...invoice.payments] : [];
++  payments.push({ amount, date });
++
++  // Calculate new balance
++  const newPaid = paid + amount;
++  const newBalance = total - newPaid;
++
++  // Determine new status
++  const status = newBalance <= 0 ? 'paid' : 'partially_paid';
++
++  return ok({
++    customerId: invoice.customerId,
++    issueDate: invoice.issueDate,
++    status,
++    number: invoice.number,
++    lines: invoice.lines.map((line) => ({ ...line })),
++    payments,
++  });
++}
+diff --git a/test/payments.test.js b/test/payments.test.js
+new file mode 100644
+index 0000000..07c08ad
+--- /dev/null
++++ b/test/payments.test.js
+@@ -0,0 +1,300 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { recordPayment, balanceDue, totalPaid } from '../src/payments.js';
++import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++
++test('balanceDue equals total when no payments made', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++  assert.equal(balanceDue(invoice), total);
++});
++
++test('balanceDue decreases with each payment', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const halfPayment = Math.floor(total / 2);
++  const r1 = recordPayment(invoice, { amount: halfPayment, date: '2025-01-20' });
++  assert.equal(r1.ok, true);
++  assert.equal(balanceDue(r1.value), total - halfPayment);
++
++  const r2 = recordPayment(r1.value, { amount: halfPayment, date: '2025-01-25' });
++  assert.equal(r2.ok, true);
++  assert.equal(balanceDue(r2.value), 0);
++});
++
++test('recordPayment sets status to partially_paid with partial payment', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const r = recordPayment(invoice, { amount: Math.floor(total / 2), date: '2025-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.status, 'partially_paid');
++});
++
++test('recordPayment sets status to paid when full amount paid', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const r = recordPayment(invoice, { amount: total, date: '2025-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.status, 'paid');
++});
++
++test('recordPayment adds payment to payments array', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const r = recordPayment(invoice, { amount: Math.floor(total / 2), date: '2025-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.payments.length, 1);
++  assert.equal(r.value.payments[0].amount, Math.floor(total / 2));
++  assert.equal(r.value.payments[0].date, '2025-01-20');
++});
++
++test('recordPayment creates payments array if missing', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const r = recordPayment(invoice, { amount: 1000, date: '2025-01-20' });
++  assert.equal(r.ok, true);
++  assert.ok(Array.isArray(r.value.payments));
++  assert.equal(r.value.payments.length, 1);
++});
++
++test('recordPayment accumulates multiple payments', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const payment1 = Math.floor(total / 3);
++  const payment2 = Math.floor(total / 3);
++  const payment3 = total - payment1 - payment2;
++
++  const r1 = recordPayment(invoice, { amount: payment1, date: '2025-01-20' });
++  assert.equal(r1.ok, true);
++  assert.equal(r1.value.payments.length, 1);
++
++  const r2 = recordPayment(r1.value, { amount: payment2, date: '2025-01-25' });
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.payments.length, 2);
++
++  const r3 = recordPayment(r2.value, { amount: payment3, date: '2025-01-30' });
++  assert.equal(r3.ok, true);
++  assert.equal(r3.value.payments.length, 3);
++  assert.equal(r3.value.status, 'paid');
++});
++
++test('recordPayment rejects payment on draft invoice', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'draft',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  const r = recordPayment(invoice, { amount: 1000, date: '2025-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'NOT_ISSUED' });
++});
++
++test('recordPayment rejects payment on already paid invoice', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'paid',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++    payments: [{ amount: 121000, date: '2025-01-20' }],
++  };
++
++  const r = recordPayment(invoice, { amount: 1000, date: '2025-01-25' });
++  assert.deepEqual(r, { ok: false, error: 'NOT_ISSUED' });
++});
++
++test('recordPayment rejects non-integer amount', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  const r = recordPayment(invoice, { amount: 100.5, date: '2025-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment rejects zero amount', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  const r = recordPayment(invoice, { amount: 0, date: '2025-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment rejects negative amount', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  const r = recordPayment(invoice, { amount: -1000, date: '2025-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment rejects overpayment', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const { total } = invoiceTotals(invoice);
++
++  const r = recordPayment(invoice, { amount: total + 1, date: '2025-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'OVERPAYMENT' });
++});
++
++test('recordPayment accepts payment on partially_paid invoice', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'partially_paid',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++    payments: [{ amount: 5000, date: '2025-01-20' }],
++  };
++  const { total } = invoiceTotals(invoice);
++  const remaining = total - 5000;
++
++  const r = recordPayment(invoice, { amount: remaining, date: '2025-01-25' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.status, 'paid');
++});
++
++test('recordPayment does not mutate original invoice', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  recordPayment(invoice, { amount: 1000, date: '2025-01-20' });
++  assert.equal(invoice.status, 'issued');
++  assert.equal(invoice.payments, undefined);
++});
++
++test('totalPaid returns 0 when no payments', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'issued',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++
++  assert.equal(totalPaid(invoice), 0);
++});
++
++test('totalPaid sums all payments', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    status: 'partially_paid',
++    number: 'INV-2025-001',
++    lines: [
++      { sku: 'WIDGET', name: 'Widget', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++    payments: [
++      { amount: 30000, date: '2025-01-20' },
++      { amount: 40000, date: '2025-01-25' },
++      { amount: 50000, date: '2025-01-30' },
++    ],
++  };
++
++  assert.equal(totalPaid(invoice), 120000);
++});

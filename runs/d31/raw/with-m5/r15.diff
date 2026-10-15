@@ -1,0 +1,357 @@
+diff --git a/src/credits.js b/src/credits.js
+new file mode 100644
+index 0000000..91b4b5e
+--- /dev/null
++++ b/src/credits.js
+@@ -0,0 +1,65 @@
++import { ok, fail } from './result.js';
++import { invoiceTotals } from './invoices.js';
++
++/**
++ * Generate the next credit note number for a given date.
++ * @param {string[]} existingNumbers - All existing invoice and credit note numbers
++ * @param {string} date - YYYY-MM-DD date
++ * @returns {string} - Credit note number in CN-YYYY-NNNN format
++ */
++function nextCreditNoteNumber(existingNumbers, date) {
++  const year = date.split('-')[0];
++  const cnNumbers = existingNumbers.filter((num) => num.startsWith('CN-'));
++  const cnThisYear = cnNumbers
++    .filter((num) => num.startsWith(`CN-${year}-`))
++    .map((num) => {
++      const match = num.match(/CN-\d{4}-(\d{4})/);
++      return match ? Number(match[1]) : 0;
++    });
++
++  const maxCounter = cnThisYear.length > 0 ? Math.max(...cnThisYear) : 0;
++  const nextCounter = maxCounter + 1;
++  return `CN-${year}-${String(nextCounter).padStart(4, '0')}`;
++}
++
++/**
++ * Create a credit note for an invoice.
++ * @param {{ status: string, number?: string, customerId: string, lines: Array }} invoice
++ * @param {{ amount: unknown, reason: string, date: string }} params
++ * @param {string[]} existingNumbers - All existing invoice and credit note numbers
++ * @returns {{ ok: true, value: { number: string, invoiceNumber: string, customerId: string, amount: number, reason: string, date: string } } | { ok: false, error: string }}
++ */
++export function createCreditNote(invoice, { amount, reason, date }, existingNumbers) {
++  // Check invoice is issued, partially_paid, or paid
++  if (!['issued', 'partially_paid', 'paid'].includes(invoice.status)) {
++    return fail('NOT_ISSUED');
++  }
++
++  // Validate amount is a positive integer
++  if (!Number.isInteger(amount) || amount <= 0) {
++    return fail('AMOUNT_INVALID');
++  }
++
++  // Get invoice total
++  const { total } = invoiceTotals(invoice);
++
++  // Validate credit amount doesn't exceed invoice total
++  if (amount > total) {
++    return fail('CREDIT_TOO_HIGH');
++  }
++
++  // Generate credit note number
++  const number = nextCreditNoteNumber(existingNumbers, date);
++
++  // Create credit note
++  const creditNote = {
++    number,
++    invoiceNumber: invoice.number,
++    customerId: invoice.customerId,
++    amount,
++    reason,
++    date,
++  };
++
++  return ok(creditNote);
++}
+diff --git a/src/errors.js b/src/errors.js
+index abde42a..12cc6ac 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,6 +1,7 @@
+ /** Every error code the project returns, with a one-line message. Codes are UPPER_SNAKE_CASE. */
+ export const ERRORS = {
+   AMOUNT_INVALID: 'Amount must be a whole, positive number of cents.',
++  CREDIT_TOO_HIGH: 'Credit note amount exceeds the invoice total.',
+   CUSTOMER_INVALID: 'A customer needs an id, a name and a valid email.',
+   CUSTOMER_NOT_FOUND: 'No customer with that id.',
+   DATE_INVALID: 'Issue date must be a valid date in YYYY-MM-DD format.',
+diff --git a/test/credits.test.js b/test/credits.test.js
+new file mode 100644
+index 0000000..22e5b5d
+--- /dev/null
++++ b/test/credits.test.js
+@@ -0,0 +1,268 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createCreditNote } from '../src/credits.js';
++import { createInvoice, issueInvoice, applyVoucher } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++// Helper to create and issue an invoice
++function createAndIssueInvoice(customerId, issueDate, lines) {
++  const draftResult = createInvoice({
++    customerId,
++    issueDate,
++    lines,
++  });
++  if (!draftResult.ok) throw new Error(`Failed to create invoice: ${draftResult.error}`);
++
++  const issuedResult = issueInvoice(draftResult.value, []);
++  if (!issuedResult.ok) throw new Error(`Failed to issue invoice: ${issuedResult.error}`);
++
++  return issuedResult.value;
++}
++
++test('createCreditNote creates a credit note', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Defective item', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.invoiceNumber, invoice.number);
++  assert.equal(r.value.customerId, 'C-001');
++  assert.equal(r.value.amount, 500);
++  assert.equal(r.value.reason, 'Defective item');
++  assert.equal(r.value.date, '2025-01-20');
++});
++
++test('createCreditNote generates CN number', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.match(r.value.number, /^CN-2025-\d{4}$/);
++});
++
++test('createCreditNote generates first CN number correctly', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.number, 'CN-2025-0001');
++});
++
++test('createCreditNote increments CN counter', () => {
++  const invoice1 = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++  const invoice2 = createAndIssueInvoice('C-001', '2025-01-16', [{ sku: 'DES-HOUR', qty: 1 }]);
++
++  const existing = [];
++
++  const r1 = createCreditNote(invoice1, { amount: 500, reason: 'Return', date: '2025-01-20' }, existing);
++  assert.equal(r1.ok, true);
++  assert.equal(r1.value.number, 'CN-2025-0001');
++  existing.push(r1.value.number);
++
++  const r2 = createCreditNote(invoice2, { amount: 600, reason: 'Discount', date: '2025-01-21' }, existing);
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.number, 'CN-2025-0002');
++});
++
++test('createCreditNote uses separate counter from invoices', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const existingNumbers = [
++    'INV-2025-0001',
++    'INV-2025-0002',
++    'INV-2025-0003',
++  ];
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, existingNumbers);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.number, 'CN-2025-0001');
++});
++
++test('createCreditNote restarts CN counter each year', () => {
++  const invoice2024 = createAndIssueInvoice('C-001', '2024-12-15', [{ sku: 'ICON-SET', qty: 1 }]);
++  const invoice2025 = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const existingNumbers = ['CN-2024-0001', 'CN-2024-0002'];
++
++  const r2025 = createCreditNote(invoice2025, { amount: 500, reason: 'Return', date: '2025-01-20' }, existingNumbers);
++  assert.equal(r2025.ok, true);
++  assert.equal(r2025.value.number, 'CN-2025-0001');
++});
++
++test('createCreditNote rejects draft invoice', () => {
++  const draftResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'ICON-SET', qty: 1 }],
++  });
++  assert.equal(draftResult.ok, true);
++
++  const r = createCreditNote(draftResult.value, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'NOT_ISSUED');
++});
++
++test('createCreditNote accepts issued invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++  assert.equal(invoice.status, 'issued');
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote accepts partially_paid invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const paymentResult = recordPayment(invoice, { amount: 500, date: '2025-01-20' });
++  assert.equal(paymentResult.ok, true);
++  assert.equal(paymentResult.value.status, 'partially_paid');
++
++  const r = createCreditNote(paymentResult.value, { amount: 300, reason: 'Return', date: '2025-01-21' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote accepts paid invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const paymentResult = recordPayment(invoice, { amount: 1127, date: '2025-01-20' });
++  assert.equal(paymentResult.ok, true);
++  assert.equal(paymentResult.value.status, 'paid');
++
++  const r = createCreditNote(paymentResult.value, { amount: 300, reason: 'Return', date: '2025-01-21' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote rejects non-integer amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 123.45, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'AMOUNT_INVALID');
++});
++
++test('createCreditNote rejects negative amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: -500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'AMOUNT_INVALID');
++});
++
++test('createCreditNote rejects zero amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 0, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'AMOUNT_INVALID');
++});
++
++test('createCreditNote rejects credit exceeding invoice total', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 2000, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'CREDIT_TOO_HIGH');
++});
++
++test('createCreditNote allows credit up to full invoice total', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 1127, reason: 'Full return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote with partial credit', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Partial return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.amount, 500);
++});
++
++test('createCreditNote with invoice containing discounts', () => {
++  const invoice = createAndIssueInvoice('C-002', '2025-01-15', [{ sku: 'ICON-SET', qty: 2, discountPercent: 10 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote with invoice containing VAT', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote with invoice containing voucher', () => {
++  const draftResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'ICON-SET', qty: 1 }],
++  });
++  assert.equal(draftResult.ok, true);
++
++  const voucherResult = applyVoucher(draftResult.value, { code: 'PROMO', amount: 200 });
++  assert.equal(voucherResult.ok, true);
++
++  const issuedResult = issueInvoice(voucherResult.value, []);
++  assert.equal(issuedResult.ok, true);
++
++  const r = createCreditNote(issuedResult.value, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote with multiple line invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [
++    { sku: 'ICON-SET', qty: 2 },
++    { sku: 'DES-HOUR', qty: 1 },
++  ]);
++
++  const r = createCreditNote(invoice, { amount: 1000, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++});
++
++test('createCreditNote finds highest CN counter in any order', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const existingNumbers = [
++    'CN-2025-0003',
++    'CN-2025-0001',
++    'CN-2025-0002',
++    'INV-2025-0001',
++  ];
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, existingNumbers);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.number, 'CN-2025-0004');
++});
++
++test('createCreditNote handles empty existing numbers', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.number, 'CN-2025-0001');
++});
++
++test('createCreditNote pads CN counter to 4 digits', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const existingNumbers = [];
++  for (let i = 0; i < 100; i++) {
++    existingNumbers.push(`CN-2025-${String(i + 1).padStart(4, '0')}`);
++  }
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Return', date: '2025-01-20' }, existingNumbers);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.number, 'CN-2025-0101');
++});
++
++test('createCreditNote preserves invoice details in credit note', () => {
++  const invoice = createAndIssueInvoice('C-001', '2025-01-15', [{ sku: 'ICON-SET', qty: 1 }]);
++
++  const r = createCreditNote(invoice, { amount: 500, reason: 'Defective', date: '2025-01-20' }, []);
++  assert.equal(r.ok, true);
++  assert.equal(r.value.invoiceNumber, invoice.number);
++  assert.equal(r.value.customerId, invoice.customerId);
++  assert.equal(r.value.date, '2025-01-20');
++  assert.equal(r.value.reason, 'Defective');
++});

@@ -1,0 +1,577 @@
+diff --git a/HANDOFF.md b/HANDOFF.md
+index 78dd5c0..3d86d13 100644
+--- a/HANDOFF.md
++++ b/HANDOFF.md
+@@ -2,7 +2,7 @@
+ 
+ ## Project Goal
+ 
+-Build a complete invoicing system for this project, starting with core invoice creation, modification, numbering, and rendering. Future work includes VAT calculations, discounts, and additional output formats.
++Build a complete invoicing system for this project, starting with core invoice creation, modification, numbering, and rendering. Includes line-level discounts, customer tier discounts, VAT calculations, and ID normalization.
+ 
+ ## House Rules (Apply to All Requests)
+ 
+@@ -16,26 +16,76 @@ These rules are fundamental to this project and must be followed in all future w
+ 
+ 4. **Run `npm test` before marking a request done.** All tests must pass before considering work complete.
+ 
++5. **Dates are YYYY-MM-DD strings, all arithmetic in UTC.** Never use machine local time. Use `isValidDate()`, `addDays()`, and `daysBetween()` from `src/dates.js` for date operations.
++
++6. **Always normalize customer IDs.** Use `normalizeId()` from `src/customers.js` to trim and uppercase all customer IDs before comparing or storing them. This handles real-world data like `'c-007 '` and `'C-007'`.
++
++7. **No computed amount may ever go below zero.** Clamp totals and any calculated amount at 0 using `Math.max(0, value)`.
++
+ ## Key Decisions
+ 
+-1. **Invoice numbering format:** `INV-<year>-<counter>`, where:
+-   - Year comes from the invoice's issue date (YYYY)
+-   - Counter is 4 digits, zero-padded (0001, 0002, ..., 9999)
+-   - Counter restarts at 0001 every January
++### Invoice Numbering
++
++Format: `INV-<year>-<counter>`, where:
++- Year comes from the invoice's issue date (YYYY)
++- Counter is 4 digits, zero-padded (0001, 0002, ..., 9999)
++- Counter restarts at 0001 every January
++
++### Line Discounts
++
++- Each line has a `discountPercent` field (0-100, can have decimals like 12.5)
++- Explicit `discountPercent` (even 0) always wins over tier discount
++- If not provided, line gets customer's tier discount
++- Invalid discounts (outside 0-100 or non-numeric) return `DISCOUNT_INVALID`
++- Line discount = `lineTotal × discountPercent / 100`, rounded per line
++
++### Customer Tier Discounts
++
++Applied automatically when a line has no explicit `discountPercent`:
++- **gold**: 5%
++- **silver**: 2.5%
++- **standard**: 0%
++
++Percentages stored in `TIER_DISCOUNTS` in `src/customers.js` for centralized management.
++
++### VAT Calculation
++
++- VAT is computed **per line on the amount after discount**: `(lineTotal - lineDiscount) × vatRate / 100`
++- Each line's VAT is rounded individually using `roundCents()`
++- Invoice VAT = sum of line VATs (NOT a percentage of invoice total)
++- VAT rates: 21% (standard), 9% (reduced), 0% (zero-rated)
++
++### Invoice Totals Calculation
+ 
+-2. **Customer-facing amounts:** Every amount displayed to a customer must go through `formatEuros()` from `src/money.js`. This ensures consistent formatting (€ sign, thousands separators, two decimals) everywhere.
++`invoiceTotals()` returns `{ subtotal, discount, vat, total }`:
++- `subtotal` = sum of all line totals
++- `discount` = sum of all line discounts
++- `vat` = sum of all rounded line VATs
++- `total` = `subtotal - discount + vat`, clamped at 0
++
++### Customer-Facing Amounts
++
++Every amount displayed to a customer must go through `formatEuros()` from `src/money.js`. This ensures consistent formatting (€ sign, thousands separators, two decimals) everywhere.
++
++### ID Normalization
++
++All customer IDs are normalized (trimmed and uppercased) before storage or comparison. This handles real-world data from other systems that may have inconsistent casing and spaces.
+ 
+ ## What Has Been Built
+ 
+ ### Core Invoice Operations (`src/invoices.js`)
+ 
+-- **`createInvoice({ customerId, issueDate, lines })`** — Creates a draft invoice with enriched line items. Each line is validated (qty must be positive integer, SKU must exist) and enriched with product details from the catalogue. Returns `ok(invoice)` or `fail(CODE)`.
++- **`createInvoice({ customerId, issueDate, lines })`** — Creates a draft invoice with enriched line items. Normalizes customer ID, validates date using `isValidDate()`, and applies tier discounts to lines without explicit `discountPercent`. Returns `ok(invoice)` or `fail(CODE)`.
++
++- **`lineTotal(line)`** — Calculates total for a single line: `qty × unitPrice` in cents.
++
++- **`lineDiscount(line)`** — Calculates discount for a line: `lineTotal × discountPercent / 100`, rounded per line in cents.
+ 
+-- **`lineTotal(line)`** — Calculates total for a single line (qty × unitPrice in cents).
++- **`lineVat(line)`** — Calculates VAT for a line: `(lineTotal - lineDiscount) × vatRate / 100`, rounded per line in cents.
+ 
+-- **`invoiceTotals(invoice)`** — Calculates invoice totals, returns `{ subtotal, total }`. Currently subtotal equals total (VAT comes later).
++- **`invoiceTotals(invoice)`** — Calculates invoice totals, returns `{ subtotal, discount, vat, total }` in cents.
+ 
+-- **`addLine(invoice, { sku, qty })`** — Adds a line to a draft invoice. If the SKU already exists, increases that line's quantity instead. Validates qty and SKU. Refuses to modify non-draft invoices (NOT_DRAFT).
++- **`addLine(invoice, { sku, qty, discountPercent })`** — Adds a line to a draft invoice. If the SKU already exists, increases that line's quantity and optionally updates discount. Applies tier discount for new lines without explicit `discountPercent`. Validates qty and SKU. Refuses to modify non-draft invoices (NOT_DRAFT).
+ 
+ - **`removeLine(invoice, sku)`** — Removes a line from a draft invoice by SKU. Refuses to remove the last line (NO_LINES) or modify non-draft invoices (NOT_DRAFT).
+ 
+@@ -50,94 +100,143 @@ These rules are fundamental to this project and must be followed in all future w
+ - **`renderInvoiceText(invoice)`** — Renders an invoice as plain text:
+   - First line: `DRAFT` or the invoice number (e.g., `INV-2024-0001`)
+   - Second line: customer name
+-  - One line per item: `qty × name @ €unitPrice = €lineTotal`
++  - One line per item: `qty × name @ €unitPrice = €lineTotal` (with discount details if applicable)
++  - Subtotal line (if discount > 0 or VAT > 0)
++  - Discount line (if discount > 0): `Discount: -€amount`
++  - VAT line (if VAT > 0): `VAT: €amount`
+   - Final line: `Total: €amount`
+   - All amounts formatted via `formatEuros()`.
+ 
+-### Error Codes (`src/errors.js`)
++### Date Utilities (`src/dates.js`)
++
++- **`isValidDate(text)`** — Validates a date string in YYYY-MM-DD format. Checks format and actual date correctness (e.g., handles leap years). Returns boolean.
++
++- **`addDays(dateStr, n)`** — Adds `n` days to a date string (can be negative). All arithmetic in UTC. Returns date in YYYY-MM-DD format.
++
++- **`daysBetween(a, b)`** — Calculates days between two dates: `b - a`. All arithmetic in UTC. Returns number of days (can be negative).
++
++### Customer Management (`src/customers.js`)
++
++- **`normalizeId(id)`** — Trims whitespace and converts to uppercase. Used before all customer ID comparisons and storage.
+ 
+-Added to support invoicing operations:
+-- `DATE_INVALID` — Date must be in YYYY-MM-DD format
+-- `LINE_NOT_FOUND` — No line with that SKU on the invoice
+-- `NO_LINES` — Invoice must have at least one line
+-- `NOT_DRAFT` — Only draft invoices can be modified
+-- `QTY_INVALID` — Quantity must be a positive integer
++- **`getCustomer(id)`** — Looks up a customer by ID. Normalizes input ID before lookup. Returns `ok(customer)` or `fail('CUSTOMER_NOT_FOUND')`.
+ 
+-Existing codes still in use:
+-- `CUSTOMER_NOT_FOUND` — No customer with that id
+-- `UNKNOWN_SKU` — No product with that SKU in the catalogue
++- **`listCustomers()`** — Returns all customers as copies (immutable).
++
++- **`validateCustomer(c)`** — Validates a customer object has id, name, and valid email.
++
++- **`TIER_DISCOUNTS`** — Constant object: `{ gold: 5, silver: 2.5, standard: 0 }`. Central place for tier discount percentages.
++
++### Error Codes (`src/errors.js`)
++
++Complete list in `ERRORS` object:
++- `AMOUNT_INVALID` — Amount must be a whole, positive number of cents.
++- `CUSTOMER_INVALID` — A customer needs an id, a name and a valid email.
++- `CUSTOMER_NOT_FOUND` — No customer with that id.
++- `DATE_INVALID` — Date must be in YYYY-MM-DD format and a valid date.
++- `DISCOUNT_INVALID` — Discount must be a number between 0 and 100.
++- `LINE_NOT_FOUND` — No line with that SKU on the invoice.
++- `NO_LINES` — Invoice must have at least one line.
++- `NOT_DRAFT` — Only draft invoices can be modified.
++- `QTY_INVALID` — Quantity must be a positive integer.
++- `UNKNOWN_SKU` — No product with that SKU in the catalogue.
++
++### Existing Modules (Unchanged)
++
++- **`src/money.js`** — `roundCents()`, `formatEuros()`, `parseEuros()`
++- **`src/result.js`** — `ok()`, `fail()` for result values
++- **`src/catalogue.js`** — Product catalogue with `getProduct()`, `listProducts()`
++- **`src/customers.js`** — Customer data with tiers
++- **`data/customers.json`** — Customer database with id, name, email, country, tier
++- **`data/catalogue.json`** — Product database with sku, name, unitPrice, vatRate
+ 
+ ## Test Coverage
+ 
+ All tests pass. Run with `npm test`:
+ 
+-- **`test/invoices.test.js`** (40 tests) — Tests for createInvoice, lineTotal, invoiceTotals, addLine, removeLine, issueInvoice. Covers validation, error cases, immutability.
++- **`test/invoices.test.js`** (116 tests) — Tests for createInvoice, lineTotal, lineDiscount, lineVat, invoiceTotals, addLine, removeLine, issueInvoice. Covers validation, discounts, tier discounts, VAT, error cases, immutability, edge cases.
++
++- **`test/customers.test.js`** (12 tests) — Tests for getCustomer, listCustomers, validateCustomer, normalizeId. Covers normalization, mixed case/spaces, tier validation.
+ 
+ - **`test/numbering.test.js`** (7 tests) — Tests for nextInvoiceNumber. Covers year handling, counter incrementing, zero-padding, unordered input.
+ 
+-- **`test/render.test.js`** (9 tests) — Tests for renderInvoiceText. Covers draft/issued display, customer names, line formatting, amount formatting.
++- **`test/render.test.js`** (22 tests) — Tests for renderInvoiceText. Covers draft/issued display, customer names, line formatting, discount rendering, VAT rendering, amount formatting.
+ 
+-- **Existing tests** (`test/customers.test.js`, `test/catalogue.test.js`, `test/money.test.js`) — All continue to pass.
++- **`test/dates.test.js`** (25 tests) — Tests for isValidDate, addDays, daysBetween. Covers format validation, date correctness, leap years, month/year boundaries, UTC arithmetic.
+ 
+-Total: 61 passing tests.
++- **`test/money.test.js`** (5 tests) — Tests for roundCents, formatEuros, parseEuros (existing, all passing).
+ 
+-## What's Unfinished
++- **`test/catalogue.test.js`** (4 tests) — Tests for product catalogue (existing, all passing).
+ 
+-1. **VAT calculation** — Currently, invoiceTotals returns `{ subtotal, total }` with total = subtotal. VAT calculations need to be added to the total based on line VAT rates. Decision needed on whether to show VAT per-line or aggregate.
++**Total: 139 passing tests** across all modules.
+ 
+-2. **Discounts** — No discount functionality yet. Will need to decide on application (per-line or invoice-level) and how to track them in the invoice object.
++## What's Unfinished
+ 
+-3. **Additional rendering formats** — Only plain text rendering exists. PDF, HTML, or other formats would be future additions.
++1. **Additional rendering formats** — Only plain text rendering exists. PDF, HTML, or other formats would be future additions.
+ 
+-4. **Invoice status workflow** — Currently only 'draft' and 'issued' exist. Future statuses (paid, overdue, cancelled) and transitions may be needed.
++2. **Invoice status workflow** — Currently only 'draft' and 'issued' exist. Future statuses (paid, overdue, cancelled) and transitions may be needed.
+ 
+-5. **Persistence** — No database or file storage yet. Data is all in-memory.
++3. **Persistence** — No database or file storage yet. Data is all in-memory. Would need to implement storage layer and handle invoice number sequence persistence.
+ 
+-## How to Run Tests
++4. **Invoice modification** — Once issued, invoices cannot be modified. Future work might need to handle amendments or credit notes.
+ 
+-```bash
+-npm test
+-```
++5. **Bulk operations** — No support for batch creating or bulk modifying invoices.
+ 
+-All tests must pass before any request is considered complete. The test suite includes:
+-- Unit tests for each function
+-- Validation tests for error cases
+-- Immutability tests to ensure no mutations
+-- Integration tests combining multiple functions
++6. **Reporting** — No summary reports, analytics, or queries across multiple invoices.
+ 
+ ## Code Organization
+ 
+ ```
+ src/
+-  invoices.js       # Core invoice operations
++  invoices.js       # Core invoice operations (create, add line, remove line, issue, totals)
+   numbering.js      # Invoice number generation
+   render.js         # Text rendering
+-  errors.js         # Error codes (update when adding new errors)
+-  money.js          # Existing: money formatting and parsing
+-  customers.js      # Existing: customer lookup
+-  catalogue.js      # Existing: product catalogue
++  dates.js          # Date utilities (validation, arithmetic)
++  customers.js      # Customer lookup, ID normalization, tier discounts
++  errors.js         # Error codes and messages
++  money.js          # Money formatting and parsing (existing)
++  catalogue.js      # Product catalogue (existing)
++  result.js         # Result type (ok/fail) (existing)
+ 
+ test/
+-  invoices.test.js  # Tests for invoices.js
+-  numbering.test.js # Tests for numbering.js
+-  render.test.js    # Tests for render.js
+-  (existing tests)  # Unchanged
++  invoices.test.js  # 116 tests
++  customers.test.js # 12 tests
++  numbering.test.js # 7 tests
++  render.test.js    # 22 tests
++  dates.test.js     # 25 tests
++  money.test.js     # 5 tests (existing)
++  catalogue.test.js # 4 tests (existing)
+ 
+ data/
+-  customers.json    # Customer database
+-  catalogue.json    # Product catalogue
++  customers.json    # Customer database with tiers
++  catalogue.json    # Product catalogue with VAT rates
++```
++
++## How to Run Tests
++
++```bash
++npm test
++```
++
++All 139 tests must pass before any work is considered complete.
++
++For specific test file:
++```bash
++npm test test/invoices.test.js
+ ```
+ 
+ ## Next Steps for Future Work
+ 
+-1. **VAT Implementation** — Add VAT calculation to invoiceTotals. Decide on display strategy (itemized or aggregated).
++1. **Persistence Layer** — Add database or file storage for invoices and invoice number sequences.
+ 
+-2. **Discount Support** — Add discount fields to invoice and line items. Implement discount validation and calculation.
++2. **Invoice Amendments** — Support for issuing credit notes or amended invoices for corrections.
+ 
+ 3. **Extended Rendering** — Add PDF or HTML rendering using the existing text renderer as a base.
+ 
+-4. **Persistence** — Add database or file-based storage for invoice numbers and invoices.
++4. **Additional Status Transitions** — Implement workflow for payment, marking as paid, cancellation, etc.
++
++5. **Bulk Operations** — Batch create or modify multiple invoices.
+ 
+-5. **Additional Status Transitions** — Implement workflow for payment, marking as paid, cancellation, etc.
++6. **Reporting** — Summaries, analytics, customer reports, tax reports (aggregate VAT by rate).
+ 
+ When starting work on any of these, remember the house rules above and this handoff document.
+diff --git a/src/errors.js b/src/errors.js
+index 4ded497..bfd7b8e 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -8,6 +8,8 @@ export const ERRORS = {
+   LINE_NOT_FOUND: 'No line with that SKU on the invoice.',
+   NO_LINES: 'Invoice must have at least one line.',
+   NOT_DRAFT: 'Only draft invoices can be modified.',
++  NOT_ISSUED: 'Invoice must be issued or partially paid to record a payment.',
++  OVERPAYMENT: 'Payment cannot exceed the amount still owed.',
+   QTY_INVALID: 'Quantity must be a positive integer.',
+   UNKNOWN_SKU: 'No product with that SKU in the catalogue.',
+ };
+diff --git a/src/payments.js b/src/payments.js
+new file mode 100644
+index 0000000..ee895e0
+--- /dev/null
++++ b/src/payments.js
+@@ -0,0 +1,59 @@
++import { ok, fail } from './result.js';
++import { invoiceTotals } from './invoices.js';
++
++/**
++ * Calculate the total amount paid on an invoice.
++ * @param {{ payments?: Array<{ amount: number, date: string }> }} invoice
++ * @returns {number} total paid in cents
++ */
++function totalPaid(invoice) {
++  if (!invoice.payments) return 0;
++  return invoice.payments.reduce((sum, payment) => sum + payment.amount, 0);
++}
++
++/**
++ * Calculate the balance due on an invoice.
++ * @param {{ lines: Array<any>, payments?: Array<{ amount: number, date: string }> }} invoice
++ * @returns {number} balance due in cents
++ */
++export function balanceDue(invoice) {
++  const totals = invoiceTotals(invoice);
++  const paid = totalPaid(invoice);
++  return Math.max(0, totals.total - paid);
++}
++
++/**
++ * Record a payment on an issued or partially paid invoice.
++ * @param {{ status: string, lines: Array<any>, customerId: string, issueDate: string, payments?: Array<{ amount: number, date: string }> }} invoice
++ * @param {{ amount: number, date: string }} payment
++ * @returns {{ ok: true, value: any } | { ok: false, error: string }}
++ */
++export function recordPayment(invoice, { amount, date }) {
++  // Validate amount is a positive integer
++  if (!Number.isInteger(amount) || amount <= 0) return fail('AMOUNT_INVALID');
++
++  // Check if invoice is issued or partially_paid
++  if (invoice.status !== 'issued' && invoice.status !== 'partially_paid') {
++    return fail('NOT_ISSUED');
++  }
++
++  // Check for overpayment
++  const owed = balanceDue(invoice);
++  if (amount > owed) return fail('OVERPAYMENT');
++
++  // Create new invoice with payment recorded
++  const newInvoice = {
++    ...invoice,
++    payments: [...(invoice.payments ?? []), { amount, date }],
++  };
++
++  // Determine new status based on balance after payment
++  const newBalance = balanceDue(newInvoice);
++  if (newBalance === 0) {
++    newInvoice.status = 'paid';
++  } else {
++    newInvoice.status = 'partially_paid';
++  }
++
++  return ok(newInvoice);
++}
+diff --git a/test/payments.test.js b/test/payments.test.js
+new file mode 100644
+index 0000000..4cf8761
+--- /dev/null
++++ b/test/payments.test.js
+@@ -0,0 +1,205 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++import { recordPayment, balanceDue } from '../src/payments.js';
++
++function createTestInvoice() {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2024-01-15',
++    lines: [{ sku: 'DES-HOUR', qty: 2 }],
++  });
++  if (!r.ok) throw new Error('Failed to create test invoice');
++  return r.value;
++}
++
++function createIssuedInvoice() {
++  const invoice = createTestInvoice();
++  const issueResult = issueInvoice(invoice, []);
++  if (!issueResult.ok) throw new Error('Failed to issue invoice');
++  return issueResult.value;
++}
++
++test('balanceDue returns total when no payments made', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  assert.equal(balanceDue(invoice), totals.total);
++});
++
++test('balanceDue returns zero when fully paid', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const invoiceWithPayment = {
++    ...invoice,
++    payments: [{ amount: totals.total, date: '2024-01-20' }],
++  };
++  assert.equal(balanceDue(invoiceWithPayment), 0);
++});
++
++test('balanceDue returns balance after partial payment', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const paid = Math.floor(totals.total / 2);
++  const invoiceWithPayment = {
++    ...invoice,
++    payments: [{ amount: paid, date: '2024-01-20' }],
++  };
++  assert.equal(balanceDue(invoiceWithPayment), totals.total - paid);
++});
++
++test('balanceDue with multiple payments', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const invoiceWithPayments = {
++    ...invoice,
++    payments: [
++      { amount: 1000, date: '2024-01-20' },
++      { amount: 2000, date: '2024-01-25' },
++    ],
++  };
++  assert.equal(balanceDue(invoiceWithPayments), totals.total - 3000);
++});
++
++test('recordPayment returns error for draft invoice', () => {
++  const invoice = createTestInvoice();
++  const r = recordPayment(invoice, { amount: 1000, date: '2024-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'NOT_ISSUED' });
++});
++
++test('recordPayment returns error for amount zero', () => {
++  const invoice = createIssuedInvoice();
++  const r = recordPayment(invoice, { amount: 0, date: '2024-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment returns error for negative amount', () => {
++  const invoice = createIssuedInvoice();
++  const r = recordPayment(invoice, { amount: -100, date: '2024-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment returns error for non-integer amount', () => {
++  const invoice = createIssuedInvoice();
++  const r = recordPayment(invoice, { amount: 100.5, date: '2024-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('recordPayment returns error for overpayment', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const r = recordPayment(invoice, { amount: totals.total + 1, date: '2024-01-20' });
++  assert.deepEqual(r, { ok: false, error: 'OVERPAYMENT' });
++});
++
++test('recordPayment records payment on issued invoice', () => {
++  const invoice = createIssuedInvoice();
++  const r = recordPayment(invoice, { amount: 5000, date: '2024-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.payments.length, 1);
++  assert.deepEqual(r.value.payments[0], { amount: 5000, date: '2024-01-20' });
++});
++
++test('recordPayment creates payments array if missing', () => {
++  const invoice = createIssuedInvoice();
++  assert.equal(invoice.payments, undefined);
++  const r = recordPayment(invoice, { amount: 1000, date: '2024-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(Array.isArray(r.value.payments), true);
++  assert.equal(r.value.payments.length, 1);
++});
++
++test('recordPayment sets status to partially_paid after first payment', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const r = recordPayment(invoice, { amount: Math.floor(totals.total / 2), date: '2024-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.status, 'partially_paid');
++});
++
++test('recordPayment sets status to paid when fully paid', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const r = recordPayment(invoice, { amount: totals.total, date: '2024-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.status, 'paid');
++});
++
++test('recordPayment allows payment on partially_paid invoice', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const half = Math.floor(totals.total / 2);
++
++  const r1 = recordPayment(invoice, { amount: half, date: '2024-01-20' });
++  assert.equal(r1.ok, true);
++  assert.equal(r1.value.status, 'partially_paid');
++
++  const r2 = recordPayment(r1.value, { amount: totals.total - half, date: '2024-01-25' });
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.status, 'paid');
++  assert.equal(r2.value.payments.length, 2);
++});
++
++test('recordPayment does not mutate original invoice', () => {
++  const invoice = createIssuedInvoice();
++  const originalStatus = invoice.status;
++  const originalPayments = invoice.payments;
++
++  recordPayment(invoice, { amount: 1000, date: '2024-01-20' });
++
++  assert.equal(invoice.status, originalStatus);
++  assert.equal(invoice.payments, originalPayments);
++});
++
++test('recordPayment returns error when overpayment on partially_paid invoice', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const half = Math.floor(totals.total / 2);
++
++  const r1 = recordPayment(invoice, { amount: half, date: '2024-01-20' });
++  assert.equal(r1.ok, true);
++
++  const remaining = totals.total - half;
++  const r2 = recordPayment(r1.value, { amount: remaining + 1, date: '2024-01-25' });
++  assert.deepEqual(r2, { ok: false, error: 'OVERPAYMENT' });
++});
++
++test('recordPayment allows full remaining payment on partially_paid invoice', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const half = Math.floor(totals.total / 2);
++
++  const r1 = recordPayment(invoice, { amount: half, date: '2024-01-20' });
++  assert.equal(r1.ok, true);
++
++  const remaining = totals.total - half;
++  const r2 = recordPayment(r1.value, { amount: remaining, date: '2024-01-25' });
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.status, 'paid');
++});
++
++test('recordPayment with multiple payments totaling invoice total', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++
++  const r1 = recordPayment(invoice, { amount: 1000, date: '2024-01-20' });
++  assert.equal(r1.ok, true);
++  assert.equal(r1.value.status, 'partially_paid');
++
++  const r2 = recordPayment(r1.value, { amount: 2000, date: '2024-01-21' });
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.status, 'partially_paid');
++
++  const remaining = totals.total - 3000;
++  const r3 = recordPayment(r2.value, { amount: remaining, date: '2024-01-22' });
++  assert.equal(r3.ok, true);
++  assert.equal(r3.value.status, 'paid');
++  assert.equal(r3.value.payments.length, 3);
++});
++
++test('balanceDue is zero for paid invoice', () => {
++  const invoice = createIssuedInvoice();
++  const totals = invoiceTotals(invoice);
++  const r = recordPayment(invoice, { amount: totals.total, date: '2024-01-20' });
++  assert.equal(r.ok, true);
++  assert.equal(balanceDue(r.value), 0);
++});

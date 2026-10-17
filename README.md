@@ -72,6 +72,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 30 | Restate the task before coding | 8/12 vs 6/12, the gap is two runs on one task | ✅ keep |
 | 31 | /compact every 5 requests vs auto-compaction | 122/150 vs 114/150 requests kept, about 11 min slower | 🟡 optional |
 | 32 | /clear every 5 requests vs one long session | 104/150 vs 124/150 requests kept, chat-only rules lost on clear | ❌ cut |
+| 33 | Handoff note every 5 requests vs /compact | 117/150 vs 118/150 requests kept, money rule broke 2 vs 8 times | 🟡 optional |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

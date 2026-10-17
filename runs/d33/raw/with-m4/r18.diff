@@ -1,0 +1,203 @@
+diff --git a/src/reports.js b/src/reports.js
+index 8b8a6ab..c40fdd4 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -2,6 +2,7 @@ import { ok, fail } from './result.js';
+ import { daysBetween, isValidDate } from './dates.js';
+ import { balanceDue } from './payments.js';
+ import { lineDiscount, lineVat } from './invoices.js';
++import { roundCents } from './money.js';
+ 
+ /**
+  * Generate a report of invoices past their due date.
+@@ -55,3 +56,24 @@ export function vatSummary(invoices) {
+   const summary = Object.values(byRate).sort((a, b) => b.rate - a.rate);
+   return ok(summary);
+ }
++
++/**
++ * Calculate late fee for an invoice.
++ * @param {Object} invoice the invoice to check
++ * @param {string} asOf date in YYYY-MM-DD format (check date)
++ * @returns {number} late fee in integer cents (0.04% per day × days overdue × amount due)
++ */
++export function lateFee(invoice, asOf) {
++  if (!isValidDate(asOf)) {
++    return 0;
++  }
++
++  const daysOverdue = daysBetween(invoice.dueDate, asOf);
++  if (daysOverdue <= 0) {
++    return 0;
++  }
++
++  const due = balanceDue(invoice);
++  const fee = due * 0.0004 * daysOverdue;
++  return roundCents(fee);
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+index 0f7d133..b95f0ff 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -1,8 +1,9 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++import { createInvoice, issueInvoice, invoiceTotals, applyVoucher } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+-import { overdueInvoices, vatSummary } from '../src/reports.js';
++import { overdueInvoices, vatSummary, lateFee } from '../src/reports.js';
++import { roundCents } from '../src/money.js';
+ 
+ function createAndIssueInvoice(customerId, issueDate, lines = [{ sku: 'DES-HOUR', qty: 2 }], terms = 'NET30') {
+   const r = createInvoice({
+@@ -378,3 +379,149 @@ test('vatSummary with multiple VAT rates in single invoice', () => {
+   assert.equal(summaryResult.value[1].rate, 9);
+   assert.equal(summaryResult.value[2].rate, 0);
+ });
++test('lateFee returns 0 for invoice not yet due', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, invoice.dueDate);
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns 0 for invoice due on asOf date', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, invoice.dueDate);
++  assert.equal(fee, 0);
++});
++
++test('lateFee calculates fee for 1 day overdue', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++
++  const fee = lateFee(invoice, '2024-02-01');
++  const expectedFee = Math.round(totals.total * 0.0004 * 1);
++  assert.equal(fee, expectedFee);
++});
++
++test('lateFee calculates fee for multiple days overdue', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++
++  const fee = lateFee(invoice, '2024-02-10');
++  const expectedFee = Math.round(totals.total * 0.0004 * 10);
++  assert.equal(fee, expectedFee);
++});
++
++test('lateFee is 0.04% per day', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++
++  const fee1Day = lateFee(invoice, '2024-02-01');
++  const fee2Days = lateFee(invoice, '2024-02-02');
++
++  assert.equal(fee2Days - fee1Day, Math.round(totals.total * 0.0004));
++});
++
++test('lateFee returns 0 for paid invoice', () => {
++  let invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++  const payment = recordPayment(invoice, { amount: totals.total, date: '2024-01-20' });
++  invoice = payment.value;
++
++  const fee = lateFee(invoice, '2024-02-10');
++  assert.equal(fee, 0);
++});
++
++test('lateFee calculates on remaining balance for partially paid invoice', () => {
++  let invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++  const halfPayment = Math.floor(totals.total / 2);
++  const payment = recordPayment(invoice, { amount: halfPayment, date: '2024-01-20' });
++  invoice = payment.value;
++
++  const fee = lateFee(invoice, '2024-02-10');
++  const remaining = totals.total - halfPayment;
++  const expectedFee = Math.round(remaining * 0.0004 * 10);
++  assert.equal(fee, expectedFee);
++});
++
++test('lateFee returns 0 for invalid asOf date', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, 'not-a-date');
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns 0 for negative days overdue', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, '2024-01-10');
++  assert.equal(fee, 0);
++});
++
++test('lateFee is integer cents', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, '2024-02-05');
++  assert.equal(Number.isInteger(fee), true);
++});
++
++test('lateFee never returns negative', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++
++  const fee = lateFee(invoice, '2024-02-10');
++  assert.equal(fee >= 0, true);
++});
++
++test('lateFee scales with invoice amount', () => {
++  const invoice1 = createAndIssueInvoice('C-001', '2024-01-01', [{ sku: 'DES-HOUR', qty: 1 }]);
++  const invoice2 = createAndIssueInvoice('C-001', '2024-01-02', [{ sku: 'DES-HOUR', qty: 2 }]);
++
++  const fee1 = lateFee(invoice1, '2024-02-10');
++  const fee2 = lateFee(invoice2, '2024-02-10');
++
++  assert(fee2 > fee1);
++});
++
++test('lateFee with 30 day threshold', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const totals = invoiceTotals(invoice);
++
++  const fee30Days = lateFee(invoice, '2024-03-02');
++  const minFee = roundCents(totals.total * 0.0004 * 29);
++  const maxFee = roundCents(totals.total * 0.0004 * 31);
++  assert(fee30Days >= minFee && fee30Days <= maxFee);
++});
++
++test('lateFee does not mutate invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2024-01-01');
++  const originalStatus = invoice.status;
++  const originalDueDate = invoice.dueDate;
++
++  lateFee(invoice, '2024-02-10');
++
++  assert.equal(invoice.status, originalStatus);
++  assert.equal(invoice.dueDate, originalDueDate);
++});
++
++test('lateFee with invoice having voucher', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2024-01-01',
++    lines: [{ sku: 'DES-HOUR', qty: 2 }],
++  });
++  if (!r.ok) throw new Error('Failed to create invoice');
++
++  let invoice = r.value;
++  const applyResult = applyVoucher(invoice, { code: 'SAVE10', amount: 1000 });
++  if (!applyResult.ok) throw new Error('Failed to apply voucher');
++  invoice = applyResult.value;
++
++  const issued = issueInvoice(invoice, []);
++  if (!issued.ok) throw new Error('Failed to issue invoice');
++  invoice = issued.value;
++
++  const totals = invoiceTotals(invoice);
++  const fee = lateFee(invoice, '2024-02-10');
++  const expectedFee = roundCents(totals.total * 0.0004 * 10);
++  assert.equal(fee, expectedFee);
++});

@@ -1,0 +1,327 @@
+diff --git a/HANDOFF.md b/HANDOFF.md
+index 7ba0683..2780bbc 100644
+--- a/HANDOFF.md
++++ b/HANDOFF.md
+@@ -25,13 +25,13 @@ Build a complete invoicing system for a service business. The system manages cre
+ ## Key Decisions Made
+ 
+ - **Invoice numbering format:** `INV-<year>-<counter>` where counter is 4 digits, zero-padded, starting at 0001 and restarting every year.
+-- **Invoice statuses:** `draft` (editable), `issued` (numbered and locked). Only draft invoices can be modified.
++- **Invoice statuses:** `draft` (editable), `issued` (numbered and locked), `partially_paid` (has payments but balance remains), `paid` (all balance paid). Only draft invoices can be modified (no edits after issuing).
+ - **Error handling:** Uses result-style `{ ok: boolean, value?, error?, details? }` pattern. Never throws exceptions for validation errors.
+ - **Customer-facing output:** All monetary amounts must go through `formatEuros()` for consistency.
+ - **Line discounts:** Per-line `discountPercent` (0–100, can have decimals). Line discount = `lineTotal × discountPercent / 100`, rounded per line.
+ - **Tier-based discounts:** Gold 5%, Silver 2.5%, Standard 0%. Applied automatically when a line has no explicit `discountPercent`.
+ - **VAT calculation:** VAT is computed per line on the line amount **after discount is applied** (i.e., `(lineTotal - lineDiscount) × vatRate / 100`). Each line's VAT is rounded independently. Invoice VAT is the sum of rounded line VATs.
+-- **Invoice totals formula:** `total = subtotal - discount + vat` (where all components are clamped at 0).
++- **Invoice totals formula:** `total = subtotal - discount + vat - voucher` (where all components are clamped at 0). Vouchers apply after VAT and are optional.
+ - **Rendering:** VAT is shown on its own line (when > 0) just above the total in plain-text output.
+ 
+ ## What Has Been Built
+@@ -222,14 +222,14 @@ Build a complete invoicing system for a service business. The system manages cre
+ 
+ The following features have not been implemented but are likely needed:
+ 
+-- **Persistence** — No database or file storage (all in-memory)
+-- **Invoice state transitions** — Only draft → issued; no cancelled, refunded, voided states
+-- **PDF rendering** — Only plain text rendering exists
+-- **Internationalization** — Hard-coded euro formatting (EUR) and Dutch-style date format
++- **Persistence** — No database or file storage (all in-memory); all data must be passed as parameters
++- **Invoice state transitions** — Only draft → issued → (partially_paid / paid); no cancelled, refunded, or voided states
++- **PDF rendering** — Only plain text rendering exists; no PDF generation
++- **Internationalization** — Hard-coded euro formatting (EUR); dates always in YYYY-MM-DD format
+ - **Line amendments** — No ability to change qty or discount on existing issued lines
+-- **Credit notes** — No support for partial or full credit memos
+-- **Email delivery** — No email integration for sending invoices
++- **Email delivery** — No email integration for sending invoices or credit notes
+ - **Remittance advice** — No support for payment instructions or bank details
++- **Credit note application** — Credit notes are created but not automatically applied to reduce invoice balance
+ 
+ ## Invoice Object Structure
+ 
+@@ -299,13 +299,21 @@ node --test test/invoices.test.js
+ 
+ When picking up this work:
+ 
+-1. Check this HANDOFF.md for context (you're reading it)
+-2. Run `npm test` to verify the current state (should see 150 passing tests)
+-3. Read the relevant source files for the feature you're building
+-4. Review existing tests to understand the pattern
+-5. Add tests first, then implement
+-6. Follow the house rules (especially money-as-cents, no-throws, UTC dates, zero-clamping)
+-7. Update this document when you add new rules or decisions
++1. **Start here:** Read this entire HANDOFF.md for project context and current state
++2. **Verify setup:** Run `npm test` to confirm all 221 tests pass
++3. **Understand patterns:** Read key files (`src/invoices.js`, `src/payments.js`) to see how the system works
++4. **Review tests:** Look at test files to understand testing patterns and edge cases
++5. **Plan new work:** Identify what feature to build next, write tests first, then implement
++6. **Follow house rules:** 
++   - All money as cents (integers only)
++   - All errors via `fail()`, never throw
++   - Never mutate arguments (return new objects)
++   - Dates always YYYY-MM-DD in UTC
++   - No amounts below zero (clamp at 0)
++   - Customer IDs normalized everywhere
++7. **Add new error codes:** Update `src/errors.js` with any new error codes
++8. **Run tests:** Always run `npm test` before considering work complete
++9. **Update HANDOFF.md:** Document any new rules, decisions, or architectural changes
+ 
+ ## Key Implementation Notes
+ 
+diff --git a/src/reports.js b/src/reports.js
+new file mode 100644
+index 0000000..d78331a
+--- /dev/null
++++ b/src/reports.js
+@@ -0,0 +1,28 @@
++import { ok, fail } from './result.js';
++import { isValidDate, daysBetween } from './dates.js';
++import { balanceDue } from './payments.js';
++
++/**
++ * Get overdue invoices as of a given date.
++ * @param {Array} invoices
++ * @param {string} asOf - Date in YYYY-MM-DD format
++ * @returns {{ ok: true, value: Array } | { ok: false, error: string }}
++ */
++export function overdueInvoices(invoices, asOf) {
++  if (!isValidDate(asOf)) {
++    return fail('DATE_INVALID');
++  }
++
++  const overdue = invoices
++    .filter(inv => (inv.status === 'issued' || inv.status === 'partially_paid') && inv.dueDate < asOf)
++    .map(inv => ({
++      number: inv.number,
++      customerId: inv.customerId,
++      dueDate: inv.dueDate,
++      daysOverdue: daysBetween(inv.dueDate, asOf),
++      due: balanceDue(inv),
++    }))
++    .sort((a, b) => b.daysOverdue - a.daysOverdue);
++
++  return ok(overdue);
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+new file mode 100644
+index 0000000..86de578
+--- /dev/null
++++ b/test/reports.test.js
+@@ -0,0 +1,217 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { overdueInvoices } from '../src/reports.js';
++import { createInvoice, issueInvoice } from '../src/invoices.js';
++import { recordPayment, balanceDue } from '../src/payments.js';
++
++test('overdueInvoices rejects invalid asOf date', () => {
++  const result = overdueInvoices([], 'not-a-date');
++  assert.deepEqual(result, { ok: false, error: 'DATE_INVALID' });
++});
++
++test('overdueInvoices returns empty array when no invoices', () => {
++  const result = overdueInvoices([], '2025-10-07');
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.value, []);
++});
++
++test('overdueInvoices excludes draft invoices', () => {
++  const draftResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const result = overdueInvoices([draftResult.value], '2025-10-07');
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.value, []);
++});
++
++test('overdueInvoices excludes paid invoices', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const balanceResult = balanceDue(invoice);
++  const paidResult = recordPayment(invoice, { amount: balanceResult, date: '2025-10-02' });
++
++  const result = overdueInvoices([paidResult.value], '2025-10-07');
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.value, []);
++});
++
++test('overdueInvoices excludes invoices with future due dates', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++
++  const result = overdueInvoices([issuedResult.value], '2025-10-05');
++  assert.equal(result.ok, true);
++  assert.deepEqual(result.value, []);
++});
++
++test('overdueInvoices includes issued invoices with past due dates', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const result = overdueInvoices([invoice], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value.length, 1);
++  assert.equal(result.value[0].number, invoice.number);
++});
++
++test('overdueInvoices includes partially_paid invoices with past due dates', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const paymentResult = recordPayment(invoice, { amount: 10000, date: '2025-10-02' });
++
++  const result = overdueInvoices([paymentResult.value], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value.length, 1);
++});
++
++test('overdueInvoices calculates daysOverdue correctly', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const result = overdueInvoices([invoice], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value.length, 1);
++  assert.equal(result.value[0].daysOverdue, 10);
++});
++
++test('overdueInvoices returns due amount from balanceDue', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const expected = balanceDue(invoice);
++
++  const result = overdueInvoices([invoice], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value[0].due, expected);
++});
++
++test('overdueInvoices returns due amount after partial payment', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const paymentResult = recordPayment(invoice, { amount: 10000, date: '2025-10-02' });
++  const expected = balanceDue(paymentResult.value);
++
++  const result = overdueInvoices([paymentResult.value], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value[0].due, expected);
++});
++
++test('overdueInvoices includes invoiceNumber and customerId', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const result = overdueInvoices([invoice], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value[0].number, invoice.number);
++  assert.equal(result.value[0].customerId, 'C-001');
++});
++
++test('overdueInvoices includes dueDate', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issuedResult = issueInvoice(invoiceResult.value, []);
++  const invoice = issuedResult.value;
++
++  const result = overdueInvoices([invoice], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value[0].dueDate, invoice.dueDate);
++});
++
++test('overdueInvoices sorts by daysOverdue descending', () => {
++  const invoice1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++  const issued1 = issueInvoice(invoice1Result.value, []);
++
++  const invoice2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-05',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++  const issued2 = issueInvoice(invoice2Result.value, ['INV-2025-0001']);
++
++  const result = overdueInvoices([issued1.value, issued2.value], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value.length, 2);
++  assert(result.value[0].daysOverdue > result.value[1].daysOverdue);
++});
++
++test('overdueInvoices handles mix of issued and partially_paid invoices', () => {
++  const invoice1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++  const issued1 = issueInvoice(invoice1Result.value, []);
++
++  const invoice2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-02',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++  const issued2 = issueInvoice(invoice2Result.value, ['INV-2025-0001']);
++  const partial = recordPayment(issued2.value, { amount: 10000, date: '2025-10-03' });
++
++  const result = overdueInvoices([issued1.value, partial.value], '2025-11-10');
++  assert.equal(result.ok, true);
++  assert.equal(result.value.length, 2);
++});

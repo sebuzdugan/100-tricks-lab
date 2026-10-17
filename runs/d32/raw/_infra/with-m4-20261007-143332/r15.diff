@@ -1,0 +1,375 @@
+diff --git a/src/credits.js b/src/credits.js
+new file mode 100644
+index 0000000..10df079
+--- /dev/null
++++ b/src/credits.js
+@@ -0,0 +1,68 @@
++import { ok, fail } from './result.js';
++import { invoiceTotals } from './invoices.js';
++import { isValidDate } from './dates.js';
++
++/**
++ * Calculate the next credit note number for a given issue date.
++ * Credit note numbers are CN-YYYY-CCCC where CCCC is a 4-digit counter starting at 0001 each year.
++ * @param {Array<string>} existingNumbers - All numbers already used (invoices and credit notes)
++ * @param {string} issueDate - Issue date in YYYY-MM-DD format
++ * @returns {string} Next credit note number (CN-YYYY-CCCC)
++ */
++function nextCreditNoteNumber(existingNumbers, issueDate) {
++  const year = issueDate.split('-')[0];
++
++  const countersThisYear = existingNumbers
++    .filter(num => num.includes(`CN-${year}-`))
++    .map(num => {
++      const match = /CN-\d{4}-(\d{4})/.exec(num);
++      return match ? parseInt(match[1], 10) : 0;
++    });
++
++  const maxCounter = countersThisYear.length > 0 ? Math.max(...countersThisYear) : 0;
++  const nextCounter = maxCounter + 1;
++
++  return `CN-${year}-${String(nextCounter).padStart(4, '0')}`;
++}
++
++/**
++ * Create a credit note for an issued, partially paid, or paid invoice.
++ * @param {{ number?: string, customerId: string, status: string, lines: Array }} invoice
++ * @param {{ amount: number, reason: string, date: string }} param
++ * @param {Array<string>} existingNumbers - All numbers already used (invoices and credit notes)
++ * @returns {{ ok: true, value: { number: string, invoiceNumber?: string, customerId: string, amount: number, reason: string, date: string } } | { ok: false, error: string }}
++ */
++export function createCreditNote(invoice, { amount, reason, date }, existingNumbers) {
++  // Validate invoice status
++  const validStatuses = ['issued', 'partially_paid', 'paid'];
++  if (!validStatuses.includes(invoice.status)) {
++    return fail('NOT_ISSUED');
++  }
++
++  // Validate date format and reality
++  if (!isValidDate(date)) {
++    return fail('DATE_INVALID');
++  }
++
++  // Validate amount
++  if (!Number.isInteger(amount) || amount <= 0) {
++    return fail('AMOUNT_INVALID');
++  }
++
++  // Validate amount doesn't exceed invoice total
++  const { total } = invoiceTotals(invoice);
++  if (amount > total) {
++    return fail('CREDIT_TOO_HIGH');
++  }
++
++  const number = nextCreditNoteNumber(existingNumbers, date);
++
++  return ok({
++    number,
++    invoiceNumber: invoice.number,
++    customerId: invoice.customerId,
++    amount,
++    reason,
++    date,
++  });
++}
+diff --git a/src/errors.js b/src/errors.js
+index 6225ed4..c9e47f6 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -1,6 +1,7 @@
+ /** Every error code the project returns, with a one-line message. Codes are UPPER_SNAKE_CASE. */
+ export const ERRORS = {
+   AMOUNT_INVALID: 'Amount must be a whole, positive number of cents.',
++  CREDIT_TOO_HIGH: 'Credit note amount exceeds the invoice total.',
+   CUSTOMER_INVALID: 'A customer needs an id, a name and a valid email.',
+   CUSTOMER_NOT_FOUND: 'No customer with that id.',
+   DATE_INVALID: 'Date must be in YYYY-MM-DD format and be a real date.',
+diff --git a/test/credits.test.js b/test/credits.test.js
+new file mode 100644
+index 0000000..3a6e2ee
+--- /dev/null
++++ b/test/credits.test.js
+@@ -0,0 +1,283 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createCreditNote } from '../src/credits.js';
++import { createInvoice, issueInvoice, invoiceTotals, applyVoucher } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++function createAndIssueInvoice(customerId = 'C-001', issueDate = '2026-10-07', lines = [{ sku: 'DES-HOUR', qty: 2 }]) {
++  const result = createInvoice({
++    customerId,
++    issueDate,
++    lines,
++  });
++  const issued = issueInvoice(result.value, []);
++  return issued.value;
++}
++
++test('createCreditNote creates credit note for issued invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const result = createCreditNote(invoice, { amount: 5000, reason: 'Quality issue', date: '2026-10-10' }, []);
++
++  assert.equal(result.ok, true);
++  const creditNote = result.value;
++  assert.equal(creditNote.number, 'CN-2026-0001');
++  assert.equal(creditNote.invoiceNumber, invoice.number);
++  assert.equal(creditNote.customerId, 'C-001');
++  assert.equal(creditNote.amount, 5000);
++  assert.equal(creditNote.reason, 'Quality issue');
++  assert.equal(creditNote.date, '2026-10-10');
++});
++
++test('createCreditNote creates credit note for partially_paid invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++  const paid = recordPayment(invoice, { amount: Math.floor(total / 2), date: '2026-10-10' }).value;
++
++  const result = createCreditNote(paid, { amount: 2000, reason: 'Discount', date: '2026-10-12' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoiceNumber, invoice.number);
++});
++
++test('createCreditNote creates credit note for paid invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++  const paid = recordPayment(invoice, { amount: total, date: '2026-10-10' }).value;
++
++  const result = createCreditNote(paid, { amount: 1000, reason: 'Overpayment refund', date: '2026-10-12' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoiceNumber, invoice.number);
++});
++
++test('createCreditNote refuses draft invoices', () => {
++  const draft = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++  }).value;
++
++  const result = createCreditNote(draft, { amount: 1000, reason: 'Test', date: '2026-10-10' }, []);
++  assert.deepEqual(result, { ok: false, error: 'NOT_ISSUED' });
++});
++
++test('createCreditNote validates amount is positive integer', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const testCases = [0, -1000, 1000.5, '1000', NaN, Infinity];
++  for (const amount of testCases) {
++    const result = createCreditNote(invoice, { amount, reason: 'Test', date: '2026-10-10' }, []);
++    assert.equal(result.ok, false, `Should reject amount ${amount}`);
++    assert.equal(result.error, 'AMOUNT_INVALID');
++  }
++});
++
++test('createCreditNote rejects credit notes higher than invoice total', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++
++  const result = createCreditNote(invoice, { amount: total + 1, reason: 'Too much', date: '2026-10-10' }, []);
++  assert.deepEqual(result, { ok: false, error: 'CREDIT_TOO_HIGH' });
++});
++
++test('createCreditNote accepts credit note equal to invoice total', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++
++  const result = createCreditNote(invoice, { amount: total, reason: 'Full refund', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.amount, total);
++});
++
++test('createCreditNote validates date format', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const invalidDates = ['10-07-2026', '2026/10/07', '2026-1-7', 'not-a-date'];
++  for (const date of invalidDates) {
++    const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date }, []);
++    assert.equal(result.ok, false, `Should reject date ${date}`);
++    assert.equal(result.error, 'DATE_INVALID');
++  }
++});
++
++test('createCreditNote generates sequential numbers within same year', () => {
++  const invoice1 = createAndIssueInvoice('C-001', '2026-10-07');
++  const invoice2 = createAndIssueInvoice('C-002', '2026-10-15');
++
++  const cn1 = createCreditNote(invoice1, { amount: 1000, reason: 'First', date: '2026-10-10' }, []);
++  assert.equal(cn1.value.number, 'CN-2026-0001');
++
++  const cn2 = createCreditNote(invoice2, { amount: 2000, reason: 'Second', date: '2026-10-20' }, [cn1.value.number]);
++  assert.equal(cn2.value.number, 'CN-2026-0002');
++});
++
++test('createCreditNote resets counter for new year', () => {
++  const cn2025 = { number: 'CN-2025-0005' };
++  const invoice2026 = createAndIssueInvoice('C-001', '2026-01-15');
++
++  const result = createCreditNote(invoice2026, { amount: 1000, reason: 'Test', date: '2026-01-20' }, [cn2025.number]);
++  assert.equal(result.value.number, 'CN-2026-0001');
++});
++
++test('createCreditNote ignores invoice numbers in existingNumbers', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const existingNumbers = ['INV-2026-0001', 'INV-2026-0002', 'INV-2026-0003'];
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, existingNumbers);
++  assert.equal(result.value.number, 'CN-2026-0001');
++});
++
++test('createCreditNote handles mixed invoice and credit note numbers', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const existingNumbers = [
++    'INV-2026-0001',
++    'CN-2026-0001',
++    'INV-2026-0002',
++    'CN-2026-0002',
++    'CN-2026-0003',
++  ];
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, existingNumbers);
++  assert.equal(result.value.number, 'CN-2026-0004');
++});
++
++test('createCreditNote with small amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 1, reason: 'Penny refund', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.amount, 1);
++});
++
++test('createCreditNote with large amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++
++  const result = createCreditNote(invoice, { amount: total, reason: 'Full', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.amount, total);
++});
++
++test('createCreditNote preserves customer ID from invoice', () => {
++  const invoice = createAndIssueInvoice('C-003', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.customerId, 'C-003');
++});
++
++test('createCreditNote with different reason texts', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const reasons = [
++    'Quality issue',
++    'Wrong item shipped',
++    'Damaged goods',
++    'Customer request',
++    'Promotional credit',
++  ];
++
++  for (const reason of reasons) {
++    const result = createCreditNote(invoice, { amount: 1000, reason, date: '2026-10-10' }, []);
++    assert.equal(result.ok, true);
++    assert.equal(result.value.reason, reason);
++  }
++});
++
++test('createCreditNote preserves invoice number', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoiceNumber, invoice.number);
++});
++
++test('createCreditNote returns integers for amount', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 5000, reason: 'Test', date: '2026-10-10' }, []);
++  assert.ok(Number.isInteger(result.value.amount));
++});
++
++test('createCreditNote with out-of-order existing numbers', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const existingNumbers = ['CN-2026-0003', 'CN-2026-0001', 'CN-2026-0002'];
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, existingNumbers);
++  assert.equal(result.value.number, 'CN-2026-0004');
++});
++
++test('createCreditNote for invoice with voucher', () => {
++  // Create draft, apply voucher, then issue
++  const draftResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 2 }],
++  });
++  const draft = draftResult.value;
++
++  const voucherResult = applyVoucher(draft, { code: 'PROMO', amount: 1000 });
++  assert.equal(voucherResult.ok, true);
++  const vouchered = voucherResult.value;
++
++  const issuedResult = issueInvoice(vouchered, []);
++  const issued = issuedResult.value;
++
++  const result = createCreditNote(issued, { amount: 2000, reason: 'Test', date: '2026-10-10' }, []);
++  assert.equal(result.ok, true);
++  const { total } = invoiceTotals(issued);
++  assert.equal(result.value.amount, 2000);
++  assert(result.value.amount <= total);
++});
++
++test('createCreditNote uses date from parameter for year in CN number', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-12-31' }, []);
++  assert.equal(result.value.number, 'CN-2026-0001');
++});
++
++test('createCreditNote CN number year matches credit note date', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-01-01');
++
++  const result = createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2025-12-31' }, []);
++  assert.equal(result.value.number, 'CN-2025-0001');
++});
++
++test('createCreditNote does not mutate invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const originalStatus = invoice.status;
++  const originalNumber = invoice.number;
++
++  createCreditNote(invoice, { amount: 1000, reason: 'Test', date: '2026-10-10' }, []);
++
++  assert.equal(invoice.status, originalStatus);
++  assert.equal(invoice.number, originalNumber);
++});
++
++test('createCreditNote for invoice after partial payment', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++  const paid = recordPayment(invoice, { amount: Math.floor(total / 3), date: '2026-10-10' }).value;
++
++  const result = createCreditNote(paid, { amount: 1000, reason: 'Test', date: '2026-10-12' }, []);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.amount, 1000);
++});
++
++test('createCreditNote zero amount returns AMOUNT_INVALID', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++
++  const result = createCreditNote(invoice, { amount: 0, reason: 'Test', date: '2026-10-10' }, []);
++  assert.deepEqual(result, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('createCreditNote handles multiple credit notes for same invoice', () => {
++  const invoice = createAndIssueInvoice('C-001', '2026-10-07');
++  const { total } = invoiceTotals(invoice);
++
++  const cn1 = createCreditNote(invoice, { amount: 2000, reason: 'Partial', date: '2026-10-10' }, []);
++  assert.equal(cn1.ok, true);
++
++  const cn2 = createCreditNote(invoice, { amount: 2000, reason: 'Partial', date: '2026-10-12' }, [cn1.value.number]);
++  assert.equal(cn2.ok, true);
++  assert.equal(cn2.value.number, 'CN-2026-0002');
++});

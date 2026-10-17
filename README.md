@@ -71,6 +71,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 29 | A "be concise" line before the task | 6/12 vs 7/12, 26% fewer output tokens | 🟡 optional |
 | 30 | Restate the task before coding | 8/12 vs 6/12, the gap is two runs on one task | ✅ keep |
 | 31 | /compact every 5 requests vs auto-compaction | 122/150 vs 114/150 requests kept, about 11 min slower | 🟡 optional |
+| 32 | /clear every 5 requests vs one long session | 104/150 vs 124/150 requests kept, chat-only rules lost on clear | ❌ cut |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 
@@ -84,10 +85,11 @@ A new row lands here the day its post goes live.
 
 ```mermaid
 flowchart TB
-  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["▶️ 21-30 · Prompting"] --> M4["31-40 · Context"] --> M5["41-50 · Verification"]
+  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["✅ 21-30 · Prompting"] --> M4["▶️ 31-40 · Context"] --> M5["41-50 · Verification"]
   M5 --> M6["51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
   style M1 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
   style M2 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
+  style M3 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
 ```
 
 ## What's in here

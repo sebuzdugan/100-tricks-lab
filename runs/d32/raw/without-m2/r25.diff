@@ -1,0 +1,248 @@
+diff --git a/src/invoices.js b/src/invoices.js
+index 323ef60..517d4c8 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -46,7 +46,8 @@ export function createInvoice({ customerId, issueDate, lines, terms = 'NET30' })
+     }
+ 
+     // Determine discount: explicit value wins, otherwise use tier discount
+-    const discountPercent = line.discountPercent !== undefined && line.discountPercent !== null
++    const hasExplicitDiscount = line.discountPercent !== undefined && line.discountPercent !== null;
++    const discountPercent = hasExplicitDiscount
+       ? line.discountPercent
+       : TIER_DISCOUNTS[customer.tier];
+ 
+@@ -66,6 +67,7 @@ export function createInvoice({ customerId, issueDate, lines, terms = 'NET30' })
+       unitPrice: product.unitPrice,
+       vatRate: product.vatRate,
+       discountPercent,
++      explicitDiscount: hasExplicitDiscount,
+     });
+   }
+ 
+@@ -105,7 +107,8 @@ export function addLine(invoice, { sku, qty, discountPercent }) {
+   const customer = customerResult.value;
+ 
+   // Determine discount: explicit value wins, otherwise use tier discount
+-  const finalDiscount = discountPercent !== undefined && discountPercent !== null
++  const hasExplicitDiscount = discountPercent !== undefined && discountPercent !== null;
++  const finalDiscount = hasExplicitDiscount
+     ? discountPercent
+     : TIER_DISCOUNTS[customer.tier];
+ 
+@@ -137,6 +140,7 @@ export function addLine(invoice, { sku, qty, discountPercent }) {
+       unitPrice: product.unitPrice,
+       vatRate: product.vatRate,
+       discountPercent: finalDiscount,
++      explicitDiscount: hasExplicitDiscount,
+     });
+   }
+ 
+diff --git a/src/render.js b/src/render.js
+index f552730..1a3b16a 100644
+--- a/src/render.js
++++ b/src/render.js
+@@ -1,35 +1,65 @@
+ import { getCustomer } from './customers.js';
+-import { invoiceTotals, lineTotal } from './invoices.js';
++import { invoiceTotals, lineTotal, lineDiscount } from './invoices.js';
+ import { formatEuros } from './money.js';
++import { balanceDue } from './payments.js';
+ 
+ /**
+  * Render an invoice as plain text.
+- * @param {{ customerId: string, number?: string, lines: Array<{ qty: number, name: string, unitPrice: number, discountPercent?: number, vatRate: number }> }} invoice
++ * @param {{ customerId: string, number?: string, dueDate?: string, lines: Array<{ qty: number, name: string, unitPrice: number, discountPercent?: number, vatRate: number }>, voucher?: object, payments?: Array }} invoice
+  * @returns {string} plain-text invoice
+  */
+ export function renderInvoiceText(invoice) {
++  const lines = [];
++
+   // First line: invoice number or DRAFT
+-  const numberLine = invoice.number || 'DRAFT';
++  lines.push(invoice.number || 'DRAFT');
+ 
+   // Get customer name
+   const customerResult = getCustomer(invoice.customerId);
+   const customerName = customerResult.ok ? customerResult.value.name : `Unknown Customer (${invoice.customerId})`;
++  lines.push(customerName);
+ 
+   // Render each line
+-  const lineTexts = invoice.lines.map((line) => {
++  invoice.lines.forEach((line) => {
+     const total = lineTotal(line);
+     const qtyText = String(line.qty);
+     const nameText = line.name;
+     const priceText = formatEuros(line.unitPrice);
+     const totalText = formatEuros(total);
+-    return `${qtyText} × ${nameText} @ ${priceText} = ${totalText}`;
++    lines.push(`${qtyText} × ${nameText} @ ${priceText} = ${totalText}`);
++
++    // Add discount if explicitly set (not for tier discounts)
++    if (line.explicitDiscount && line.discountPercent && line.discountPercent > 0) {
++      const discount = lineDiscount(line);
++      lines.push(`  Discount (${line.discountPercent}%): -${formatEuros(discount)}`);
++    }
+   });
+ 
+   // Get totals
+   const totals = invoiceTotals(invoice);
+   const vatLine = `VAT: ${formatEuros(totals.vat)}`;
+-  const totalLine = `Total: ${formatEuros(totals.total)}`;
++  lines.push(vatLine);
++
++  // Add voucher if present
++  if (invoice.voucher && invoice.voucher.amount > 0) {
++    lines.push(`Voucher (${invoice.voucher.code}): -${formatEuros(invoice.voucher.amount)}`);
++  }
++
++  // Add total
++  lines.push(`Total: ${formatEuros(totals.total)}`);
++
++  // Add due date if invoice is issued
++  if (invoice.dueDate && invoice.number) {
++    lines.push(`Due: ${invoice.dueDate}`);
++  }
++
++  // Add payment info if payments exist
++  if (invoice.payments && invoice.payments.length > 0) {
++    const amountPaid = totals.total - balanceDue(invoice);
++    if (amountPaid > 0) {
++      lines.push(`Paid: ${formatEuros(amountPaid)}`);
++    }
++  }
+ 
+-  // Combine all lines
+-  return [numberLine, customerName, ...lineTexts, vatLine, totalLine].join('\n');
++  return lines.join('\n');
+ }
+diff --git a/test/render.test.js b/test/render.test.js
+index f1ce03a..1c842e7 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -299,3 +299,125 @@ test('renderInvoiceText with zero VAT', () => {
+   // WORKSHOP-DAY has 0% VAT
+   assert(vatLine.includes('€0.00'));
+ });
++import { applyVoucher, invoiceTotals } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++import { formatEuros } from '../src/money.js';
++
++test('renderInvoiceText shows line discount', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5, discountPercent: 15 }],
++  });
++
++  const text = renderInvoiceText(result.value);
++  assert(text.includes('Discount (15%)'));
++  assert(text.includes('-' + String.fromCharCode(8364)));
++});
++
++test('renderInvoiceText shows multiple line discounts', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [
++      { sku: 'DES-HOUR', qty: 5, discountPercent: 10 },
++      { sku: 'DEV-HOUR', qty: 3, discountPercent: 20 },
++    ],
++  });
++
++  const text = renderInvoiceText(result.value);
++  assert(text.includes('Discount (10%)'));
++  assert(text.includes('Discount (20%)'));
++});
++
++test('renderInvoiceText shows voucher before total', () => {
++  let result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  result = applyVoucher(result.value, { code: 'PROMO2026', amount: 5000 });
++
++  const text = renderInvoiceText(result.value);
++  const lines = text.split('\n');
++  assert(text.includes('Voucher (PROMO2026)'));
++  const voucherLineIndex = lines.findIndex((l) => l.includes('Voucher'));
++  const totalLineIndex = lines.findIndex((l) => l.startsWith('Total:'));
++  assert(voucherLineIndex < totalLineIndex);
++});
++
++test('renderInvoiceText shows due date for issued invoice', () => {
++  let result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++    terms: 'NET14',
++  });
++  const issued = issueInvoice(result.value, []);
++
++  const text = renderInvoiceText(issued.value);
++  const lines = text.split('\n');
++  const lastLine = lines[lines.length - 1];
++  assert(lastLine.startsWith('Due:'));
++  assert(lastLine.includes('2026-10-15'));
++});
++
++test('renderInvoiceText shows payment info when invoice has payments', () => {
++  let result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  let issued = issueInvoice(result.value, []);
++  const totals = invoiceTotals(issued.value);
++  const paymentAmount = Math.floor(totals.total / 2);
++  issued = recordPayment(issued.value, { amount: paymentAmount, date: '2026-10-02' });
++
++  const text = renderInvoiceText(issued.value);
++  assert(text.includes('Paid:'));
++});
++
++test('renderInvoiceText does not show due date for draft', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++    terms: 'NET14',
++  });
++
++  const text = renderInvoiceText(result.value);
++  assert(!text.includes('Due:'));
++});
++
++test('renderInvoiceText does not show paid info without payments', () => {
++  let result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const issued = issueInvoice(result.value, []);
++
++  const text = renderInvoiceText(issued.value);
++  assert(!text.includes('Paid:'));
++});
++
++test('renderInvoiceText with complete invoice', () => {
++  let result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 5, discountPercent: 10 }],
++    terms: 'NET14',
++  });
++  result = applyVoucher(result.value, { code: 'SPECIAL', amount: 2000 });
++  let issued = issueInvoice(result.value, []);
++  const totals = invoiceTotals(issued.value);
++  issued = recordPayment(issued.value, { amount: Math.floor(totals.total * 0.4), date: '2026-10-02' });
++
++  const text = renderInvoiceText(issued.value);
++
++  assert(text.includes('INV-2026-0001'));
++  assert(text.includes('Discount (10%)'));
++  assert(text.includes('Voucher (SPECIAL)'));
++  assert(text.includes('Due: 2026-10-15'));
++  assert(text.includes('Paid:'));
++});

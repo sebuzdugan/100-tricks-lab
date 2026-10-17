@@ -1,0 +1,219 @@
+diff --git a/src/errors.js b/src/errors.js
+index 608bb94..c709156 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -11,6 +11,7 @@ export const ERRORS = {
+   NOT_ISSUED: 'Can only record payments on issued or partially paid invoices.',
+   OVERPAYMENT: 'Payment is more than the amount still owed.',
+   QTY_INVALID: 'Quantity must be a positive integer.',
++  TERMS_INVALID: 'Terms must be NET14, NET30, or EOM.',
+   UNKNOWN_SKU: 'No product with that SKU in the catalogue.',
+ };
+ 
+diff --git a/src/invoices.js b/src/invoices.js
+index 79b07cf..74683d8 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -3,14 +3,14 @@ import { roundCents } from './money.js';
+ import { getCustomer, TIER_DISCOUNTS, normalizeId } from './customers.js';
+ import { getProduct } from './catalogue.js';
+ import { nextInvoiceNumber } from './numbering.js';
+-import { isValidDate } from './dates.js';
++import { isValidDate, addDays } from './dates.js';
+ 
+ /**
+  * Create an invoice.
+- * @param {{ customerId: string, issueDate: string, lines: Array<{ sku: string, qty: number, discountPercent?: number }> }} params
+- * @returns {{ ok: true, value: { customerId: string, issueDate: string, status: string, lines: Array } } | { ok: false, error: string }}
++ * @param {{ customerId: string, issueDate: string, lines: Array<{ sku: string, qty: number, discountPercent?: number }>, terms?: string }} params
++ * @returns {{ ok: true, value: { customerId: string, issueDate: string, status: string, lines: Array, terms: string, dueDate: string } } | { ok: false, error: string }}
+  */
+-export function createInvoice({ customerId, issueDate, lines }) {
++export function createInvoice({ customerId, issueDate, lines, terms = 'NET30' }) {
+   // Normalize customer ID
+   const normalizedCustomerId = normalizeId(customerId);
+ 
+@@ -21,6 +21,11 @@ export function createInvoice({ customerId, issueDate, lines }) {
+   // Validate issueDate
+   if (!isValidDate(issueDate)) return fail('DATE_INVALID');
+ 
++  // Calculate due date based on terms
++  const dueDateResult = calculateDueDate(issueDate, terms);
++  if (!dueDateResult.ok) return dueDateResult;
++  const dueDate = dueDateResult.value;
++
+   // Validate lines
+   if (!Array.isArray(lines) || lines.length === 0) return fail('NO_LINES');
+ 
+@@ -60,6 +65,8 @@ export function createInvoice({ customerId, issueDate, lines }) {
+     customerId: normalizedCustomerId,
+     issueDate,
+     status: 'draft',
++    terms,
++    dueDate,
+     lines: enrichedLines,
+   });
+ }
+@@ -225,6 +232,25 @@ export function issueInvoice(invoice, existingNumbers) {
+   });
+ }
+ 
++function calculateDueDate(issueDate, terms) {
++  if (terms === 'NET14') {
++    return ok(addDays(issueDate, 14));
++  } else if (terms === 'NET30') {
++    return ok(addDays(issueDate, 30));
++  } else if (terms === 'EOM') {
++    // End of month: last day of the month of the issue date
++    const [year, month] = issueDate.split('-').map(Number);
++    // Use UTC to find last day of month
++    const lastDayUtc = new Date(Date.UTC(year, month, 0)); // month + 1, day 0 = last day of previous month
++    const lastDay = lastDayUtc.getUTCDate();
++    const monthStr = String(month).padStart(2, '0');
++    const dayStr = String(lastDay).padStart(2, '0');
++    return ok(`${year}-${monthStr}-${dayStr}`);
++  } else {
++    return fail('TERMS_INVALID');
++  }
++}
++
+ function isValidDiscountPercent(value) {
+   return typeof value === 'number' && value >= 0 && value <= 100;
+ }
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index d58fcb0..8f03524 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -1218,3 +1218,132 @@ test('createInvoice works with customer ID with spaces', () => {
+   // Should have tier discount for C-003 (silver)
+   assert.equal(r.value.lines[0].discountPercent, 2.5);
+ });
++
++test('createInvoice defaults terms to NET30', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++  });
++
++  assert.equal(r.ok, true);
++  assert.equal(r.value.terms, 'NET30');
++  assert.equal(r.value.dueDate, '2026-11-06');
++});
++
++test('createInvoice accepts NET14 terms', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  assert.equal(r.ok, true);
++  assert.equal(r.value.terms, 'NET14');
++  assert.equal(r.value.dueDate, '2026-10-21');
++});
++
++test('createInvoice accepts NET30 terms', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'NET30',
++  });
++
++  assert.equal(r.ok, true);
++  assert.equal(r.value.terms, 'NET30');
++  assert.equal(r.value.dueDate, '2026-11-06');
++});
++
++test('createInvoice accepts EOM terms', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++
++  assert.equal(r.ok, true);
++  assert.equal(r.value.terms, 'EOM');
++  assert.equal(r.value.dueDate, '2026-10-31');
++});
++
++test('createInvoice EOM for different months', () => {
++  // February (non-leap year)
++  let r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2025-02-28');
++
++  // February (leap year)
++  r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2024-02-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2024-02-29');
++
++  // April (30 days)
++  r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-04-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2026-04-30');
++
++  // December
++  r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-12-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2026-12-31');
++});
++
++test('createInvoice rejects invalid terms', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'NET45',
++  });
++
++  assert.deepEqual(r, { ok: false, error: 'TERMS_INVALID' });
++});
++
++test('createInvoice EOM is always last day of month', () => {
++  // Issue on the 1st
++  let r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-01',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2026-10-31');
++
++  // Issue on the 15th
++  r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2026-10-31');
++
++  // Issue on the 31st
++  r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-31',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++    terms: 'EOM',
++  });
++  assert.equal(r.value.dueDate, '2026-10-31');
++});

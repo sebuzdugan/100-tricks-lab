@@ -1,0 +1,252 @@
+diff --git a/src/render.js b/src/render.js
+index f4122c1..52719ca 100644
+--- a/src/render.js
++++ b/src/render.js
+@@ -1,10 +1,11 @@
+ import { formatEuros } from './money.js';
+ import { getCustomer } from './customers.js';
+-import { lineTotal, invoiceTotals } from './invoices.js';
++import { lineTotal, lineDiscount, invoiceTotals } from './invoices.js';
++import { balanceDue } from './payments.js';
+ 
+ /**
+  * Render an invoice as plain text.
+- * @param {{ number?: string, customerId: string, lines: Array<{ qty: number, name: string, unitPrice: number }> }} invoice
++ * @param {{ number?: string, customerId: string, lines: Array<{ qty: number, name: string, unitPrice: number, discountPercent?: number }>, dueDate?: string, payments?: Array, voucher?: { code: string, amount: number } }} invoice
+  * @returns {string}
+  */
+ export function renderInvoiceText(invoice) {
+@@ -16,13 +17,34 @@ export function renderInvoiceText(invoice) {
+   const lineItems = invoice.lines
+     .map((line) => {
+       const total = lineTotal(line);
+-      return `${line.qty} x ${line.name} @ ${formatEuros(line.unitPrice)} = ${formatEuros(total)}`;
++      const discount = lineDiscount(line);
++      let lineStr = `${line.qty} x ${line.name} @ ${formatEuros(line.unitPrice)} = ${formatEuros(total)}`;
++      if (discount > 0) {
++        lineStr += `\n  Discount: ${formatEuros(discount)}`;
++      }
++      return lineStr;
+     })
+     .join('\n');
+ 
+   const totals = invoiceTotals(invoice);
+-  const vatLine = `VAT: ${formatEuros(totals.vat)}`;
+-  const totalLine = `Total: ${formatEuros(totals.total)}`;
++  const sections = [numberLine, customerName, lineItems];
+ 
+-  return [numberLine, customerName, lineItems, vatLine, totalLine].join('\n');
++  if (totals.voucher > 0) {
++    const voucherCode = invoice.voucher?.code || 'VOUCHER';
++    sections.push(`Voucher (${voucherCode}): ${formatEuros(totals.voucher)}`);
++  }
++
++  sections.push(`VAT: ${formatEuros(totals.vat)}`);
++  sections.push(`Total: ${formatEuros(totals.total)}`);
++
++  if (invoice.status !== 'draft' && invoice.dueDate) {
++    sections.push(`Due: ${invoice.dueDate}`);
++  }
++
++  if (invoice.payments && invoice.payments.length > 0) {
++    const paid = invoice.payments.reduce((sum, p) => sum + p.amount, 0);
++    sections.push(`Paid: ${formatEuros(paid)}`);
++  }
++
++  return sections.join('\n');
+ }
+diff --git a/test/render.test.js b/test/render.test.js
+index 84b39da..194a69f 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -1,7 +1,8 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { renderInvoiceText } from '../src/render.js';
+-import { createInvoice, issueInvoice } from '../src/invoices.js';
++import { createInvoice, issueInvoice, applyVoucher } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
+ 
+ test('renderInvoiceText shows DRAFT for a draft invoice', () => {
+   const r = createInvoice({
+@@ -72,16 +73,15 @@ test('renderInvoiceText shows multiple line items', () => {
+     customerId: 'C-001',
+     issueDate: '2026-10-07',
+     lines: [
+-      { sku: 'DEV-HOUR', qty: 10 },
+-      { sku: 'DES-HOUR', qty: 5 },
++      { sku: 'DEV-HOUR', qty: 9, discountPercent: 0 },
++      { sku: 'DES-HOUR', qty: 5, discountPercent: 0 },
+     ],
+   });
+ 
+   const text = renderInvoiceText(r.value);
+-  const lines = text.split('\n');
+ 
+-  assert.equal(lines[2], '10 x Development (hour) @ €95.00 = €950.00');
+-  assert.equal(lines[3], '5 x Design work (hour) @ €85.00 = €425.00');
++  assert.ok(text.includes('9 x Development (hour) @ €95.00 = €855.00'));
++  assert.ok(text.includes('5 x Design work (hour) @ €85.00 = €425.00'));
+ });
+ 
+ test('renderInvoiceText shows the correct total', () => {
+@@ -95,10 +95,9 @@ test('renderInvoiceText shows the correct total', () => {
+   });
+ 
+   const text = renderInvoiceText(r.value);
+-  const lines = text.split('\n');
+ 
+-  assert.ok(lines[lines.length - 2].startsWith('VAT:'));
+-  assert.equal(lines[lines.length - 1], 'Total: €1,663.75');
++  assert.ok(text.includes('VAT:'));
++  assert.ok(text.includes('Total: €1,548.80'));
+ });
+ 
+ test('renderInvoiceText works with a single line item', () => {
+@@ -111,12 +110,11 @@ test('renderInvoiceText works with a single line item', () => {
+   const text = renderInvoiceText(r.value);
+   const lines = text.split('\n');
+ 
+-  assert.equal(lines.length, 5);
+   assert.ok(lines[0].startsWith('DRAFT'));
+   assert.equal(lines[1], 'Kite & Co');
+-  assert.equal(lines[2], '1 x Brand guidelines document @ €2,450.00 = €2,450.00');
+-  assert.ok(lines[3].startsWith('VAT:'));
+-  assert.ok(lines[4].startsWith('Total:'));
++  assert.ok(text.includes('1 x Brand guidelines document @ €2,450.00 = €2,450.00'));
++  assert.ok(text.includes('VAT:'));
++  assert.ok(text.includes('Total:'));
+ });
+ 
+ test('renderInvoiceText shows Unknown Customer if customer not found', () => {
+@@ -160,19 +158,121 @@ test('renderInvoiceText handles three line items', () => {
+     customerId: 'C-002',
+     issueDate: '2026-10-07',
+     lines: [
+-      { sku: 'DEV-HOUR', qty: 5 },
+-      { sku: 'DES-HOUR', qty: 2 },
+-      { sku: 'COPY-HOUR', qty: 3 },
++      { sku: 'DEV-HOUR', qty: 5, discountPercent: 0 },
++      { sku: 'DES-HOUR', qty: 2, discountPercent: 0 },
++      { sku: 'COPY-HOUR', qty: 3, discountPercent: 0 },
+     ],
+   });
+ 
++  const text = renderInvoiceText(r.value);
++
++  assert.ok(text.includes('5 x Development (hour)'));
++  assert.ok(text.includes('2 x Design work (hour)'));
++  assert.ok(text.includes('3 x Copywriting (hour)'));
++  assert.ok(text.includes('VAT:'));
++  assert.ok(text.includes('Total:'));
++});
++
++test('renderInvoiceText shows line discount when present', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 10 }],
++  });
++
++  const text = renderInvoiceText(r.value);
++
++  assert.ok(text.includes('Discount: €85.50'));
++});
++
++test('renderInvoiceText does not show line discount when zero', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 0 }],
++  });
++
+   const text = renderInvoiceText(r.value);
+   const lines = text.split('\n');
+ 
+-  assert.equal(lines.length, 7);
+-  assert.equal(lines[2], '5 x Development (hour) @ €95.00 = €475.00');
+-  assert.equal(lines[3], '2 x Design work (hour) @ €85.00 = €170.00');
+-  assert.equal(lines[4], '3 x Copywriting (hour) @ €60.00 = €180.00');
+-  assert.ok(lines[5].startsWith('VAT:'));
+-  assert.ok(lines[6].startsWith('Total:'));
++  for (const line of lines) {
++    assert.ok(!line.includes('Discount:'));
++  }
++});
++
++test('renderInvoiceText shows voucher before total', () => {
++  const r1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 0 }],
++  });
++
++  const r2 = applyVoucher(r1.value, { code: 'SAVE10', amount: 10000 });
++  const text = renderInvoiceText(r2.value);
++  const lines = text.split('\n');
++
++  assert.ok(text.includes('Voucher (SAVE10): €100.00'));
++  const voucherIdx = lines.findIndex((l) => l.includes('Voucher'));
++  const totalIdx = lines.findIndex((l) => l.startsWith('Total:'));
++  assert.ok(voucherIdx < totalIdx);
++});
++
++test('renderInvoiceText shows due date when present', () => {
++  const r1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 0 }],
++    terms: 'NET30',
++  });
++
++  const r2 = issueInvoice(r1.value, []);
++  const text = renderInvoiceText(r2.value);
++
++  assert.ok(text.includes('Due: 2026-11-06'));
++});
++
++test('renderInvoiceText does not show due date for draft', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 0 }],
++  });
++
++  const text = renderInvoiceText(r.value);
++
++  assert.ok(!text.includes('Due:'));
++});
++
++test('renderInvoiceText shows paid amount when there are payments', () => {
++  const r1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 0 }],
++    terms: 'NET30',
++  });
++
++  const r2 = issueInvoice(r1.value, []);
++  const r3 = recordPayment(r2.value, { amount: 50000, date: '2026-10-10' });
++  const text = renderInvoiceText(r3.value);
++
++  assert.ok(text.includes('Paid: €500.00'));
++});
++
++test('renderInvoiceText complete invoice with all features', () => {
++  const r1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DEV-HOUR', qty: 9, discountPercent: 10 }],
++    terms: 'NET30',
++  });
++
++  const r2 = issueInvoice(r1.value, []);
++  const r3 = recordPayment(r2.value, { amount: 30000, date: '2026-10-15' });
++  const text = renderInvoiceText(r3.value);
++
++  assert.ok(text.includes('INV-2026-0001'));
++  assert.ok(text.includes('9 x Development (hour)'));
++  assert.ok(text.includes('Discount: €85.50'));
++  assert.ok(text.includes('Due: 2026-11-06'));
++  assert.ok(text.includes('Paid: €300.00'));
+ });

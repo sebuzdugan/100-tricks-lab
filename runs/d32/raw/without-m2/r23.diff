@@ -1,0 +1,402 @@
+diff --git a/src/invoices.js b/src/invoices.js
+index 5cef87e..323ef60 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -3,10 +3,10 @@ import { getCustomer, TIER_DISCOUNTS, normalizeId } from './customers.js';
+ import { getProduct } from './catalogue.js';
+ import { nextInvoiceNumber } from './numbering.js';
+ import { isValidDate, addDays } from './dates.js';
+-import { lineTotal, lineDiscount, lineVAT, invoiceTotals } from './totals.js';
++import { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount } from './totals.js';
+ 
+ // Re-export totals functions for backward compatibility
+-export { lineTotal, lineDiscount, lineVAT, invoiceTotals };
++export { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount };
+ 
+ /**
+  * Create a new invoice.
+diff --git a/src/totals.js b/src/totals.js
+index 207e4f6..60bbdf5 100644
+--- a/src/totals.js
++++ b/src/totals.js
+@@ -20,17 +20,35 @@ export function lineDiscount(line) {
+   return roundCents(discount);
+ }
+ 
++/**
++ * Calculate the bulk discount for a single invoice line.
++ * Lines with 10+ units get an extra 2.5% off, applied after the line discount.
++ * @param {{ qty: number, unitPrice: number, discountPercent?: number }} line
++ * @returns {number} bulk discount in cents
++ */
++export function bulkDiscount(line) {
++  if (line.qty < 10) {
++    return 0;
++  }
++  const total = lineTotal(line);
++  const discount = lineDiscount(line);
++  const amountAfterDiscount = total - discount;
++  const bulk = (amountAfterDiscount * 2.5) / 100;
++  return roundCents(bulk);
++}
++
+ /**
+  * Calculate the VAT for a single invoice line.
+- * VAT is computed on the line amount after discount.
++ * VAT is computed on the line amount after all discounts (line discount + bulk discount).
+  * @param {{ qty: number, unitPrice: number, discountPercent?: number, vatRate: number }} line
+  * @returns {number} VAT in cents
+  */
+ export function lineVAT(line) {
+   const subtotal = lineTotal(line);
+   const discount = lineDiscount(line);
+-  const amountAfterDiscount = subtotal - discount;
+-  const vat = (amountAfterDiscount * line.vatRate) / 100;
++  const bulk = bulkDiscount(line);
++  const amountAfterAllDiscounts = subtotal - discount - bulk;
++  const vat = (amountAfterAllDiscounts * line.vatRate) / 100;
+   return roundCents(vat);
+ }
+ 
+@@ -45,7 +63,7 @@ export function invoiceTotals(invoice) {
+   let vat = 0;
+   for (const line of invoice.lines) {
+     subtotal += lineTotal(line);
+-    discount += lineDiscount(line);
++    discount += lineDiscount(line) + bulkDiscount(line);
+     vat += lineVAT(line);
+   }
+   const voucher = invoice.voucher?.amount ?? 0;
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 9dac679..c96cc00 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -548,9 +548,10 @@ test('invoiceTotals sums all line totals', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 42500 + 95000); // 137500
+-  assert.equal(totals.discount, 0);
++  // qty: 10 line gets 2.5% bulk discount = 95000 * 0.025 = 2375
++  assert.equal(totals.discount, 2375);
+   assert.equal(totals.vat, 0);
+-  assert.equal(totals.total, 137500);
++  assert.equal(totals.total, 137500 - 2375); // 135125
+ });
+ 
+ test('invoiceTotals with single line', () => {
+@@ -1344,17 +1345,17 @@ test('lineVAT with zero VAT rate', () => {
+ });
+ 
+ test('lineVAT with 9% VAT rate', () => {
+-  // Line: 10 * 1000 = 10000, no discount, amount after = 10000
+-  // VAT 9% = 10000 * 0.09 = 900
++  // Line: 10 * 1000 = 10000, bulk discount 2.5% = 250, amount after = 9750
++  // VAT 9% = 9750 * 0.09 = 877.5 ≈ 878
+   const vat = lineVAT({ qty: 10, unitPrice: 1000, vatRate: 9 });
+-  assert.equal(vat, 900);
++  assert.equal(vat, 878);
+ });
+ 
+ test('lineVAT with 21% VAT rate', () => {
+-  // Line: 10 * 1000 = 10000, no discount, amount after = 10000
+-  // VAT 21% = 10000 * 0.21 = 2100
++  // Line: 10 * 1000 = 10000, bulk discount 2.5% = 250, amount after = 9750
++  // VAT 21% = 9750 * 0.21 = 2047.5 ≈ 2048
+   const vat = lineVAT({ qty: 10, unitPrice: 1000, vatRate: 21 });
+-  assert.equal(vat, 2100);
++  assert.equal(vat, 2048);
+ });
+ 
+ test('invoiceTotals with VAT included', () => {
+@@ -1378,19 +1379,19 @@ test('invoiceTotals with multiple lines and different VAT rates', () => {
+     customerId: 'C-002',
+     issueDate: '2026-10-07',
+     lines: [
+-      { sku: 'DES-HOUR', qty: 5 },      // 42500, VAT 21% = 8925
+-      { sku: 'PRINT-A4', qty: 100 },    // 3700, VAT 9% = 333
++      { sku: 'DES-HOUR', qty: 5 },      // 42500, no bulk, VAT 21% = 8925
++      { sku: 'PRINT-A4', qty: 100 },    // 3700, bulk 2.5% = 92, VAT 9% = 325
+     ],
+   });
+   const totals = invoiceTotals(result.value);
+   // subtotal: 42500 + 3700 = 46200
+-  // discount: 0
+-  // VAT: 8925 + 333 = 9258
+-  // total: 46200 + 9258 = 55458
++  // discount: 92 (bulk on PRINT-A4)
++  // VAT: 8925 + 325 = 9250
++  // total: 46200 - 92 + 9250 = 55358
+   assert.equal(totals.subtotal, 46200);
+-  assert.equal(totals.discount, 0);
+-  assert.equal(totals.vat, 9258);
+-  assert.equal(totals.total, 55458);
++  assert.equal(totals.discount, 92);
++  assert.equal(totals.vat, 9250);
++  assert.equal(totals.total, 55358);
+ });
+ 
+ test('invoiceTotals with VAT-exempt product', () => {
+@@ -1418,14 +1419,14 @@ test('invoiceTotals with discount and VAT', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   // subtotal: 100000
+-  // discount: 20000
+-  // amount after discount: 80000
+-  // VAT 21% on 80000: 16800
+-  // total: 100000 - 20000 + 16800 = 96800
++  // discount: 20% = 20000, bulk 2.5% on 80000 = 2000, total = 22000
++  // amount after discounts: 78000
++  // VAT 21% on 78000: 16380
++  // total: 100000 - 22000 + 16380 = 94380
+   assert.equal(totals.subtotal, 100000);
+-  assert.equal(totals.discount, 20000);
+-  assert.equal(totals.vat, 16800);
+-  assert.equal(totals.total, 96800);
++  assert.equal(totals.discount, 22000);
++  assert.equal(totals.vat, 16380);
++  assert.equal(totals.total, 94380);
+ });
+ 
+ test('invoiceTotals with complex scenario (multiple lines, tiers, discounts, VATs)', () => {
+@@ -1433,17 +1434,17 @@ test('invoiceTotals with complex scenario (multiple lines, tiers, discounts, VAT
+     customerId: 'C-003',  // silver tier 2.5%
+     issueDate: '2026-10-07',
+     lines: [
+-      { sku: 'DES-HOUR', qty: 10 },           // 85000, discount 2.5% = 2125, VAT 21% on 82875 = 17404
+-      { sku: 'PRINT-A4', qty: 50, discountPercent: 10 }, // 1850, discount 10% = 185, VAT 9% on 1665 = 150
++      { sku: 'DES-HOUR', qty: 10 },           // 85000, discount 2.5% = 2125, bulk 2.5% on 82875 = 2072, VAT 21% on 80803 = 16969
++      { sku: 'PRINT-A4', qty: 50, discountPercent: 10 }, // 1850, discount 10% = 185, bulk 2.5% on 1665 = 42, VAT 9% on 1623 = 146
+     ],
+   });
+   const totals = invoiceTotals(result.value);
+   // subtotal: 85000 + 1850 = 86850
+-  // discount: 2125 + 185 = 2310
+-  // VAT: 17404 + 150 = 17554
+-  // total: 86850 - 2310 + 17554 = 102094
++  // discount: (2125 + 2072) + (185 + 42) = 4424
++  // VAT: 16969 + 146 = 17115
++  // total: 86850 - 4424 + 17115 = 99541
+   assert.equal(totals.subtotal, 86850);
+-  assert.equal(totals.discount, 2310);
+-  assert.equal(totals.vat, 17554);
+-  assert.equal(totals.total, 102094);
++  assert.equal(totals.discount, 4424);
++  assert.equal(totals.vat, 17115);
++  assert.equal(totals.total, 99541);
+ });
+diff --git a/test/totals.test.js b/test/totals.test.js
+index e31e59f..b82aef6 100644
+--- a/test/totals.test.js
++++ b/test/totals.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { lineTotal, lineDiscount, lineVAT, invoiceTotals } from '../src/totals.js';
++import { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount } from '../src/totals.js';
+ 
+ // lineTotal tests
+ test('lineTotal multiplies qty by unitPrice', () => {
+@@ -84,7 +84,9 @@ test('lineVAT with 9% VAT rate', () => {
+ test('lineVAT with 21% VAT rate', () => {
+   const line = { qty: 10, unitPrice: 5000, vatRate: 21 };
+   const total = lineTotal(line);
+-  const expected = Math.round((total * 21) / 100);
++  const bulk = bulkDiscount(line);
++  const amountAfterDiscount = total - bulk;
++  const expected = Math.round((amountAfterDiscount * 21) / 100);
+   assert.equal(lineVAT(line), expected);
+ });
+ 
+@@ -144,7 +146,9 @@ test('invoiceTotals with no explicit discount', () => {
+     ],
+   };
+   const result = invoiceTotals(invoice);
+-  assert.equal(result.discount, 0);
++  // Line 1 (qty 5) gets no bulk, line 2 (qty 10) gets bulk discount of 2.5%
++  const expectedDiscount = bulkDiscount(invoice.lines[1]);
++  assert.equal(result.discount, expectedDiscount);
+ });
+ 
+ test('invoiceTotals with multiple lines and varying discounts', () => {
+@@ -220,7 +224,7 @@ test('invoiceTotals with complex scenario', () => {
+   let expectedVAT = 0;
+   for (const line of invoice.lines) {
+     expectedSubtotal += lineTotal(line);
+-    expectedDiscount += lineDiscount(line);
++    expectedDiscount += lineDiscount(line) + bulkDiscount(line);
+     expectedVAT += lineVAT(line);
+   }
+ 
+@@ -246,3 +250,172 @@ test('lineTotal does not mutate input', () => {
+   lineTotal(line);
+   assert.deepEqual(line, original);
+ });
++
++// Bulk discount tests
++test('bulkDiscount returns 0 for qty < 10', () => {
++  const line = { qty: 9, unitPrice: 1000, discountPercent: 0 };
++  assert.equal(bulkDiscount(line), 0);
++});
++
++test('bulkDiscount returns 0 for qty = 9', () => {
++  const line = { qty: 9, unitPrice: 1700, discountPercent: 0 };
++  assert.equal(bulkDiscount(line), 0);
++});
++
++test('bulkDiscount applies 2.5% for qty >= 10', () => {
++  const line = { qty: 10, unitPrice: 1000, discountPercent: 0 };
++  const bulk = bulkDiscount(line);
++  assert(bulk > 0);
++  // 10 * 1000 = 10000 cents, 2.5% = 250 cents
++  assert.equal(bulk, 250);
++});
++
++test('bulkDiscount applies 2.5% on amount after line discount', () => {
++  const line = { qty: 10, unitPrice: 1000, discountPercent: 10 };
++  const total = lineTotal(line);
++  const discount = lineDiscount(line);
++  const amountAfterDiscount = total - discount;
++  const expectedBulk = Math.round((amountAfterDiscount * 2.5) / 100);
++  const bulk = bulkDiscount(line);
++  assert.equal(bulk, expectedBulk);
++});
++
++test('bulkDiscount with qty 100', () => {
++  const line = { qty: 100, unitPrice: 1000, discountPercent: 0 };
++  const bulk = bulkDiscount(line);
++  // 100 * 1000 = 100000, 2.5% = 2500
++  assert.equal(bulk, 2500);
++});
++
++test('bulkDiscount with qty exactly 10', () => {
++  const line = { qty: 10, unitPrice: 1700, discountPercent: 0 };
++  const bulk = bulkDiscount(line);
++  assert(bulk > 0);
++});
++
++test('bulkDiscount with qty 11', () => {
++  const line = { qty: 11, unitPrice: 1700, discountPercent: 0 };
++  const bulk = bulkDiscount(line);
++  assert(bulk > 0);
++});
++
++test('lineVAT includes bulk discount in calculation', () => {
++  const line = { qty: 10, unitPrice: 1000, discountPercent: 10, vatRate: 21 };
++  const total = lineTotal(line);
++  const discount = lineDiscount(line);
++  const bulk = bulkDiscount(line);
++  const amountAfterAllDiscounts = total - discount - bulk;
++  const expectedVAT = Math.round((amountAfterAllDiscounts * 21) / 100);
++  const vat = lineVAT(line);
++  assert.equal(vat, expectedVAT);
++});
++
++test('lineVAT with bulk discount and no line discount', () => {
++  const line = { qty: 10, unitPrice: 1000, discountPercent: 0, vatRate: 21 };
++  const vat = lineVAT(line);
++  assert(vat > 0);
++  // 10000 - 250 (bulk) = 9750, 21% = 2047.5 ~ 2048
++  assert(vat > 2000);
++});
++
++test('invoiceTotals includes bulk discount', () => {
++  const invoice = {
++    lines: [{ qty: 10, unitPrice: 1000, discountPercent: 0, vatRate: 21 }],
++  };
++  const result = invoiceTotals(invoice);
++  const lineBulk = bulkDiscount(invoice.lines[0]);
++  assert(result.discount > 0);
++  assert.equal(result.discount, lineBulk);
++});
++
++test('invoiceTotals with multiple lines, some with bulk discount', () => {
++  const invoice = {
++    lines: [
++      { qty: 5, unitPrice: 1000, discountPercent: 0, vatRate: 21 },
++      { qty: 10, unitPrice: 1000, discountPercent: 0, vatRate: 21 },
++    ],
++  };
++  const result = invoiceTotals(invoice);
++  const line1Discount = lineDiscount(invoice.lines[0]);
++  const line1Bulk = bulkDiscount(invoice.lines[0]);
++  const line2Discount = lineDiscount(invoice.lines[1]);
++  const line2Bulk = bulkDiscount(invoice.lines[1]);
++  const expectedDiscount = line1Discount + line1Bulk + line2Discount + line2Bulk;
++  assert.equal(result.discount, expectedDiscount);
++});
++
++test('invoiceTotals with line discount and bulk discount', () => {
++  const invoice = {
++    lines: [{ qty: 10, unitPrice: 1000, discountPercent: 10, vatRate: 21 }],
++  };
++  const result = invoiceTotals(invoice);
++  const lineDisc = lineDiscount(invoice.lines[0]);
++  const bulkDisc = bulkDiscount(invoice.lines[0]);
++  const expectedDiscount = lineDisc + bulkDisc;
++  assert(result.discount > lineDisc);
++  assert.equal(result.discount, expectedDiscount);
++});
++
++test('invoiceTotals VAT calculated after all discounts', () => {
++  const invoice = {
++    lines: [{ qty: 10, unitPrice: 1000, discountPercent: 10, vatRate: 21 }],
++  };
++  const result = invoiceTotals(invoice);
++  const vat = lineVAT(invoice.lines[0]);
++  assert.equal(result.vat, vat);
++});
++
++test('bulk discount reduces VAT rate on the discounted portion', () => {
++  const line9 = { qty: 9, unitPrice: 1000, discountPercent: 0, vatRate: 21 };
++  const line10 = { qty: 10, unitPrice: 1000, discountPercent: 0, vatRate: 21 };
++
++  // 9 units: 9000 total, no bulk discount, 9000 * 21% = 1890 vat
++  const vat9 = lineVAT(line9);
++  // 10 units: 10000 total, 250 bulk discount, (10000-250) * 21% = 2047.5 vat
++  const vat10 = lineVAT(line10);
++
++  // VAT on the base before bulk discount
++  const base10Before = lineTotal(line10) - lineDiscount(line10);
++  const base10After = base10Before - bulkDiscount(line10);
++  const expectedVat10 = Math.round((base10After * 21) / 100);
++  assert.equal(vat10, expectedVat10);
++});
++
++test('bulk discount with no line discount', () => {
++  const line = { qty: 20, unitPrice: 500, discountPercent: undefined, vatRate: 21 };
++  const bulk = bulkDiscount(line);
++  assert(bulk > 0);
++});
++
++test('bulk discount calculation is consistent', () => {
++  const line = { qty: 50, unitPrice: 1000, discountPercent: 5, vatRate: 21 };
++  const bulk1 = bulkDiscount(line);
++  const bulk2 = bulkDiscount(line);
++  assert.equal(bulk1, bulk2);
++});
++
++test('invoiceTotals with complex scenario including bulk discount', () => {
++  const invoice = {
++    lines: [
++      { qty: 5, unitPrice: 1700, discountPercent: 0, vatRate: 21 },
++      { qty: 10, unitPrice: 1700, discountPercent: 10, vatRate: 21 },
++      { qty: 50, unitPrice: 37, discountPercent: 0, vatRate: 9 },
++    ],
++  };
++  const result = invoiceTotals(invoice);
++
++  let expectedSubtotal = 0;
++  let expectedDiscount = 0;
++  let expectedVAT = 0;
++  for (const line of invoice.lines) {
++    expectedSubtotal += lineTotal(line);
++    expectedDiscount += lineDiscount(line) + bulkDiscount(line);
++    expectedVAT += lineVAT(line);
++  }
++
++  assert.equal(result.subtotal, expectedSubtotal);
++  assert.equal(result.discount, expectedDiscount);
++  assert.equal(result.vat, expectedVAT);
++  // Verify the total calculation
++  assert.equal(result.total, Math.max(0, result.subtotal - result.discount + result.vat - (result.voucher ?? 0)));
++});

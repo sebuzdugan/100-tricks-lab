@@ -1,0 +1,263 @@
+diff --git a/src/errors.js b/src/errors.js
+index 43ea6e9..f4927e7 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -4,6 +4,7 @@ export const ERRORS = {
+   CUSTOMER_INVALID: 'A customer needs an id, a name and a valid email.',
+   CUSTOMER_NOT_FOUND: 'No customer with that id.',
+   DATE_INVALID: 'Issue date must be in YYYY-MM-DD format.',
++  DISCOUNT_INVALID: 'Discount percent must be a number from 0 to 100.',
+   LINE_NOT_FOUND: 'Line with that SKU not found on this invoice.',
+   NO_LINES: 'An invoice must have at least one line item.',
+   NOT_DRAFT: 'Invoice must be in draft status to modify it.',
+diff --git a/src/invoices.js b/src/invoices.js
+index 01d62bc..50e865c 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -2,6 +2,7 @@ import { getCustomer } from './customers.js';
+ import { getProduct } from './catalogue.js';
+ import { ok, fail } from './result.js';
+ import { nextInvoiceNumber } from './numbering.js';
++import { roundCents } from './money.js';
+ 
+ /**
+  * Create an invoice.
+@@ -35,6 +36,12 @@ export function createInvoice({ customerId, issueDate, lines }) {
+       return fail('QTY_INVALID');
+     }
+ 
++    // Validate discount
++    const discountPercent = line.discountPercent ?? 0;
++    if (typeof discountPercent !== 'number' || discountPercent < 0 || discountPercent > 100) {
++      return fail('DISCOUNT_INVALID');
++    }
++
+     // Validate and get product
+     const productResult = getProduct(line.sku);
+     if (!productResult.ok) return productResult;
+@@ -45,6 +52,7 @@ export function createInvoice({ customerId, issueDate, lines }) {
+       qty: line.qty,
+       unitPrice: productResult.value.unitPrice,
+       vatRate: productResult.value.vatRate,
++      discountPercent,
+     });
+   }
+ 
+@@ -67,21 +75,31 @@ export function lineTotal(line) {
+ 
+ /**
+  * Calculate totals for an invoice.
+- * @param {{ lines: Array<{ qty: number, unitPrice: number }> }} invoice
+- * @returns {{ subtotal: number, total: number }}
++ * @param {{ lines: Array<{ qty: number, unitPrice: number, discountPercent?: number }> }} invoice
++ * @returns {{ subtotal: number, discount: number, total: number }}
+  */
+ export function invoiceTotals(invoice) {
+-  const subtotal = invoice.lines.reduce((sum, line) => sum + lineTotal(line), 0);
+-  return { subtotal, total: subtotal };
++  let subtotal = 0;
++  let discount = 0;
++
++  for (const line of invoice.lines) {
++    const lineamt = lineTotal(line);
++    subtotal += lineamt;
++    const lineDiscount = lineamt * (line.discountPercent ?? 0) / 100;
++    discount += roundCents(lineDiscount);
++  }
++
++  const total = Math.max(0, subtotal - discount);
++  return { subtotal, discount, total };
+ }
+ 
+ /**
+  * Add or update a line on an invoice.
+  * @param {{ status: string, customerId: string, issueDate: string, lines: Array }} invoice
+- * @param {{ sku: string, qty: number }}
++ * @param {{ sku: string, qty: number, discountPercent?: number }}
+  * @returns {object}
+  */
+-export function addLine(invoice, { sku, qty }) {
++export function addLine(invoice, { sku, qty, discountPercent }) {
+   if (invoice.status !== 'draft') {
+     return fail('NOT_DRAFT');
+   }
+@@ -90,6 +108,11 @@ export function addLine(invoice, { sku, qty }) {
+     return fail('QTY_INVALID');
+   }
+ 
++  const discount = discountPercent ?? 0;
++  if (typeof discount !== 'number' || discount < 0 || discount > 100) {
++    return fail('DISCOUNT_INVALID');
++  }
++
+   const productResult = getProduct(sku);
+   if (!productResult.ok) return productResult;
+ 
+@@ -108,6 +131,7 @@ export function addLine(invoice, { sku, qty }) {
+       qty: qty,
+       unitPrice: productResult.value.unitPrice,
+       vatRate: productResult.value.vatRate,
++      discountPercent: discount,
+     });
+   }
+ 
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 57540c1..264ac16 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -148,6 +148,7 @@ test('createInvoice does not mutate input lines', () => {
+     qty: 2,
+     unitPrice: 8500,
+     vatRate: 21,
++    discountPercent: 0,
+   });
+ });
+ 
+@@ -166,6 +167,7 @@ test('invoiceTotals calculates subtotal and total', () => {
+   const totals = invoiceTotals(invoice);
+   assert.deepEqual(totals, {
+     subtotal: 17000,
++    discount: 0,
+     total: 17000,
+   });
+ });
+@@ -181,9 +183,109 @@ test('invoiceTotals with multiple lines', () => {
+   }).value;
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 2 * 8500 + 3 * 9500);
++  assert.equal(totals.discount, 0);
+   assert.equal(totals.total, totals.subtotal);
+ });
+ 
++test('createInvoice accepts discountPercent on lines', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 2, discountPercent: 10 }],
++  });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.lines[0].discountPercent, 10);
++});
++
++test('createInvoice returns DISCOUNT_INVALID for negative discount', () => {
++  assert.deepEqual(
++    createInvoice({
++      customerId: 'C-001',
++      issueDate: '2026-10-07',
++      lines: [{ sku: 'DES-HOUR', qty: 2, discountPercent: -1 }],
++    }),
++    { ok: false, error: 'DISCOUNT_INVALID' }
++  );
++});
++
++test('createInvoice returns DISCOUNT_INVALID for discount over 100', () => {
++  assert.deepEqual(
++    createInvoice({
++      customerId: 'C-001',
++      issueDate: '2026-10-07',
++      lines: [{ sku: 'DES-HOUR', qty: 2, discountPercent: 101 }],
++    }),
++    { ok: false, error: 'DISCOUNT_INVALID' }
++  );
++});
++
++test('createInvoice returns DISCOUNT_INVALID for non-numeric discount', () => {
++  assert.deepEqual(
++    createInvoice({
++      customerId: 'C-001',
++      issueDate: '2026-10-07',
++      lines: [{ sku: 'DES-HOUR', qty: 2, discountPercent: 'ten' }],
++    }),
++    { ok: false, error: 'DISCOUNT_INVALID' }
++  );
++});
++
++test('invoiceTotals calculates discount correctly', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 2, discountPercent: 50 }],
++  }).value;
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.subtotal, 17000);
++  assert.equal(totals.discount, 8500);
++  assert.equal(totals.total, 8500);
++});
++
++test('invoiceTotals with multiple lines and different discounts', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [
++      { sku: 'DES-HOUR', qty: 2, discountPercent: 10 },
++      { sku: 'DEV-HOUR', qty: 2, discountPercent: 20 },
++    ],
++  }).value;
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.subtotal, 2 * 8500 + 2 * 9500);
++  assert.equal(totals.discount, (2 * 8500) * 0.1 + (2 * 9500) * 0.2);
++  assert.equal(totals.total, totals.subtotal - totals.discount);
++});
++
++test('invoiceTotals clamps total to zero if discount exceeds subtotal', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DES-HOUR', qty: 2, unitPrice: 8500, vatRate: 21, name: 'Design work', discountPercent: 100 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.subtotal, 17000);
++  assert.equal(totals.discount, 17000);
++  assert.equal(totals.total, 0);
++});
++
++test('invoiceTotals defaults discountPercent to 0', () => {
++  const invoice = {
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DES-HOUR', qty: 2, unitPrice: 8500, vatRate: 21, name: 'Design work' },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.discount, 0);
++  assert.equal(totals.total, 17000);
++});
++
+ test('addLine adds a new line to the invoice', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001',
+@@ -246,6 +348,29 @@ test('addLine returns NOT_DRAFT for non-draft invoice', () => {
+   });
+ });
+ 
++test('addLine accepts discountPercent', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 2 }],
++  }).value;
++  const r = addLine(invoice, { sku: 'DEV-HOUR', qty: 3, discountPercent: 15 });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.lines[1].discountPercent, 15);
++});
++
++test('addLine returns DISCOUNT_INVALID for invalid discount', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 2 }],
++  }).value;
++  assert.deepEqual(addLine(invoice, { sku: 'DEV-HOUR', qty: 1, discountPercent: 150 }), {
++    ok: false,
++    error: 'DISCOUNT_INVALID',
++  });
++});
++
+ test('addLine does not mutate input invoice', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001',

@@ -1,0 +1,181 @@
+diff --git a/src/errors.js b/src/errors.js
+index 02e978c..5e6beed 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -13,6 +13,7 @@ export const ERRORS = {
+   QTY_INVALID: 'Line quantity must be a positive integer.',
+   TERMS_INVALID: 'Terms must be NET14, NET30, or EOM.',
+   UNKNOWN_SKU: 'No product with that SKU in the catalogue.',
++  VOUCHER_EXISTS: 'An invoice can only have one voucher.',
+ };
+ 
+ /**
+diff --git a/src/invoices.js b/src/invoices.js
+index 2c8945e..f59de3d 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -134,9 +134,9 @@ export function lineVat(line) {
+ }
+ 
+ /**
+- * Calculate invoice totals: subtotal, discount, vat, and total.
+- * @param {{ lines: Array }}
+- * @returns {{ subtotal: number, discount: number, vat: number, total: number }}
++ * Calculate invoice totals: subtotal, discount, vat, voucher, and total.
++ * @param {{ lines: Array, voucher?: { code: string, amount: number } }}
++ * @returns {{ subtotal: number, discount: number, vat: number, voucher: number, total: number }}
+  */
+ export function invoiceTotals(invoice) {
+   let subtotal = 0;
+@@ -147,8 +147,9 @@ export function invoiceTotals(invoice) {
+     discount += lineDiscount(line);
+     vat += lineVat(line);
+   }
+-  const total = subtotal - discount + vat;
+-  return { subtotal, discount, vat, total };
++  const voucher = invoice.voucher?.amount ?? 0;
++  const total = Math.max(0, subtotal - discount + vat - voucher);
++  return { subtotal, discount, vat, voucher, total };
+ }
+ 
+ /**
+@@ -249,3 +250,24 @@ export function issueInvoice(invoice, existingNumbers) {
+ 
+   return ok(newInvoice);
+ }
++
++/**
++ * Apply a voucher to a draft invoice (fixed amount off after VAT).
++ * @param {{ status: string, voucher?: any }} invoice
++ * @param {{ code: string, amount: number }} voucher
++ * @returns {{ ok: true, value: any } | { ok: false, error: string }}
++ */
++export function applyVoucher(invoice, { code, amount }) {
++  if (invoice.status !== 'draft') return fail('NOT_DRAFT');
++
++  if (invoice.voucher) return fail('VOUCHER_EXISTS');
++
++  if (!Number.isInteger(amount) || amount <= 0) return fail('AMOUNT_INVALID');
++
++  const newInvoice = {
++    ...invoice,
++    voucher: { code, amount },
++  };
++
++  return ok(newInvoice);
++}
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index a0ff75c..baf9023 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { createInvoice, lineTotal, invoiceTotals, addLine, removeLine, issueInvoice, lineDiscount, lineVat } from '../src/invoices.js';
++import { createInvoice, lineTotal, invoiceTotals, addLine, removeLine, issueInvoice, lineDiscount, lineVat, applyVoucher } from '../src/invoices.js';
+ 
+ test('createInvoice creates a draft invoice with enriched lines', () => {
+   const r = createInvoice({
+@@ -120,6 +120,102 @@ test('createInvoice calculates EOM for different months', () => {
+   assert.equal(r3.value.dueDate, '2024-02-29');
+ });
+ 
++test('applyVoucher adds a voucher to a draft invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++
++  const r = applyVoucher(invoice, { code: 'SUMMER2026', amount: 5000 });
++  assert.equal(r.ok, true);
++  assert.equal(r.value.voucher.code, 'SUMMER2026');
++  assert.equal(r.value.voucher.amount, 5000);
++});
++
++test('applyVoucher rejects non-draft invoices', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++  const issuedResult = issueInvoice(invoice, []);
++  const issuedInvoice = issuedResult.value;
++
++  assert.deepEqual(applyVoucher(issuedInvoice, { code: 'SUMMER2026', amount: 5000 }), { ok: false, error: 'NOT_DRAFT' });
++});
++
++test('applyVoucher rejects duplicate vouchers', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++
++  const r1 = applyVoucher(invoice, { code: 'SUMMER2026', amount: 5000 });
++  assert.equal(r1.ok, true);
++
++  const r2 = applyVoucher(r1.value, { code: 'ANOTHER', amount: 2000 });
++  assert.deepEqual(r2, { ok: false, error: 'VOUCHER_EXISTS' });
++});
++
++test('applyVoucher rejects invalid amount', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++
++  assert.deepEqual(applyVoucher(invoice, { code: 'BAD', amount: 0 }), { ok: false, error: 'AMOUNT_INVALID' });
++  assert.deepEqual(applyVoucher(invoice, { code: 'BAD', amount: -1000 }), { ok: false, error: 'AMOUNT_INVALID' });
++  assert.deepEqual(applyVoucher(invoice, { code: 'BAD', amount: 100.5 }), { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('invoiceTotals includes voucher in calculation', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++  const withVoucher = applyVoucher(invoice, { code: 'SUMMER2026', amount: 5000 }).value;
++
++  const totals = invoiceTotals(withVoucher);
++  assert.equal(totals.voucher, 5000);
++  assert.equal(totals.total, totals.subtotal - totals.discount + totals.vat - 5000);
++});
++
++test('invoiceTotals voucher is 0 without a voucher', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.voucher, 0);
++  assert.equal(totals.total, totals.subtotal - totals.discount + totals.vat);
++});
++
++test('applyVoucher does not mutate original invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }],
++  });
++  const invoice = invoiceResult.value;
++
++  const originalVoucher = invoice.voucher;
++  applyVoucher(invoice, { code: 'SUMMER2026', amount: 5000 });
++
++  assert.equal(invoice.voucher, originalVoucher);
++});
++
+ test('createInvoice reports unknown customer', () => {
+   const r = createInvoice({
+     customerId: 'C-999',

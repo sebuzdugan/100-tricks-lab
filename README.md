@@ -73,6 +73,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 31 | /compact every 5 requests vs auto-compaction | 122/150 vs 114/150 requests kept, about 11 min slower | 🟡 optional |
 | 32 | /clear every 5 requests vs one long session | 104/150 vs 124/150 requests kept, chat-only rules lost on clear | ❌ cut |
 | 33 | Handoff note every 5 requests vs /compact | 117/150 vs 118/150 requests kept, money rule broke 2 vs 8 times | 🟡 optional |
+| 34 | @-name the relevant files in every request | 120/150 vs 126/150 requests kept, reads and searches 186 vs 393 | 🟡 optional |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

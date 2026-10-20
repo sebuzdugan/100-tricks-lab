@@ -1,0 +1,231 @@
+diff --git a/src/reports.js b/src/reports.js
+index 86d8ab7..ed18d0f 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -53,3 +53,19 @@ export function vatSummary(invoices) {
+ 
+   return Array.from(vatMap.values()).sort((a, b) => b.rate - a.rate);
+ }
++
++/**
++ * Calculate late fee for an invoice.
++ * 0.04% per day of the amount still due, 0 if not overdue.
++ * @param {{ dueDate: string, payments?: Array }} invoice
++ * @param {string} asOf Date in YYYY-MM-DD format
++ * @returns {number} Late fee in cents
++ */
++export function lateFee(invoice, asOf) {
++  const daysOverdue = daysBetween(invoice.dueDate, asOf);
++  if (daysOverdue <= 0) return 0;
++
++  const due = balanceDue(invoice);
++  const fee = due * (daysOverdue * 0.04 / 100);
++  return roundCents(fee);
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+index dae2382..ad0ccbc 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -2,7 +2,7 @@ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+-import { overdueInvoices, vatSummary } from '../src/reports.js';
++import { overdueInvoices, vatSummary, lateFee } from '../src/reports.js';
+ 
+ test('overdueInvoices returns empty for no invoices', () => {
+   const result = overdueInvoices([], '2025-10-15');
+@@ -517,3 +517,193 @@ test('vatSummary sorts by rate descending', () => {
+   assert.equal(result[1].rate, 9);
+   assert.equal(result[2].rate, 0);
+ });
++
++test('lateFee returns 0 when invoice is not overdue', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++  // Due 2025-10-21, asOf 2025-10-15 = not overdue
++  const fee = lateFee(issued, '2025-10-15');
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns 0 when on due date', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++  // Due 2025-10-21, asOf 2025-10-21 = not overdue
++  const fee = lateFee(issued, '2025-10-21');
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns fee when 1 day overdue', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++  const totals = invoiceTotals(issued);
++
++  // Due 2025-10-21, asOf 2025-10-22 = 1 day overdue
++  // fee = 145200 * 1 * 0.04 / 100 = 58.08 cents = 58 cents rounded
++  const fee = lateFee(issued, '2025-10-22');
++
++  assert(fee > 0);
++  // LOGO-PACK 120000 + VAT 25200 = 145200
++  // 1 day * 0.04% = 0.04% of 145200 = 58.08 → 58 cents
++  assert.equal(fee, 58);
++});
++
++test('lateFee calculates correctly for multiple days overdue', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++  const totals = invoiceTotals(issued);
++
++  // Due 2025-10-21, asOf 2025-11-04 = 14 days overdue
++  // fee = 145200 * 14 * 0.04 / 100 = 812.16 cents, rounded to 813
++  const fee = lateFee(issued, '2025-11-04');
++
++  // 145200 * 14 * 0.04 / 100 = 812.16 → 813 cents (banker's rounding)
++  assert.equal(fee, 813);
++});
++
++test('lateFee returns 0 for paid invoice', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  let issued = issueInvoice(inv.value, []).value;
++  const totals = invoiceTotals(issued);
++
++  // Pay in full
++  issued = recordPayment(issued, {
++    amount: totals.total,
++    date: '2025-10-20',
++  }).value;
++
++  // Due 2025-10-21, asOf 2025-11-04, but paid so no fee
++  const fee = lateFee(issued, '2025-11-04');
++  assert.equal(fee, 0);
++});
++
++test('lateFee accounts for partial payments', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  let issued = issueInvoice(inv.value, []).value;
++  const totals = invoiceTotals(issued);
++
++  // Pay half
++  const paymentAmount = Math.floor(totals.total / 2);
++  issued = recordPayment(issued, {
++    amount: paymentAmount,
++    date: '2025-10-20',
++  }).value;
++
++  // Due 2025-10-21, asOf 2025-10-22 = 1 day overdue
++  // Remaining due ≈ 72600 (half of 145200)
++  // fee = 72600 * 1 * 0.04 / 100 = 29.04 cents = 29 cents
++  const fee = lateFee(issued, '2025-10-22');
++
++  assert.equal(fee, 29);
++});
++
++test('lateFee works with different payment terms', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-01',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET30',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++
++  // Due 2025-10-31, asOf 2025-11-07 = 7 days overdue
++  // fee = 145200 * 7 * 0.04 / 100 = 405.60 cents, rounded to 407
++  const fee = lateFee(issued, '2025-11-07');
++
++  assert.equal(fee, 407);
++});
++
++test('lateFee rounds correctly with banker\'s rounding', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++
++  // Due 2025-10-21, asOf 2025-10-22 = 1 day overdue
++  // 145200 * 1 * 0.04 / 100 = 58.08
++  const fee = lateFee(issued, '2025-10-22');
++
++  // Should be rounded using roundCents (banker's rounding)
++  assert.equal(fee, 58);
++});
++
++test('lateFee with EOM terms', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }],
++    terms: 'EOM',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++
++  // Due 2025-10-31, asOf 2025-11-02 = 2 days overdue
++  // fee = 145200 * 2 * 0.04 / 100 = 116.16 cents = 116 cents
++  const fee = lateFee(issued, '2025-11-02');
++
++  assert.equal(fee, 116);
++});
++
++test('lateFee with multiple line items', () => {
++  const inv = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-07',
++    lines: [
++      { sku: 'LOGO-PACK', qty: 1 },
++      { sku: 'LOGO-PACK', qty: 1 },
++    ],
++    terms: 'NET14',
++  });
++
++  const issued = issueInvoice(inv.value, []).value;
++  const totals = invoiceTotals(issued);
++
++  // Two LOGO-PACK invoices = 240000 + VAT 50400 = 290400
++  // Due 2025-10-21, asOf 2025-10-22 = 1 day overdue
++  // fee = 290400 * 1 * 0.04 / 100 = 116.16 cents = 116 cents
++  const fee = lateFee(issued, '2025-10-22');
++
++  assert.equal(fee, 116);
++});

@@ -1,0 +1,256 @@
+diff --git a/src/reports.js b/src/reports.js
+index fefe686..000a869 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -1,6 +1,7 @@
+ import { balanceDue } from './payments.js';
+ import { daysBetween } from './dates.js';
+ import { lineTotal, lineDiscount, lineVat } from './invoices.js';
++import { roundCents } from './money.js';
+ 
+ /**
+  * Get invoices that are overdue as of a given date.
+@@ -52,3 +53,18 @@ export function vatSummary(invoices) {
+ 
+   return Object.values(vatMap).sort((a, b) => b.rate - a.rate);
+ }
++
++/**
++ * Calculate late fee for an invoice: 0.04% of amount due per day overdue.
++ * @param {{ dueDate: string }} invoice
++ * @param {string} asOf - cutoff date in YYYY-MM-DD format
++ * @returns {number} - late fee in cents, 0 if not overdue
++ */
++export function lateFee(invoice, asOf) {
++  const daysOverdue = daysBetween(invoice.dueDate, asOf);
++  if (daysOverdue <= 0) return 0;
++
++  const due = balanceDue(invoice);
++  const fee = daysOverdue * 0.0004 * due;
++  return roundCents(fee);
++}
+diff --git a/test/late-fees.test.js b/test/late-fees.test.js
+new file mode 100644
+index 0000000..e3ecb7e
+--- /dev/null
++++ b/test/late-fees.test.js
+@@ -0,0 +1,219 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { lateFee } from '../src/reports.js';
++import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++function createTestInvoice(customerId, issueDate, lines, terms = 'NET30') {
++  const invResult = createInvoice({
++    customerId,
++    issueDate,
++    lines,
++    terms,
++  });
++  return issueInvoice(invResult.value, []).value;
++}
++
++test('lateFee returns 0 for non-overdue invoice', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  // dueDate: 2026-10-01
++
++  const result = lateFee(invoice, '2026-10-01');
++  assert.equal(result, 0);
++});
++
++test('lateFee returns 0 for invoice with future dueDate', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  // dueDate: 2026-10-01
++
++  const result = lateFee(invoice, '2026-09-30');
++  assert.equal(result, 0);
++});
++
++test('lateFee calculates fee for overdue invoice', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  // dueDate: 2026-10-01
++
++  const result = lateFee(invoice, '2026-10-02');
++  assert.ok(result > 0);
++});
++
++test('lateFee uses correct formula: 0.04% per day', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 100 }]);
++  // dueDate: 2026-10-01
++  // amount due includes VAT and discounts
++  // 10 days overdue
++  // fee = amount * 10 * 0.0004
++
++  const fee1Day = lateFee(invoice, '2026-10-02');
++  const fee10Days = lateFee(invoice, '2026-10-11');
++
++  // 10 days should result in roughly 10x the fee of 1 day (allow large tolerance for rounding)
++  assert.ok(fee10Days >= fee1Day * 8);
++  assert.ok(fee10Days <= fee1Day * 12);
++});
++
++test('lateFee for 1 day overdue', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 100 }]);
++  // dueDate: 2026-10-01
++  // 1 day overdue: fee = amount * 0.0004
++
++  const result = lateFee(invoice, '2026-10-02');
++  assert.ok(result > 0);
++  assert.ok(Number.isInteger(result));
++});
++
++test('lateFee increases with more days overdue', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  // dueDate: 2026-10-01
++
++  const fee5Days = lateFee(invoice, '2026-10-06');
++  const fee10Days = lateFee(invoice, '2026-10-11');
++
++  assert.ok(fee10Days > fee5Days);
++  // 10 days should be roughly 2x the fee of 5 days (within rounding)
++  assert.ok(fee10Days > fee5Days * 1.8);
++  assert.ok(fee10Days < fee5Days * 2.2);
++});
++
++test('lateFee accounts for partial payments', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  const totals = invoiceTotals(invoice);
++  const partialPayment = totals.total / 2;
++  const paidInvoice = recordPayment(invoice, { amount: partialPayment, date: '2026-09-15' }).value;
++
++  const feeUnpaid = lateFee(invoice, '2026-10-11');
++  const feePaid = lateFee(paidInvoice, '2026-10-11');
++
++  // Fee on paid invoice should be roughly half the fee on unpaid (within 5%)
++  const expectedHalf = feeUnpaid / 2;
++  assert.ok(feePaid > expectedHalf * 0.95);
++  assert.ok(feePaid < expectedHalf * 1.05);
++});
++
++test('lateFee returns 0 for fully paid invoice', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  const totals = invoiceTotals(invoice);
++  const paidInvoice = recordPayment(invoice, { amount: totals.total, date: '2026-09-15' }).value;
++
++  const result = lateFee(paidInvoice, '2026-10-11');
++  assert.equal(result, 0);
++});
++
++test('lateFee with NET14 terms', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 100 }], 'NET14');
++  // dueDate: 2026-09-15
++  // 5 days overdue on 2026-09-20
++
++  const fee1Day = lateFee(invoice, '2026-09-16');
++  const fee5Days = lateFee(invoice, '2026-09-20');
++
++  // Longer overdue period should result in higher fee
++  assert.ok(fee5Days > fee1Day);
++  assert.ok(Number.isInteger(fee5Days));
++});
++
++test('lateFee with EOM terms', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-15', [{ sku: 'STICKER', qty: 100 }], 'EOM');
++  // dueDate: 2026-09-30
++  // 5 days overdue on 2026-10-05
++
++  const fee1Day = lateFee(invoice, '2026-10-01');
++  const fee5Days = lateFee(invoice, '2026-10-05');
++
++  // 5 days should result in roughly 5x the fee of 1 day (within rounding)
++  assert.ok(fee5Days > fee1Day * 4);
++  assert.ok(fee5Days < fee1Day * 6);
++});
++
++test('lateFee with high amount due', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'LOGO-PACK', qty: 1 }]);
++  // dueDate: 2026-10-01
++  // LOGO-PACK: unitPrice 120000, qty 1
++  // amount due will be high (with VAT and discount adjustments)
++  // 10 days overdue
++  // fee should be much higher than for small amounts
++
++  const smallInvoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 1 }]);
++  const smallFee = lateFee(smallInvoice, '2026-10-11');
++  const largeFee = lateFee(invoice, '2026-10-11');
++
++  assert.ok(largeFee > smallFee * 100);
++});
++
++test('lateFee rounds to whole cents', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 1 }]);
++  // dueDate: 2026-10-01
++  // amount due: 8500 cents (or close to it with discounts/VAT)
++  // 7 days overdue
++  // fee = amount * 7 * 0.0004, should be rounded
++
++  const result = lateFee(invoice, '2026-10-08');
++  assert.ok(Number.isInteger(result));
++});
++
++test('lateFee with many days overdue', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 100 }]);
++  // dueDate: 2026-10-01
++  // 100 days overdue on 2027-01-08
++
++  const fee1Day = lateFee(invoice, '2026-10-02');
++  const fee10Days = lateFee(invoice, '2026-10-11');
++  const fee100Days = lateFee(invoice, '2027-01-08');
++
++  // Fee increases with more days overdue
++  assert.ok(fee10Days > fee1Day);
++  assert.ok(fee100Days > fee10Days);
++  assert.ok(Number.isInteger(fee100Days));
++});
++
++test('lateFee with discount applied to line', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [
++    { sku: 'DES-HOUR', qty: 10, discountPercent: 20 },
++  ]);
++  // dueDate: 2026-10-01
++  // Line total: 85000, Discount: 17000, Base: 68000
++  // With VAT: roughly 82480
++  // 10 days overdue
++  // fee = 82480 * 10 * 0.0004 = 329.92 (rounded)
++
++  const result = lateFee(invoice, '2026-10-11');
++  assert.ok(result > 300);
++  assert.ok(result < 350);
++});
++
++test('lateFee exactly at boundary (0 days overdue)', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'DES-HOUR', qty: 10 }]);
++  // dueDate: 2026-10-01
++
++  const resultSameDay = lateFee(invoice, '2026-10-01');
++  const resultNextDay = lateFee(invoice, '2026-10-02');
++
++  assert.equal(resultSameDay, 0);
++  assert.ok(resultNextDay > 0);
++});
++
++test('lateFee is zero if amount due is zero', () => {
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 1 }]);
++  const totals = invoiceTotals(invoice);
++  const paidInvoice = recordPayment(invoice, { amount: totals.total, date: '2026-09-15' }).value;
++
++  const result = lateFee(paidInvoice, '2026-10-11');
++  assert.equal(result, 0);
++});
++
++test('lateFee calculation matches expected formula', () => {
++  // Create invoice and verify fee scales linearly with days
++  const invoice = createTestInvoice('C-001', '2026-09-01', [{ sku: 'STICKER', qty: 1000 }]);
++  // dueDate: 2026-10-01
++
++  const fee1Day = lateFee(invoice, '2026-10-02');
++  const fee5Days = lateFee(invoice, '2026-10-06');
++  const fee10Days = lateFee(invoice, '2026-10-11');
++
++  // Fees should scale roughly linearly with days (within rounding)
++  assert.ok(fee5Days > fee1Day * 4);
++  assert.ok(fee5Days < fee1Day * 6);
++  assert.ok(fee10Days > fee1Day * 9);
++  assert.ok(fee10Days < fee1Day * 11);
++});

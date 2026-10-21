@@ -1,0 +1,353 @@
+diff --git a/src/invoices.js b/src/invoices.js
+index 5ce220d..03ee776 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -206,7 +206,7 @@ export function removeLine(invoice, sku) {
+ 
+ /**
+  * Issue a draft invoice, assigning it a number and changing status to 'issued'.
+- * @param {{ customerId: string, issueDate: string, status: string, lines: Array }} invoice
++ * @param {{ customerId: string, issueDate: string, status: string, lines: Array, terms?: string, dueDate?: string }} invoice
+  * @param {Array<string>} existingNumbers - Array of invoice numbers already used
+  * @returns {{ ok: true, value: object } | { ok: false, error: string }}
+  */
+@@ -221,6 +221,8 @@ export function issueInvoice(invoice, existingNumbers) {
+     issueDate: invoice.issueDate,
+     status: 'issued',
+     lines: invoice.lines.map((line) => ({ ...line })),
++    terms: invoice.terms,
++    dueDate: invoice.dueDate,
+   });
+ }
+ 
+diff --git a/src/statements.js b/src/statements.js
+new file mode 100644
+index 0000000..e4d413c
+--- /dev/null
++++ b/src/statements.js
+@@ -0,0 +1,45 @@
++import { normalizeId, getCustomer } from './customers.js';
++import { invoiceTotals } from './invoices.js';
++import { balanceDue } from './payments.js';
++import { ok, fail } from './result.js';
++
++/**
++ * Generate a customer statement.
++ * @param {string} customerId
++ * @param {Array} invoices Array of invoice objects
++ * @param {string} asOf Date in YYYY-MM-DD format
++ * @returns {{ ok: true, value: { customerId: string, invoices: Array, totalDue: number } } | { ok: false, error: string }}
++ */
++export function statement(customerId, invoices, asOf) {
++  const normalizedCustomerId = normalizeId(customerId);
++  const customerResult = getCustomer(normalizedCustomerId);
++  if (!customerResult.ok) return customerResult;
++
++  const statementInvoices = invoices
++    .filter(
++      (inv) =>
++        normalizeId(inv.customerId) === normalizedCustomerId &&
++        (inv.status === 'issued' || inv.status === 'partially_paid') &&
++        inv.issueDate <= asOf
++    )
++    .map((inv) => {
++      const totals = invoiceTotals(inv);
++      const due = balanceDue(inv);
++      return {
++        number: inv.number,
++        issueDate: inv.issueDate,
++        dueDate: inv.dueDate,
++        total: totals.total,
++        due,
++      };
++    })
++    .sort((a, b) => a.issueDate.localeCompare(b.issueDate));
++
++  const totalDue = statementInvoices.reduce((sum, inv) => sum + inv.due, 0);
++
++  return ok({
++    customerId: normalizedCustomerId,
++    invoices: statementInvoices,
++    totalDue,
++  });
++}
+diff --git a/test/statements.test.js b/test/statements.test.js
+new file mode 100644
+index 0000000..1361477
+--- /dev/null
++++ b/test/statements.test.js
+@@ -0,0 +1,274 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { statement } from '../src/statements.js';
++import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++test('statement with no invoices for customer', () => {
++  const result = statement('C-001', [], '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.customerId, 'C-001');
++  assert.equal(result.value.invoices.length, 0);
++  assert.equal(result.value.totalDue, 0);
++});
++
++test('statement with single issued invoice', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 1);
++  assert.equal(result.value.invoices[0].number, 'INV-2026-0001');
++  assert.equal(result.value.invoices[0].issueDate, '2026-01-15');
++  assert.ok(result.value.invoices[0].dueDate);
++  assert.ok(result.value.invoices[0].total > 0);
++  assert.ok(result.value.invoices[0].due > 0);
++});
++
++test('statement excludes draft invoices', () => {
++  const draftInvoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const result = statement('C-001', [draftInvoice.value], '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 0);
++});
++
++test('statement excludes future-dated invoices', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-06-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement('C-001', invoices, '2026-01-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 0);
++});
++
++test('statement includes invoices up to asOf date', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement('C-001', invoices, '2026-01-15');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 1);
++});
++
++test('statement with unknown customer', () => {
++  const result = statement('C-999', [], '2026-12-31');
++
++  assert.equal(result.ok, false);
++  assert.equal(result.error, 'CUSTOMER_NOT_FOUND');
++});
++
++test('statement with multiple invoices', () => {
++  const invoices = [];
++  const issuedNumbers = [];
++  for (let i = 1; i <= 3; i++) {
++    const createResult = createInvoice({
++      customerId: 'C-001',
++      issueDate: `2026-0${i}-15`,
++      lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++    });
++
++    const issueResult = issueInvoice(createResult.value, issuedNumbers);
++    issuedNumbers.push(issueResult.value.number);
++    invoices.push(issueResult.value);
++  }
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 3);
++  assert.equal(result.value.invoices[0].number, 'INV-2026-0001');
++  assert.equal(result.value.invoices[1].number, 'INV-2026-0002');
++  assert.equal(result.value.invoices[2].number, 'INV-2026-0003');
++});
++
++test('statement sorts by issueDate', () => {
++  const invoices = [];
++  const issuedNumbers = [];
++  const dates = ['2026-03-15', '2026-01-15', '2026-02-15'];
++  for (let i = 0; i < 3; i++) {
++    const createResult = createInvoice({
++      customerId: 'C-001',
++      issueDate: dates[i],
++      lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++    });
++
++    const issueResult = issueInvoice(createResult.value, issuedNumbers);
++    issuedNumbers.push(issueResult.value.number);
++    invoices.push(issueResult.value);
++  }
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices[0].issueDate, '2026-01-15');
++  assert.equal(result.value.invoices[1].issueDate, '2026-02-15');
++  assert.equal(result.value.invoices[2].issueDate, '2026-03-15');
++});
++
++test('statement calculates totalDue', () => {
++  const invoices = [];
++  const issuedNumbers = [];
++  for (let i = 1; i <= 2; i++) {
++    const createResult = createInvoice({
++      customerId: 'C-001',
++      issueDate: `2026-0${i}-15`,
++      lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++    });
++
++    const issueResult = issueInvoice(createResult.value, issuedNumbers);
++    issuedNumbers.push(issueResult.value.number);
++    invoices.push(issueResult.value);
++  }
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.totalDue, result.value.invoices[0].due + result.value.invoices[1].due);
++});
++
++test('statement with partially paid invoice', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  let invoice = issueResult.value;
++
++  const paymentResult = recordPayment(invoice, { amount: 50000, date: '2026-02-01' });
++  invoice = paymentResult.value;
++
++  const result = statement('C-001', [invoice], '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 1);
++  assert.ok(result.value.invoices[0].due > 0);
++  assert.ok(result.value.invoices[0].due < result.value.invoices[0].total);
++});
++
++test('statement excludes paid invoices', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  let invoice = issueResult.value;
++
++  const totals = invoiceTotals(invoice);
++  const paymentResult = recordPayment(invoice, { amount: totals.total, date: '2026-02-01' });
++  invoice = paymentResult.value;
++
++  const result = statement('C-001', [invoice], '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 0);
++});
++
++test('statement with mixed customer invoices', () => {
++  const invoices = [];
++  const issuedNumbers = [];
++
++  for (const customerId of ['C-001', 'C-002', 'C-001']) {
++    const createResult = createInvoice({
++      customerId,
++      issueDate: '2026-01-15',
++      lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++    });
++
++    const issueResult = issueInvoice(createResult.value, issuedNumbers);
++    issuedNumbers.push(issueResult.value.number);
++    invoices.push(issueResult.value);
++  }
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.invoices.length, 2);
++});
++
++test('statement with mixed case customerId', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement('c-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.customerId, 'C-001');
++  assert.equal(result.value.invoices.length, 1);
++});
++
++test('statement with spaces in customerId', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement(' C-001 ', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.customerId, 'C-001');
++  assert.equal(result.value.invoices.length, 1);
++});
++
++test('statement invoice format', () => {
++  const createResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  const issueResult = issueInvoice(createResult.value, []);
++  const invoices = [issueResult.value];
++
++  const result = statement('C-001', invoices, '2026-12-31');
++
++  assert.equal(result.ok, true);
++  const inv = result.value.invoices[0];
++  assert.ok(inv.number);
++  assert.ok(inv.issueDate);
++  assert.ok(inv.dueDate);
++  assert.equal(typeof inv.total, 'number');
++  assert.equal(typeof inv.due, 'number');
++});

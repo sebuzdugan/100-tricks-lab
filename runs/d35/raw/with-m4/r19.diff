@@ -1,0 +1,366 @@
+diff --git a/src/export.js b/src/export.js
+new file mode 100644
+index 0000000..b76d7f1
+--- /dev/null
++++ b/src/export.js
+@@ -0,0 +1,63 @@
++import { getCustomer } from './customers.js';
++import { invoiceTotals } from './invoices.js';
++import { balanceDue } from './payments.js';
++
++/**
++ * Format cents as euros with 2 decimals: 123456 -> "1234.56", -5 -> "-0.05"
++ * @param {number} cents
++ * @returns {string}
++ */
++function formatEurosPlain(cents) {
++  const sign = cents < 0 ? '-' : '';
++  const abs = Math.abs(cents);
++  const euros = Math.floor(abs / 100);
++  const centsPart = abs % 100;
++  return `${sign}${euros}.${String(centsPart).padStart(2, '0')}`;
++}
++
++/**
++ * Escape a field for CSV: wrap in quotes if it contains comma or quote, and double internal quotes.
++ * @param {string} value
++ * @returns {string}
++ */
++function escapeCsvField(value) {
++  const str = String(value);
++  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
++    return `"${str.replace(/"/g, '""')}"`;
++  }
++  return str;
++}
++
++/**
++ * Export invoices to CSV format.
++ * @param {Array<object>} invoices
++ * @returns {string} CSV string with newlines
++ */
++export function exportCsv(invoices) {
++  const header = ['number', 'customer', 'issueDate', 'dueDate', 'status', 'subtotal', 'discount', 'vat', 'total', 'due'];
++  const lines = [header.join(',')];
++
++  for (const invoice of invoices) {
++    const customerResult = getCustomer(invoice.customerId);
++    const customerName = customerResult.ok ? customerResult.value.name : '';
++    const totals = invoiceTotals(invoice);
++    const due = balanceDue(invoice);
++
++    const row = [
++      escapeCsvField(invoice.number || ''),
++      escapeCsvField(customerName),
++      escapeCsvField(invoice.issueDate || ''),
++      escapeCsvField(invoice.dueDate || ''),
++      escapeCsvField(invoice.status || ''),
++      formatEurosPlain(totals.subtotal),
++      formatEurosPlain(totals.discount),
++      formatEurosPlain(totals.vat),
++      formatEurosPlain(totals.total),
++      formatEurosPlain(due),
++    ];
++
++    lines.push(row.join(','));
++  }
++
++  return lines.join('\n') + '\n';
++}
+diff --git a/test/export.test.js b/test/export.test.js
+new file mode 100644
+index 0000000..4894933
+--- /dev/null
++++ b/test/export.test.js
+@@ -0,0 +1,291 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { exportCsv } from '../src/export.js';
++import { createInvoice, invoiceTotals } from '../src/invoices.js';
++import { issueInvoice } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
++
++test('exportCsv with empty array returns header and newline', () => {
++  const result = exportCsv([]);
++  assert.equal(result, 'number,customer,issueDate,dueDate,status,subtotal,discount,vat,total,due\n');
++});
++
++test('exportCsv with single issued invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  assert.match(result, /^number,customer,issueDate,dueDate,status,subtotal,discount,vat,total,due\n/);
++  assert.match(result, /INV-2025-0001/);
++  assert.match(result, /Northwind Studio/); // C-001 name
++  assert.match(result, /2025-12-15/);
++  assert.match(result, /2025-12-29/); // NET14
++  assert.match(result, /issued/);
++});
++
++test('exportCsv with multiple invoices in order', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-12-16',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }],
++  });
++
++  let inv1 = issueInvoice(inv1Result.value, []).value;
++  let inv2 = issueInvoice(inv2Result.value, [inv1.number]).value;
++
++  const result = exportCsv([inv1, inv2]);
++  const lines = result.split('\n').filter((l) => l); // Remove trailing empty string
++
++  assert.equal(lines.length, 3); // header + 2 invoices
++  assert.match(lines[1], /Northwind Studio/);
++  assert.match(lines[2], /Blue Fern Bakery/);
++});
++
++test('exportCsv escapes fields with commas', () => {
++  // C-004 has comma in name: "Smith, Jones & Partners"
++  const invoiceResult = createInvoice({
++    customerId: 'C-004',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  // Customer name with comma should be quoted
++  assert.ok(result.includes('"Smith, Jones & Partners"'));
++});
++
++test('exportCsv formats amounts as plain euros', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }], // 50 * 100 = 5000 cents = 50.00 euros
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  // Should contain amounts with dots and 2 decimals
++  assert.match(result, /\d+\.\d{2}/); // At least one amount
++  // Should not contain currency sign or thousands separator
++  assert.ok(!result.includes('€'));
++  assert.ok(!result.includes(',000'));
++});
++
++test('exportCsv includes due amount for unpaid invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const totals = invoiceTotals(invoice);
++  const result = exportCsv([invoice]);
++  const lines = result.split('\n');
++  const fields = lines[1].split(',');
++
++  // Last field is due amount (should equal total for unpaid invoice)
++  const dueStr = fields[fields.length - 1];
++  assert.equal(dueStr, fields[fields.length - 2]); // due = total for unpaid
++});
++
++test('exportCsv includes due amount for partially paid invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  invoice = recordPayment(invoice, { amount: 2000, date: '2025-12-20' }).value;
++
++  const result = exportCsv([invoice]);
++  const lines = result.split('\n');
++  const fields = lines[1].split(',');
++
++  // Last field should be less than total
++  const total = parseFloat(fields[fields.length - 2]);
++  const due = parseFloat(fields[fields.length - 1]);
++  assert.ok(due < total);
++  assert.ok(due > 0);
++});
++
++test('exportCsv includes 0 due for paid invoice', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const totals = invoiceTotals(invoice);
++  invoice = recordPayment(invoice, { amount: totals.total, date: '2025-12-20' }).value;
++
++  const result = exportCsv([invoice]);
++  const lines = result.split('\n');
++  const fields = lines[1].split(',');
++
++  // Due should be 0.00
++  assert.equal(fields[fields.length - 1], '0.00');
++});
++
++test('exportCsv with draft invoice (no number)', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  const draft = invoiceResult.value;
++  const result = exportCsv([draft]);
++  const lines = result.split('\n').filter((l) => l);
++
++  // Number field should be empty for draft, customer name should follow
++  assert.match(lines[1], /^,Northwind Studio/);
++  // dueDate should be empty for draft
++  assert.match(lines[1], /draft,/);
++});
++
++test('exportCsv header format', () => {
++  const result = exportCsv([]);
++  const firstLine = result.split('\n')[0];
++  const header = firstLine.split(',');
++
++  assert.deepEqual(header, ['number', 'customer', 'issueDate', 'dueDate', 'status', 'subtotal', 'discount', 'vat', 'total', 'due']);
++});
++
++test('exportCsv lines end with newline', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  assert.ok(result.endsWith('\n'));
++  // Should have exactly 2 newlines: one after header, one after invoice (which is at the end)
++  const newlineCount = (result.match(/\n/g) || []).length;
++  assert.equal(newlineCount, 2);
++});
++
++test('exportCsv with negative amounts (credit)', () => {
++  // This is an edge case - we're not creating actual credits in this test,
++  // but we verify the formatting can handle negative amounts
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  // All amounts should be non-negative (no discounts on this small invoice)
++  assert.ok(!result.includes(',-'));
++});
++
++test('exportCsv with various customer tiers', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001', // gold
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002', // standard
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  const inv3Result = createInvoice({
++    customerId: 'C-005', // silver
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  let inv1 = issueInvoice(inv1Result.value, ['INV-2025-0001']).value;
++  let inv2 = issueInvoice(inv2Result.value, ['INV-2025-0001', 'INV-2025-0002']).value;
++  let inv3 = issueInvoice(inv3Result.value, ['INV-2025-0001', 'INV-2025-0002', 'INV-2025-0003']).value;
++
++  const result = exportCsv([inv1, inv2, inv3]);
++  const lines = result.split('\n');
++
++  // Should have subtotals that reflect tier discounts
++  assert.match(lines[1], /Northwind Studio/);
++  assert.match(lines[2], /Blue Fern Bakery/);
++  assert.match(lines[3], /Orchard Health/);
++});
++
++test('exportCsv with invoice containing multiple lines', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [
++      { sku: 'DEV-HOUR', qty: 5 },
++      { sku: 'DES-HOUR', qty: 3 },
++    ],
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++  const lines = result.split('\n');
++
++  // Should have header + 1 invoice line (multi-line invoices collapse to one row)
++  assert.equal(lines.length, 3); // header + invoice + trailing newline
++  assert.match(lines[1], /Northwind Studio/);
++});
++
++test('exportCsv does not escape fields without special characters', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  // Most fields should not be quoted
++  const lines = result.split('\n');
++  assert.match(lines[1], /Northwind Studio/); // Name without quotes (no special chars)
++  assert.match(lines[1], /2025-12-15/); // Date without quotes
++});
++
++test('exportCsv formats decimal amounts correctly', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'PRINT-A4', qty: 3 }], // 37 cents each = 111 cents = 1.11 euros
++    terms: 'NET14',
++  });
++
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++  const result = exportCsv([invoice]);
++
++  // Should contain a number with 2 decimals
++  assert.match(result, /\d\.\d{2}/);
++  // Verify no currency symbols
++  assert.ok(!result.includes('€'));
++});

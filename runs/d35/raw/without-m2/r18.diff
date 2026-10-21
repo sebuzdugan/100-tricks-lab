@@ -1,0 +1,243 @@
+diff --git a/src/reports.js b/src/reports.js
+index a007b8a..95ba502 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -66,3 +66,28 @@ export function vatSummary(invoices) {
+ 
+   return result;
+ }
++
++/**
++ * Calculate late fee for an overdue invoice.
++ * @param {{ status: string, dueDate: string, payments?: Array }} invoice
++ * @param {string} asOf - date in YYYY-MM-DD format
++ * @returns {number} late fee in cents, 0 if not overdue
++ */
++export function lateFee(invoice, asOf) {
++  // Only calculate for issued, partially_paid, or paid invoices
++  if (!['issued', 'partially_paid', 'paid'].includes(invoice.status)) {
++    return 0;
++  }
++
++  const daysOverdue = daysBetween(invoice.dueDate, asOf);
++
++  // No late fee if not overdue
++  if (daysOverdue <= 0) {
++    return 0;
++  }
++
++  const due = balanceDue(invoice);
++  const fee = roundCents((due * daysOverdue * 0.04) / 100);
++
++  return Math.max(0, fee);
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+index 18de46b..c42f581 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { overdueInvoices, vatSummary } from '../src/reports.js';
++import { overdueInvoices, vatSummary, lateFee } from '../src/reports.js';
+ import { createInvoice, issueInvoice } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+ 
+@@ -551,3 +551,197 @@ test('vatSummary with complex discounts and multiple VAT rates', () => {
+   assert.equal(result[1].base, 11828); // 2490 * 5 - (2490 * 5 * 5 / 100) rounded
+   assert.equal(result[1].vat, 1065); // 11828 * 9 / 100 rounded
+ });
++
++test('lateFee returns 0 for draft invoice', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++    terms: 'NET14',
++  }).value;
++
++  const fee = lateFee(invoice, '2025-11-05');
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns 0 when invoice is not yet due', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  const fee = lateFee(issued, '2025-10-28');
++  assert.equal(fee, 0);
++});
++
++test('lateFee returns 0 when invoice is due today', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  const fee = lateFee(issued, '2025-10-29');
++  assert.equal(fee, 0);
++});
++
++test('lateFee calculates fee for one day overdue', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 1 day overdue: 51425 * 1 * 0.04 / 100 = 20.57 → 21 cents
++  const fee = lateFee(issued, '2025-10-30');
++  assert.equal(fee, 21);
++});
++
++test('lateFee calculates fee for multiple days overdue', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 7 days overdue: 51425 * 7 * 0.04 / 100 = 143.99 → 144 cents
++  const fee = lateFee(issued, '2025-11-05');
++  assert.equal(fee, 144);
++});
++
++test('lateFee returns 0 for paid invoice', () => {
++  let invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  let issued = issueInvoice(invoice, []).value;
++  issued = recordPayment(issued, { amount: 51425, date: '2025-11-05' }).value;
++  assert.equal(issued.status, 'paid');
++
++  // Even though we check on 2025-11-05 (after due date), paid invoice has no balance due
++  const fee = lateFee(issued, '2025-11-05');
++  assert.equal(fee, 0);
++});
++
++test('lateFee calculates on partially paid invoice', () => {
++  let invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  let issued = issueInvoice(invoice, []).value;
++  issued = recordPayment(issued, { amount: 25000, date: '2025-10-25' }).value;
++  assert.equal(issued.status, 'partially_paid');
++
++  // 7 days overdue, balance due = 51425 - 25000 = 26425
++  // fee = 26425 * 7 * 0.04 / 100 = 73.79 → 74 cents
++  const fee = lateFee(issued, '2025-11-05');
++  assert.equal(fee, 74);
++});
++
++test('lateFee with large balance due', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'LOGO-PACK', qty: 1 }], // €1200, no discount (standard tier), VAT €252, total €1452
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 10 days overdue: 145200 * 10 * 0.04 / 100 = 580.8 → 581 cents
++  const fee = lateFee(issued, '2025-11-08');
++  assert.equal(fee, 581);
++});
++
++test('lateFee with 30 days overdue', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 30 days overdue: 51425 * 30 * 0.04 / 100 = 617.10 → 617 cents
++  const fee = lateFee(issued, '2025-11-28');
++  assert.equal(fee, 617);
++});
++
++test('lateFee with NET30 terms', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, VAT €178.50, total €1028.50
++    terms: 'NET30', // due 2025-11-14
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 5 days overdue: 102850 * 5 * 0.04 / 100 = 205.70 → 206 cents
++  const fee = lateFee(issued, '2025-11-19');
++  assert.equal(fee, 206);
++});
++
++test('lateFee with EOM terms', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'EOM', // due 2025-10-31
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 5 days overdue: 51425 * 5 * 0.04 / 100 = 102.85 → 103 cents
++  const fee = lateFee(issued, '2025-11-05');
++  assert.equal(fee, 103);
++});
++
++test('lateFee with small balance due rounds correctly', () => {
++  let invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }], // €514.25
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  let issued = issueInvoice(invoice, []).value;
++  // Pay almost everything, leaving small balance
++  issued = recordPayment(issued, { amount: 51400, date: '2025-10-25' }).value;
++
++  // 7 days overdue, balance due = 25
++  // fee = 25 * 7 * 0.04 / 100 = 0.07 → 0 cents (rounds to 0)
++  const fee = lateFee(issued, '2025-11-05');
++  assert.equal(fee, 0);
++});
++
++test('lateFee accumulates with multiple days', () => {
++  const invoice = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-10-15',
++    lines: [{ sku: 'DES-HOUR', qty: 1 }], // €85, VAT €17.85, total €102.85
++    terms: 'NET14', // due 2025-10-29
++  }).value;
++  const issued = issueInvoice(invoice, []).value;
++
++  // 1 day: 10285 * 1 * 0.04 / 100 = 4.114 → 4 cents
++  const fee1 = lateFee(issued, '2025-10-30');
++  assert.equal(fee1, 4);
++
++  // 2 days: 10285 * 2 * 0.04 / 100 = 8.228 → 8 cents
++  const fee2 = lateFee(issued, '2025-10-31');
++  assert.equal(fee2, 8);
++
++  // 3 days: 10285 * 3 * 0.04 / 100 = 12.342 → 12 cents
++  const fee3 = lateFee(issued, '2025-11-01');
++  assert.equal(fee3, 12);
++});

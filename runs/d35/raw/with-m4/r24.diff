@@ -1,0 +1,286 @@
+diff --git a/src/reports.js b/src/reports.js
+index c64417f..41d63fd 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -73,3 +73,55 @@ export function lateFee(invoice, asOf) {
+   const fee = due * 0.0004 * daysOverdue;
+   return roundCents(fee);
+ }
++
++/**
++ * Get dashboard summary statistics for invoices.
++ * @param {Array<object>} invoices array of all invoices
++ * @param {string} asOf YYYY-MM-DD format (cutoff date)
++ * @returns {{ counts: object, outstanding: number, overdue: object, topCustomers: Array }}
++ */
++export function dashboard(invoices, asOf) {
++  // Count invoices per status
++  const counts = {
++    draft: 0,
++    issued: 0,
++    partially_paid: 0,
++    paid: 0,
++  };
++
++  for (const invoice of invoices) {
++    counts[invoice.status] = (counts[invoice.status] || 0) + 1;
++  }
++
++  // Calculate outstanding (total due for issued and partially_paid)
++  let outstanding = 0;
++  for (const invoice of invoices) {
++    if (invoice.status === 'issued' || invoice.status === 'partially_paid') {
++      outstanding += balanceDue(invoice);
++    }
++  }
++
++  // Get overdue info
++  const overduList = overdueInvoices(invoices, asOf);
++  const overdue = {
++    count: overduList.length,
++    amount: overduList.reduce((sum, inv) => sum + inv.due, 0),
++  };
++
++  // Get top 3 customers with most still due
++  const customerDue = {};
++  for (const invoice of invoices) {
++    if (invoice.status === 'issued' || invoice.status === 'partially_paid') {
++      const customerId = invoice.customerId;
++      const due = balanceDue(invoice);
++      customerDue[customerId] = (customerDue[customerId] || 0) + due;
++    }
++  }
++
++  const topCustomers = Object.entries(customerDue)
++    .map(([customerId, due]) => ({ customerId, due }))
++    .sort((a, b) => b.due - a.due)
++    .slice(0, 3);
++
++  return { counts, outstanding, overdue, topCustomers };
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+index a196cd6..4b83c9c 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { overdueInvoices, vatSummary, lateFee } from '../src/reports.js';
++import { overdueInvoices, vatSummary, lateFee, dashboard } from '../src/reports.js';
+ import { createInvoice, invoiceTotals } from '../src/invoices.js';
+ import { issueInvoice } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+@@ -715,3 +715,213 @@ test('lateFee returns 0 if dueDate is undefined (draft invoice)', () => {
+ 
+   assert.equal(fee, 0);
+ });
++
++test('dashboard with empty invoices array', () => {
++  const result = dashboard([], '2025-12-31');
++
++  assert.deepEqual(result.counts, { draft: 0, issued: 0, partially_paid: 0, paid: 0 });
++  assert.equal(result.outstanding, 0);
++  assert.deepEqual(result.overdue, { count: 0, amount: 0 });
++  assert.deepEqual(result.topCustomers, []);
++});
++
++test('dashboard counts invoices per status', () => {
++  const inv1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  }).value;
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-12-16',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++  const inv2 = issueInvoice(inv2Result.value, []).value;
++
++  const inv3Result = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2025-12-17',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++  let inv3 = issueInvoice(inv3Result.value, ['INV-2025-0001']).value;
++  const totals = invoiceTotals(inv3);
++  inv3 = recordPayment(inv3, { amount: totals.total, date: '2025-12-20' }).value;
++
++  const result = dashboard([inv1, inv2, inv3], '2025-12-31');
++
++  assert.equal(result.counts.draft, 1);
++  assert.equal(result.counts.issued, 1);
++  assert.equal(result.counts.partially_paid, 0);
++  assert.equal(result.counts.paid, 1);
++});
++
++test('dashboard calculates outstanding amount', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }], // ~5900 total
++  });
++  const inv1 = issueInvoice(inv1Result.value, []).value;
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-12-16',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }], // ~11000 total
++  });
++  const inv2 = issueInvoice(inv2Result.value, ['INV-2025-0001']).value;
++
++  const invoices = [inv1, inv2];
++  const result = dashboard(invoices, '2025-12-31');
++
++  // Outstanding should be sum of issued invoices with balance due
++  assert.ok(result.outstanding > 0);
++  assert.ok(result.outstanding > 5000); // Both invoices unpaid
++});
++
++test('dashboard counts overdue invoices and amount', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++    terms: 'NET14', // Due 2025-12-29
++  });
++  const inv1 = issueInvoice(inv1Result.value, []).value;
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-12-25',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++    terms: 'NET14', // Due 2026-01-08 (not overdue)
++  });
++  const inv2 = issueInvoice(inv2Result.value, ['INV-2025-0001']).value;
++
++  const invoices = [inv1, inv2];
++  const result = dashboard(invoices, '2025-12-31');
++
++  assert.equal(result.overdue.count, 1); // Only inv1 is overdue
++  assert.ok(result.overdue.amount > 0);
++});
++
++test('dashboard identifies top 3 customers by due amount', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++  const inv1 = issueInvoice(inv1Result.value, []).value;
++
++  const inv2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-12-16',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++  const inv2 = issueInvoice(inv2Result.value, ['INV-2025-0001']).value;
++
++  const inv3Result = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2025-12-17',
++    lines: [{ sku: 'DEV-HOUR', qty: 3 }],
++  });
++  const inv3 = issueInvoice(inv3Result.value, ['INV-2025-0001', 'INV-2025-0002']).value;
++
++  const invoices = [inv1, inv2, inv3];
++  const result = dashboard(invoices, '2025-12-31');
++
++  assert.equal(result.topCustomers.length, 3);
++  assert.equal(result.topCustomers[0].customerId, 'C-001'); // Highest due
++  assert.equal(result.topCustomers[1].customerId, 'C-003'); // Second highest
++  assert.equal(result.topCustomers[2].customerId, 'C-002'); // Lowest
++});
++
++test('dashboard returns top 3 customers when more than 3 exist', () => {
++  const invoices = [];
++  for (let i = 1; i <= 5; i++) {
++    const invResult = createInvoice({
++      customerId: `C-00${i}`,
++      issueDate: '2025-12-15',
++      lines: [{ sku: 'DEV-HOUR', qty: i }], // C-005 has most due
++    });
++    const inv = issueInvoice(invResult.value, [...invoices.map(i => i.number || 'INV-2025-0000')]).value;
++    invoices.push(inv);
++  }
++
++  const result = dashboard(invoices, '2025-12-31');
++
++  assert.equal(result.topCustomers.length, 3);
++  assert.equal(result.topCustomers[0].customerId, 'C-005'); // Highest
++  assert.equal(result.topCustomers[1].customerId, 'C-004');
++  assert.equal(result.topCustomers[2].customerId, 'C-003');
++});
++
++test('dashboard ignores paid invoices in outstanding calculation', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }],
++  });
++  let inv1 = issueInvoice(inv1Result.value, []).value;
++  const totals = invoiceTotals(inv1);
++  inv1 = recordPayment(inv1, { amount: totals.total, date: '2025-12-20' }).value;
++
++  const result = dashboard([inv1], '2025-12-31');
++
++  assert.equal(result.outstanding, 0);
++  assert.equal(result.topCustomers.length, 0); // Paid invoice not in top customers
++});
++
++test('dashboard with draft invoices', () => {
++  const draftResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  const result = dashboard([draftResult.value], '2025-12-31');
++
++  assert.equal(result.counts.draft, 1);
++  assert.equal(result.outstanding, 0); // Draft not included in outstanding
++  assert.equal(result.topCustomers.length, 0); // Draft not in top customers
++});
++
++test('dashboard with partially paid invoice', () => {
++  const invResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'STICKER', qty: 100 }], // ~5900 total
++  });
++  let invoice = issueInvoice(invResult.value, []).value;
++  invoice = recordPayment(invoice, { amount: 2000, date: '2025-12-20' }).value;
++
++  const result = dashboard([invoice], '2025-12-31');
++
++  assert.equal(result.counts.partially_paid, 1);
++  assert.ok(result.outstanding > 0);
++  assert.ok(result.outstanding < 6000); // Less than full amount
++  assert.equal(result.topCustomers[0].customerId, 'C-001');
++  assert.ok(result.topCustomers[0].due < 5900); // Partial payment accounted for
++});
++
++test('dashboard top customers accumulates due from multiple invoices', () => {
++  const inv1Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++  const inv1 = issueInvoice(inv1Result.value, []).value;
++
++  const inv2Result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-12-16',
++    lines: [{ sku: 'STICKER', qty: 100 }],
++  });
++  const inv2 = issueInvoice(inv2Result.value, ['INV-2025-0001']).value;
++
++  const result = dashboard([inv1, inv2], '2025-12-31');
++
++  assert.equal(result.topCustomers.length, 1);
++  const totals1 = invoiceTotals(inv1);
++  const totals2 = invoiceTotals(inv2);
++  const expectedDue = totals1.total + totals2.total;
++  assert.equal(result.topCustomers[0].due, expectedDue);
++});

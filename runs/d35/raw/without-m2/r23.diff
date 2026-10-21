@@ -1,0 +1,957 @@
+diff --git a/src/invoices.js b/src/invoices.js
+index fd504ce..87e6a46 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -4,10 +4,10 @@ import { getProduct } from './catalogue.js';
+ import { nextInvoiceNumber } from './numbering.js';
+ import { roundCents } from './money.js';
+ import { isValidDate, calculateDueDate } from './dates.js';
+-import { lineTotal, lineDiscount, lineVAT, invoiceTotals } from './totals.js';
++import { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount } from './totals.js';
+ 
+ // Re-export totals functions for backward compatibility
+-export { lineTotal, lineDiscount, lineVAT, invoiceTotals };
++export { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount };
+ 
+ /**
+  * Validate a discount percent value (0-100, can be decimal).
+diff --git a/src/reports.js b/src/reports.js
+index 95ba502..e9a945f 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -1,6 +1,7 @@
+ import { daysBetween } from './dates.js';
+ import { balanceDue } from './payments.js';
+ import { roundCents } from './money.js';
++import { bulkDiscount } from './totals.js';
+ 
+ /**
+  * Get invoices that are overdue.
+@@ -44,7 +45,8 @@ export function vatSummary(invoices) {
+       const lineTotal = line.qty * line.unitPrice;
+       const discountPercent = line.discountPercent ?? 0;
+       const lineDiscount = roundCents((lineTotal * discountPercent) / 100);
+-      const base = lineTotal - lineDiscount;
++      const bulk = bulkDiscount(line);
++      const base = lineTotal - lineDiscount - bulk;
+       const vat = roundCents((base * line.vatRate) / 100);
+ 
+       const rate = line.vatRate;
+diff --git a/src/totals.js b/src/totals.js
+index e712920..993b7ba 100644
+--- a/src/totals.js
++++ b/src/totals.js
+@@ -22,14 +22,32 @@ export function lineDiscount(line) {
+ }
+ 
+ /**
+- * Calculate the VAT for a single line: (lineTotal - lineDiscount) times vatRate / 100.
++ * Calculate the bulk discount for a single line: 2.5% off if qty >= 10, applied after line discount.
++ * @param {{ qty: number, unitPrice: number, discountPercent?: number }} line
++ * @returns {number} bulk discount in cents, clamped to >= 0
++ */
++export function bulkDiscount(line) {
++  if (line.qty < 10) {
++    return 0;
++  }
++
++  const total = lineTotal(line);
++  const discount = lineDiscount(line);
++  const netAfterLineDiscount = total - discount;
++  const bulk = roundCents((netAfterLineDiscount * 2.5) / 100);
++  return Math.max(0, bulk);
++}
++
++/**
++ * Calculate the VAT for a single line: (lineTotal - lineDiscount - bulkDiscount) times vatRate / 100.
+  * @param {{ qty: number, unitPrice: number, discountPercent?: number, vatRate: number }} line
+  * @returns {number} VAT in cents, clamped to >= 0
+  */
+ export function lineVAT(line) {
+   const total = lineTotal(line);
+   const discount = lineDiscount(line);
+-  const netTotal = total - discount;
++  const bulk = bulkDiscount(line);
++  const netTotal = total - discount - bulk;
+   const vat = roundCents((netTotal * line.vatRate) / 100);
+   return Math.max(0, vat);
+ }
+@@ -41,7 +59,9 @@ export function lineVAT(line) {
+  */
+ export function invoiceTotals(invoice) {
+   const subtotal = invoice.lines.reduce((sum, line) => sum + lineTotal(line), 0);
+-  const discount = invoice.lines.reduce((sum, line) => sum + lineDiscount(line), 0);
++  const lineDiscounts = invoice.lines.reduce((sum, line) => sum + lineDiscount(line), 0);
++  const bulkDiscounts = invoice.lines.reduce((sum, line) => sum + bulkDiscount(line), 0);
++  const discount = lineDiscounts + bulkDiscounts;
+   const vat = invoice.lines.reduce((sum, line) => sum + lineVAT(line), 0);
+   const voucher = invoice.voucher?.amount ?? 0;
+   const total = Math.max(0, subtotal - discount + vat - voucher);
+diff --git a/test/export.test.js b/test/export.test.js
+index b8f66e7..84ad2d8 100644
+--- a/test/export.test.js
++++ b/test/export.test.js
+@@ -64,7 +64,7 @@ test('exportCsv includes discount in output', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 20 }], // €850, 20% discount = €170, net €680, VAT €142.80, total €822.80
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 20 }], // €850, 20% discount = €170 - bulk 2.5% €17 = €187, net €663, VAT €139.23, total €802.23
+     terms: 'NET14',
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+@@ -72,14 +72,14 @@ test('exportCsv includes discount in output', () => {
+   const csv = exportCsv([issued]);
+   const lines = csv.split('\n');
+ 
+-  assert.equal(lines[1], 'INV-2025-0001,Blue Fern Bakery,2025-10-15,2025-10-29,issued,850.00,170.00,142.80,822.80,822.80');
++  assert.equal(lines[1], 'INV-2025-0001,Blue Fern Bakery,2025-10-15,2025-10-29,issued,850.00,187.00,139.23,802.23,802.23');
+ });
+ 
+ test('exportCsv includes tier discount', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001', // gold tier, 5% discount
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, 5% tier discount = €42.50, net €807.50, VAT €169.58, total €977.08
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, 5% tier discount = €42.50 - bulk 2.5% €20.19 = €62.69, net €787.31, VAT €165.34, total €952.65
+     terms: 'NET14',
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+@@ -87,7 +87,7 @@ test('exportCsv includes tier discount', () => {
+   const csv = exportCsv([issued]);
+   const lines = csv.split('\n');
+ 
+-  assert.equal(lines[1], 'INV-2025-0001,Northwind Studio,2025-10-15,2025-10-29,issued,850.00,42.50,169.58,977.08,977.08');
++  assert.equal(lines[1], 'INV-2025-0001,Northwind Studio,2025-10-15,2025-10-29,issued,850.00,62.69,165.34,952.65,952.65');
+ });
+ 
+ test('exportCsv exports partially paid invoice', () => {
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 9adb307..8c26cb5 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -175,15 +175,15 @@ test('invoiceTotals total formula with voucher: subtotal - discount + vat - vouc
+   let invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 + VAT €178.50 = €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - bulk 2.5% €21.25 = €828.75 + VAT €174.04 = €1002.79
+   }).value;
+ 
+   let totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 0);
+-  assert.equal(totals.vat, 17850);
++  assert.equal(totals.discount, 2125);
++  assert.equal(totals.vat, 17404);
+   assert.equal(totals.voucher, 0);
+-  assert.equal(totals.total, 102850);
++  assert.equal(totals.total, 100279);
+ 
+   // Apply voucher
+   const result = applyVoucher(invoice, { code: 'SAVE10', amount: 10000 });
+@@ -191,10 +191,10 @@ test('invoiceTotals total formula with voucher: subtotal - discount + vat - vouc
+ 
+   totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 0);
+-  assert.equal(totals.vat, 17850);
++  assert.equal(totals.discount, 2125);
++  assert.equal(totals.vat, 17404);
+   assert.equal(totals.voucher, 10000);
+-  assert.equal(totals.total, 92850);
++  assert.equal(totals.total, 90279);
+ });
+ 
+ test('applyVoucher applies voucher to draft invoice', () => {
+@@ -503,11 +503,11 @@ test('invoiceTotals with multiple lines', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   const expectedSubtotal = 5 * 8500 + 10 * 9500 + 3 * 6000;
+-  const expectedVAT = 8925 + 19950 + 1620;
++  const expectedVAT = 8925 + 19451 + 1620;
+   assert.equal(totals.subtotal, expectedSubtotal);
+-  assert.equal(totals.discount, 0);
++  assert.equal(totals.discount, 2375);
+   assert.equal(totals.vat, expectedVAT);
+-  assert.equal(totals.total, expectedSubtotal + expectedVAT);
++  assert.equal(totals.total, expectedSubtotal - 2375 + expectedVAT);
+ });
+ 
+ test('invoiceTotals with no lines', () => {
+@@ -805,14 +805,14 @@ test('invoiceTotals now includes discount and vat fields', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 = €765, VAT €160.65
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 - bulk 2.5% €19.12 = €745.88, VAT €156.63
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 8500);
+-  assert.equal(totals.vat, 16065);
+-  assert.equal(totals.total, 92565);
++  assert.equal(totals.discount, 10412);
++  assert.equal(totals.vat, 15663);
++  assert.equal(totals.total, 90251);
+ });
+ 
+ test('invoiceTotals calculates total with multiple discounts', () => {
+@@ -820,17 +820,17 @@ test('invoiceTotals calculates total with multiple discounts', () => {
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-15',
+     lines: [
+-      { sku: 'DES-HOUR', qty: 10, discountPercent: 10 }, // €850 - €85 = €765, VAT €160.65
++      { sku: 'DES-HOUR', qty: 10, discountPercent: 10 }, // €850 - €85 - bulk 2.5% €19.12 = €745.88, VAT €156.63
+       { sku: 'DEV-HOUR', qty: 5, discountPercent: 20 },  // €475 - €95 = €380, VAT €79.80
+     ],
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000 + 47500);
+-  assert.equal(totals.discount, 8500 + 9500);
+-  const expectedVAT = 16065 + 7980;
++  assert.equal(totals.discount, 10412 + 9500);
++  const expectedVAT = 15663 + 7980;
+   assert.equal(totals.vat, expectedVAT);
+-  assert.equal(totals.total, 132500 - 18000 + expectedVAT);
++  assert.equal(totals.total, 132500 - 19912 + expectedVAT);
+ });
+ 
+ test('invoiceTotals total is clamped at 0', () => {
+@@ -1021,42 +1021,42 @@ test('createInvoice tier discount affects invoiceTotals', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001', // gold tier (5%)
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - 5% = €807.50, VAT €169.58
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - 5% €42.50 - bulk 2.5% €20.19 = €787.31, VAT €165.34
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 4250);
+-  assert.equal(totals.vat, 16958);
+-  assert.equal(totals.total, 85000 - 4250 + 16958);
++  assert.equal(totals.discount, 6269);
++  assert.equal(totals.vat, 16534);
++  assert.equal(totals.total, 85000 - 6269 + 16534);
+ });
+ 
+ test('createInvoice explicit discount overrides tier in totals', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001', // gold tier (5%), but explicit 10% overrides
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - 10% = €765, VAT €160.65
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - 10% €85 - bulk 2.5% €19.12 = €745.88, VAT €156.63
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 8500);
+-  assert.equal(totals.vat, 16065);
+-  assert.equal(totals.total, 85000 - 8500 + 16065);
++  assert.equal(totals.discount, 10412);
++  assert.equal(totals.vat, 15663);
++  assert.equal(totals.total, 85000 - 10412 + 15663);
+ });
+ 
+ test('lineVAT calculates VAT on net amount after discount', () => {
+-  // Line: €850 with 5% discount = €807.50, VAT 21% = €169.575 ≈ €169.58
++  // Line: €850 with 5% discount = €807.50 - bulk 2.5% €20.19 = €787.31, VAT 21% = €165.34
+   const line = { qty: 10, unitPrice: 8500, discountPercent: 5, vatRate: 21 };
+   const vat = lineVAT(line);
+-  assert.equal(vat, 16958);
++  assert.equal(vat, 16534);
+ });
+ 
+ test('lineVAT handles 9% VAT', () => {
+-  // Line: €37 with no discount, VAT 9% = €3.33
++  // Line: qty=100 × €0.37 = €37, bulk discount 2.5% = €0.92, net €36.08, VAT 9% = €3.25
+   const line = { qty: 100, unitPrice: 37, vatRate: 9 };
+   const vat = lineVAT(line);
+-  assert.equal(vat, 333);
++  assert.equal(vat, 325);
+ });
+ 
+ test('lineVAT handles 0% VAT (exempt)', () => {
+@@ -1080,14 +1080,14 @@ test('invoiceTotals now includes vat field', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002', // standard tier, no discount
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 * 21% = €178.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - bulk 2.5% €21.25 = €828.75, VAT €174.04
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 0);
+-  assert.equal(totals.vat, 17850);
+-  assert.equal(totals.total, 85000 + 17850);
++  assert.equal(totals.discount, 2125);
++  assert.equal(totals.vat, 17404);
++  assert.equal(totals.total, 85000 - 2125 + 17404);
+ });
+ 
+ test('invoiceTotals calculates VAT after discount per line', () => {
+@@ -1095,17 +1095,17 @@ test('invoiceTotals calculates VAT after discount per line', () => {
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-15',
+     lines: [
+-      { sku: 'DES-HOUR', qty: 10, discountPercent: 10 }, // €850 - €85 = €765, VAT €160.65
+-      { sku: 'PRINT-A4', qty: 100 }, // €37, VAT €3.33
++      { sku: 'DES-HOUR', qty: 10, discountPercent: 10 }, // €850 - €85 - bulk €19.12 = €745.88, VAT €156.63
++      { sku: 'PRINT-A4', qty: 100 }, // €37 - bulk €0.92 = €36.08, VAT €3.25
+     ],
+   }).value;
+ 
+   const totals = invoiceTotals(invoice);
+   assert.equal(totals.subtotal, 85000 + 3700);
+-  assert.equal(totals.discount, 8500);
+-  const expectedVAT = 16065 + 333;
++  assert.equal(totals.discount, 10504);
++  const expectedVAT = 15663 + 325;
+   assert.equal(totals.vat, expectedVAT);
+-  assert.equal(totals.total, 88700 - 8500 + expectedVAT);
++  assert.equal(totals.total, 88700 - 10504 + expectedVAT);
+ });
+ 
+ test('invoiceTotals total formula: subtotal - discount + vat', () => {
+diff --git a/test/payments.test.js b/test/payments.test.js
+index 21305c0..d22247d 100644
+--- a/test/payments.test.js
++++ b/test/payments.test.js
+@@ -7,12 +7,12 @@ test('balanceDue returns total for unpaid invoice', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 + VAT €178.50 = €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - bulk 2.5% €21.25 = €828.75 + VAT €174.04 = €1002.79
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+   const due = balanceDue(issued);
+-  assert.equal(due, 102850);
++  assert.equal(due, 100279);
+ });
+ 
+ test('balanceDue returns 0 for fully paid invoice', () => {
+@@ -23,7 +23,7 @@ test('balanceDue returns 0 for fully paid invoice', () => {
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+-  const afterPayment = recordPayment(issued, { amount: 102850, date: '2025-10-20' }).value;
++  const afterPayment = recordPayment(issued, { amount: 100279, date: '2025-10-20' }).value;
+   const due = balanceDue(afterPayment);
+   assert.equal(due, 0);
+ });
+@@ -38,7 +38,7 @@ test('balanceDue returns remaining amount for partially paid invoice', () => {
+ 
+   const afterPayment = recordPayment(issued, { amount: 50000, date: '2025-10-20' }).value;
+   const due = balanceDue(afterPayment);
+-  assert.equal(due, 52850);
++  assert.equal(due, 50279);
+ });
+ 
+ test('recordPayment creates payments array', () => {
+@@ -102,7 +102,7 @@ test('recordPayment allows multiple payments', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1002.79
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+@@ -115,7 +115,7 @@ test('recordPayment allows multiple payments', () => {
+   assert.equal(current.status, 'partially_paid');
+   assert.equal(current.payments.length, 2);
+ 
+-  current = recordPayment(current, { amount: 32850, date: '2025-10-30' }).value;
++  current = recordPayment(current, { amount: 30279, date: '2025-10-30' }).value;
+   assert.equal(current.status, 'paid');
+   assert.equal(current.payments.length, 3);
+ });
+@@ -257,14 +257,14 @@ test('recordPayment allows payment on partially_paid invoice', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1002.79
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+   let current = recordPayment(issued, { amount: 50000, date: '2025-10-20' }).value;
+   assert.equal(current.status, 'partially_paid');
+ 
+-  const result = recordPayment(current, { amount: 52850, date: '2025-10-25' });
++  const result = recordPayment(current, { amount: 50279, date: '2025-10-25' });
+   assert.equal(result.ok, true);
+   assert.equal(result.value.status, 'paid');
+ });
+diff --git a/test/render.test.js b/test/render.test.js
+index c3493f3..2aa264b 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -124,16 +124,16 @@ test('renderInvoiceText handles different quantities and prices', () => {
+     customerId: 'C-002', // standard tier, no discount
+     issueDate: '2025-10-15',
+     lines: [
+-      { sku: 'PRINT-A4', qty: 100 }, // 100 * €0.37 = €37.00, VAT 9% = €3.33
+-      { sku: 'STICKER', qty: 1000 }, // 1000 * €0.50 = €500.00, VAT 21% = €105.00
++      { sku: 'PRINT-A4', qty: 100 }, // 100 * €0.37 = €37.00 - bulk 2.5% €0.92 = €36.08, VAT 9% = €3.25
++      { sku: 'STICKER', qty: 1000 }, // 1000 * €0.50 = €500.00 - bulk 2.5% €12.50 = €487.50, VAT 21% = €102.38
+     ],
+   }).value;
+ 
+   const text = renderInvoiceText(invoice);
+   assert.match(text, /100 Printed flyer/);
+   assert.match(text, /1000 Sticker/);
+-  // Subtotal: €537.00, VAT: €108.33, Total: €645.33
+-  assert.match(text, /Total: €645\.33/);
++  // Subtotal: €537.00, Discount: €13.42, VAT: €105.63, Total: €629.21
++  assert.match(text, /Total: €629\.21/);
+ });
+ 
+ test('renderInvoiceText uses formatEuros for all amounts', () => {
+@@ -194,12 +194,12 @@ test('renderInvoiceText shows discount on line with discountPercent', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 = €765
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 - bulk 2.5% €19.12 = €745.88
+   }).value;
+ 
+   const text = renderInvoiceText(invoice);
+   assert.match(text, /-10%/);
+-  assert.match(text, /€765\.00/); // net total after discount
++  assert.match(text, /Total: €902\.51/); // with bulk discount and VAT
+ });
+ 
+ test('renderInvoiceText shows subtotal and discount when there are discounts', () => {
+@@ -213,9 +213,10 @@ test('renderInvoiceText shows subtotal and discount when there are discounts', (
+   }).value;
+ 
+   const text = renderInvoiceText(invoice);
+-  assert.match(text, /Subtotal:/);
+-  assert.match(text, /Discount:/);
+-  assert.match(text, /Total:/);
++  assert.match(text, /Subtotal: €1,325\.00/);
++  assert.match(text, /Discount: -€199\.12/);
++  assert.match(text, /VAT: €236\.43/);
++  assert.match(text, /Total: €1,362\.31/);
+ });
+ 
+ test('renderInvoiceText shows only Subtotal and Total when no discounts or VAT', () => {
+@@ -302,14 +303,14 @@ test('renderInvoiceText VAT is calculated on net amount after discount', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 = €765, VAT €160.65
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 10 }], // €850 - €85 - bulk 2.5% €19.12 = €745.88, VAT €156.63
+   }).value;
+ 
+   const text = renderInvoiceText(invoice);
+   assert.match(text, /Subtotal: €850\.00/);
+-  assert.match(text, /Discount: -€85\.00/);
+-  assert.match(text, /VAT: €160\.65/);
+-  assert.match(text, /Total: €925\.65/);
++  assert.match(text, /Discount: -€104\.12/);
++  assert.match(text, /VAT: €156\.63/);
++  assert.match(text, /Total: €902\.51/);
+ });
+ 
+ test('renderInvoiceText shows all VAT-related lines in correct order', () => {
+@@ -341,15 +342,15 @@ test('renderInvoiceText with multiple lines and mixed VAT rates', () => {
+     issueDate: '2025-10-15',
+     lines: [
+       { sku: 'DES-HOUR', qty: 5 }, // €425, VAT 21% = €89.25
+-      { sku: 'PRINT-A4', qty: 100 }, // €37, VAT 9% = €3.33
++      { sku: 'PRINT-A4', qty: 100 }, // €37 - bulk 2.5% €0.92 = €36.08, VAT 9% = €3.25
+       { sku: 'WORKSHOP-DAY', qty: 1 }, // €600, VAT 0% = €0
+     ],
+   }).value;
+ 
+   const text = renderInvoiceText(invoice);
+   assert.match(text, /Subtotal: €1,062\.00/);
+-  assert.match(text, /VAT: €92\.58/); // €89.25 + €3.33 + €0
+-  assert.match(text, /Total: €1,154\.58/);
++  assert.match(text, /VAT: €92\.50/); // €89.25 + €3.25 + €0
++  assert.match(text, /Total: €1,153\.58/);
+ });
+ 
+ test('renderInvoiceText shows correct formatting with discount and VAT', () => {
+diff --git a/test/reports.test.js b/test/reports.test.js
+index c42f581..e0b7e87 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -165,7 +165,7 @@ test('overdueInvoices calculates correct due for partially paid invoices', () =>
+   let invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-01',
+-    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €950 + VAT €199.50 = €1149.50
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €950 - bulk 2.5% €23.75 = €926.25 + VAT €194.51 = €1120.76
+     terms: 'NET14',
+   }).value;
+   let issued = issueInvoice(invoice, []).value;
+@@ -174,7 +174,7 @@ test('overdueInvoices calculates correct due for partially paid invoices', () =>
+   const result = overdueInvoices([issued], '2025-11-05');
+ 
+   assert.equal(result.length, 1);
+-  assert.equal(result[0].due, 54950); // 114950 - 60000
++  assert.equal(result[0].due, 52076); // 112076 - 60000
+ });
+ 
+ test('overdueInvoices handles multiple customers', () => {
+@@ -311,7 +311,7 @@ test('vatSummary with multiple VAT rates', () => {
+     issueDate: '2025-10-15',
+     lines: [
+       { sku: 'DES-HOUR', qty: 5 }, // €85 * 5 = €425, VAT 21% = €89.25
+-      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110 cents, VAT 9% = €99.90 → 100
++      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110 - bulk €28 = €1082, VAT 9% = €97.38 → €97
+     ],
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+@@ -324,8 +324,8 @@ test('vatSummary with multiple VAT rates', () => {
+   assert.equal(result[0].base, 42500);
+   assert.equal(result[0].vat, 8925);
+   assert.equal(result[1].rate, 9);
+-  assert.equal(result[1].base, 1110);
+-  assert.equal(result[1].vat, 100);
++  assert.equal(result[1].base, 1082);
++  assert.equal(result[1].vat, 97);
+ });
+ 
+ test('vatSummary sorted by rate descending', () => {
+@@ -368,7 +368,7 @@ test('vatSummary with line discounts', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 20 }], // €850, 20% discount = €170, net €680, VAT 21%: €142.80
++    lines: [{ sku: 'DES-HOUR', qty: 10, discountPercent: 20 }], // €850, 20% discount = €170 - bulk 2.5% €17 = €187, net €663, VAT 21%: €139.23
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+@@ -376,15 +376,15 @@ test('vatSummary with line discounts', () => {
+ 
+   assert.equal(result.length, 1);
+   assert.equal(result[0].rate, 21);
+-  assert.equal(result[0].base, 68000);
+-  assert.equal(result[0].vat, 14280);
++  assert.equal(result[0].base, 66300);
++  assert.equal(result[0].vat, 13923);
+ });
+ 
+ test('vatSummary with tier discounts', () => {
+   const invoice = createInvoice({
+     customerId: 'C-001', // gold tier, 5% discount
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, 5% tier discount = €42.50, net €807.50, VAT 21%: €169.58
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, 5% tier discount = €42.50 - bulk 2.5% €20.19 = €62.69, net €787.31, VAT 21%: €165.34
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+@@ -392,8 +392,8 @@ test('vatSummary with tier discounts', () => {
+ 
+   assert.equal(result.length, 1);
+   assert.equal(result[0].rate, 21);
+-  assert.equal(result[0].base, 80750);
+-  assert.equal(result[0].vat, 16958);
++  assert.equal(result[0].base, 78731);
++  assert.equal(result[0].vat, 16534);
+ });
+ 
+ test('vatSummary includes issued invoices', () => {
+@@ -471,7 +471,7 @@ test('vatSummary aggregates by VAT rate across invoices', () => {
+     issueDate: '2025-10-01',
+     lines: [
+       { sku: 'DES-HOUR', qty: 5 }, // €425, VAT 21%
+-      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110, VAT 9%
++      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110 - bulk €28 = €1082, VAT 9%
+     ],
+   }).value;
+   const issued1 = issueInvoice(inv1, []).value;
+@@ -481,7 +481,7 @@ test('vatSummary aggregates by VAT rate across invoices', () => {
+     issueDate: '2025-10-05',
+     lines: [
+       { sku: 'DES-HOUR', qty: 2 }, // €170, VAT 21%
+-      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110, VAT 9%
++      { sku: 'PRINT-A4', qty: 30 }, // €37 * 30 = €1110 - bulk €28 = €1082, VAT 9%
+     ],
+   }).value;
+   const issued2 = issueInvoice(inv2, ['INV-2025-0001']).value;
+@@ -493,8 +493,8 @@ test('vatSummary aggregates by VAT rate across invoices', () => {
+   assert.equal(result[0].base, 59500); // 42500 + 17000
+   assert.equal(result[0].vat, 12495); // 8925 + 3570
+   assert.equal(result[1].rate, 9);
+-  assert.equal(result[1].base, 2220); // 1110 + 1110 (37 * 30 each)
+-  assert.equal(result[1].vat, 200); // roundCents(1110 * 9 / 100) * 2 = roundCents(99.9) * 2 = 100 * 2
++  assert.equal(result[1].base, 2164); // 1082 + 1082 (1110 - 28 each)
++  assert.equal(result[1].vat, 194); // roundCents(1082 * 9 / 100) * 2 = roundCents(97.38) * 2 = 97 * 2
+ });
+ 
+ test('vatSummary with mixed invoice statuses', () => {
+@@ -683,14 +683,14 @@ test('lateFee with NET30 terms', () => {
+   const invoice = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, VAT €178.50, total €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850, bulk 2.5% €21.25, net €828.75, VAT €174.04, total €1002.79
+     terms: 'NET30', // due 2025-11-14
+   }).value;
+   const issued = issueInvoice(invoice, []).value;
+ 
+-  // 5 days overdue: 102850 * 5 * 0.04 / 100 = 205.70 → 206 cents
++  // 5 days overdue: 100279 * 5 * 0.04 / 100 = 200.558 → 201 cents
+   const fee = lateFee(issued, '2025-11-19');
+-  assert.equal(fee, 206);
++  assert.equal(fee, 201);
+ });
+ 
+ test('lateFee with EOM terms', () => {
+diff --git a/test/statements.test.js b/test/statements.test.js
+index 4f67cda..e43454b 100644
+--- a/test/statements.test.js
++++ b/test/statements.test.js
+@@ -138,7 +138,7 @@ test('statement includes invoice details', () => {
+   const inv = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1002.79
+     terms: 'NET14',
+   }).value;
+   const issued = issueInvoice(inv, []).value;
+@@ -150,15 +150,15 @@ test('statement includes invoice details', () => {
+   assert.equal(line.number, 'INV-2025-0001');
+   assert.equal(line.issueDate, '2025-10-15');
+   assert.equal(line.dueDate, '2025-10-29');
+-  assert.equal(line.total, 102850);
+-  assert.equal(line.due, 102850);
++  assert.equal(line.total, 100279);
++  assert.equal(line.due, 100279);
+ });
+ 
+ test('statement calculates due from balanceDue', () => {
+   const inv = createInvoice({
+     customerId: 'C-002',
+     issueDate: '2025-10-15',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €1002.79
+   }).value;
+   let issued = issueInvoice(inv, []).value;
+ 
+@@ -167,8 +167,8 @@ test('statement calculates due from balanceDue', () => {
+ 
+   const result = statement('C-002', [issued], '2025-10-31');
+ 
+-  assert.equal(result.value.invoices[0].total, 102850);
+-  assert.equal(result.value.invoices[0].due, 52850);
++  assert.equal(result.value.invoices[0].total, 100279);
++  assert.equal(result.value.invoices[0].due, 50279);
+ });
+ 
+ test('statement calculates totalDue as sum of due amounts', () => {
+@@ -198,7 +198,7 @@ test('statement includes partially paid invoices with correct due amount', () =>
+   const inv1 = createInvoice({
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-01',
+-    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 + VAT €178.50 = €1028.50
++    lines: [{ sku: 'DES-HOUR', qty: 10 }], // €850 - bulk 2.5% €21.25 = €828.75 + VAT €174.04 = €1002.79
+   }).value;
+   let issued1 = issueInvoice(inv1, []).value;
+   issued1 = recordPayment(issued1, { amount: 50000, date: '2025-10-05' }).value;
+@@ -206,16 +206,16 @@ test('statement includes partially paid invoices with correct due amount', () =>
+   const inv2 = createInvoice({
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-10',
+-    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €950 + VAT €199.50 = €1149.50
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €950 - bulk 2.5% €23.75 = €926.25 + VAT €194.51 = €1120.76
+   }).value;
+   const issued2 = issueInvoice(inv2, ['INV-2025-0001']).value;
+ 
+   const result = statement('C-002', [issued1, issued2], '2025-10-31');
+ 
+   assert.equal(result.value.invoices.length, 2);
+-  assert.equal(result.value.invoices[0].due, 52850);
+-  assert.equal(result.value.invoices[1].due, 114950);
+-  assert.equal(result.value.totalDue, 167800);
++  assert.equal(result.value.invoices[0].due, 50279);
++  assert.equal(result.value.invoices[1].due, 112076);
++  assert.equal(result.value.totalDue, 162355);
+ });
+ 
+ test('statement normalizes customer ID', () => {
+@@ -265,7 +265,7 @@ test('statement handles mixed invoice statuses and amounts', () => {
+   const inv2 = createInvoice({
+     customerId: 'C-002', // standard tier
+     issueDate: '2025-10-05',
+-    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €1083.50
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }], // €950 - bulk 2.5% €23.75 = €926.25 + VAT €194.51 = €1120.76
+   }).value;
+   let issued2 = issueInvoice(inv2, ['INV-2025-0001']).value;
+   issued2 = recordPayment(issued2, { amount: 50000, date: '2025-10-10' }).value;
+@@ -286,6 +286,7 @@ test('statement handles mixed invoice statuses and amounts', () => {
+   assert.equal(result.value.invoices[0].number, 'INV-2025-0001');
+   assert.equal(result.value.invoices[0].due, 51425);
+   assert.equal(result.value.invoices[1].number, 'INV-2025-0002');
+-  assert.equal(result.value.invoices[1].due, 64950); // €950 + VAT €199.50 = €1149.50, minus €500 payment = €649.50
+-  assert.equal(result.value.totalDue, 116375);
++  // DEV-HOUR qty=10: €950 - bulk discount €23.75 = €926.25 + VAT €194.51 = €1120.76, minus €50000 payment = €62076
++  assert.equal(result.value.invoices[1].due, 62076);
++  assert.equal(result.value.totalDue, 113501);
+ });
+diff --git a/test/totals.test.js b/test/totals.test.js
+index 4dd8b1f..fed3c8d 100644
+--- a/test/totals.test.js
++++ b/test/totals.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { lineTotal, lineDiscount, lineVAT, invoiceTotals } from '../src/totals.js';
++import { lineTotal, lineDiscount, lineVAT, invoiceTotals, bulkDiscount } from '../src/totals.js';
+ 
+ test('lineTotal calculates qty * unitPrice', () => {
+   assert.equal(lineTotal({ qty: 5, unitPrice: 8500 }), 42500);
+@@ -60,9 +60,9 @@ test('lineVAT calculates VAT on net amount', () => {
+ 
+ test('lineVAT with discount reduces base', () => {
+   const line = { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 };
+-  // lineTotal = 85000, discount = 17000, net = 68000
+-  // VAT = 68000 * 21 / 100 = 14280
+-  assert.equal(lineVAT(line), 14280);
++  // lineTotal = 85000, discount = 17000, bulkDiscount = 1700, net = 66300
++  // VAT = 66300 * 21 / 100 = 13923
++  assert.equal(lineVAT(line), 13923);
+ });
+ 
+ test('lineVAT with 0% VAT rate', () => {
+@@ -72,9 +72,9 @@ test('lineVAT with 0% VAT rate', () => {
+ 
+ test('lineVAT with 9% VAT rate', () => {
+   const line = { qty: 30, unitPrice: 37, discountPercent: 0, vatRate: 9 };
+-  // lineTotal = 1110, discount = 0, net = 1110
+-  // VAT = 1110 * 9 / 100 = 99.9 → 100
+-  assert.equal(lineVAT(line), 100);
++  // lineTotal = 1110, discount = 0, bulkDiscount = 28, net = 1082
++  // VAT = 1082 * 9 / 100 = 97.38 → 97
++  assert.equal(lineVAT(line), 97);
+ });
+ 
+ test('lineVAT clamped to >= 0', () => {
+@@ -105,25 +105,25 @@ test('invoiceTotals with multiple lines', () => {
+   const totals = invoiceTotals(invoice);
+ 
+   assert.equal(totals.subtotal, 43610); // 42500 + 1110
+-  assert.equal(totals.discount, 0);
+-  assert.equal(totals.vat, 9025); // 8925 + 100
++  assert.equal(totals.discount, 28); // Bulk discount on line 2: roundCents(1110 * 2.5 / 100) = 28
++  assert.equal(totals.vat, 9022); // 8925 + roundCents(1082 * 9 / 100) = 8925 + 97
+   assert.equal(totals.voucher, 0);
+-  assert.equal(totals.total, 52635); // 43610 + 9025
++  assert.equal(totals.total, 52604); // 43610 - 28 + 9022
+ });
+ 
+ test('invoiceTotals with line discounts', () => {
+   const invoice = {
+     lines: [
+-      { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 }, // 85000, 17000, 14280
++      { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 }, // 85000, 17000+1700 bulk, VAT on 66300 = 13923
+     ],
+   };
+   const totals = invoiceTotals(invoice);
+ 
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 17000);
+-  assert.equal(totals.vat, 14280);
++  assert.equal(totals.discount, 18700); // 17000 + 1700 bulk
++  assert.equal(totals.vat, 13923);
+   assert.equal(totals.voucher, 0);
+-  assert.equal(totals.total, 82280); // 85000 - 17000 + 14280
++  assert.equal(totals.total, 80223); // 85000 - 18700 + 13923
+ });
+ 
+ test('invoiceTotals with voucher', () => {
+@@ -157,31 +157,31 @@ test('invoiceTotals with mixed VAT rates', () => {
+   const invoice = {
+     lines: [
+       { qty: 5, unitPrice: 8500, discountPercent: 0, vatRate: 21 }, // 42500, 0, 8925
+-      { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 }, // 85000, 17000, 14280
+-      { qty: 30, unitPrice: 37, discountPercent: 0, vatRate: 9 }, // 1110, 0, 100
++      { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 }, // 85000, 17000+1700, VAT on 66300 = 13923
++      { qty: 30, unitPrice: 37, discountPercent: 0, vatRate: 9 }, // 1110, 28, VAT on 1082 = 97
+     ],
+   };
+   const totals = invoiceTotals(invoice);
+ 
+   assert.equal(totals.subtotal, 128610); // 42500 + 85000 + 1110
+-  assert.equal(totals.discount, 17000);
+-  assert.equal(totals.vat, 23305); // 8925 + 14280 + 100
+-  assert.equal(totals.total, 134915); // 128610 - 17000 + 23305
++  assert.equal(totals.discount, 18728); // 0 + 17000 + 1700 + 28
++  assert.equal(totals.vat, 22945); // 8925 + 13923 + 97
++  assert.equal(totals.total, 132827); // 128610 - 18728 + 22945
+ });
+ 
+ test('invoiceTotals with tier discounts', () => {
+   // Tier discount is applied by createInvoice, so we test with discountPercent already set
+   const invoice = {
+     lines: [
+-      { qty: 10, unitPrice: 8500, discountPercent: 5, vatRate: 21 }, // 85000, 4250, 16958
++      { qty: 10, unitPrice: 8500, discountPercent: 5, vatRate: 21 }, // 85000, 4250+2019 bulk, VAT on 78731 = 16534
+     ],
+   };
+   const totals = invoiceTotals(invoice);
+ 
+   assert.equal(totals.subtotal, 85000);
+-  assert.equal(totals.discount, 4250);
+-  assert.equal(totals.vat, 16958); // (85000 - 4250) * 21 / 100 = 80750 * 21 / 100 = 16957.5 → 16958
+-  assert.equal(totals.total, 97708); // 85000 - 4250 + 16958
++  assert.equal(totals.discount, 6269); // 4250 + 2019 bulk
++  assert.equal(totals.vat, 16534); // (85000 - 4250 - 2019) * 21 / 100 = 78731 * 21 / 100
++  assert.equal(totals.total, 95265); // 85000 - 6269 + 16534
+ });
+ 
+ test('invoiceTotals no lines', () => {
+@@ -236,3 +236,141 @@ test('invoiceTotals preserves original invoice', () => {
+ 
+   assert.equal(JSON.stringify(invoice), original);
+ });
++
++test('bulkDiscount returns 0 for qty < 10', () => {
++  const line = { qty: 9, unitPrice: 8500, discountPercent: 0, vatRate: 21 };
++  assert.equal(bulkDiscount(line), 0);
++});
++
++test('bulkDiscount calculates 2.5% for qty >= 10', () => {
++  const line = { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 };
++  // lineTotal = 85000, lineDiscount = 0, net = 85000
++  // bulkDiscount = 85000 * 2.5 / 100 = 2125
++  assert.equal(bulkDiscount(line), 2125);
++});
++
++test('bulkDiscount applied after line discount', () => {
++  const line = { qty: 10, unitPrice: 8500, discountPercent: 20, vatRate: 21 };
++  // lineTotal = 85000, lineDiscount = 17000, net = 68000
++  // bulkDiscount = 68000 * 2.5 / 100 = 1700
++  assert.equal(bulkDiscount(line), 1700);
++});
++
++test('bulkDiscount with large quantity', () => {
++  const line = { qty: 100, unitPrice: 8500, discountPercent: 0, vatRate: 21 };
++  // lineTotal = 850000, lineDiscount = 0, net = 850000
++  // bulkDiscount = 850000 * 2.5 / 100 = 21250
++  assert.equal(bulkDiscount(line), 21250);
++});
++
++test('bulkDiscount threshold at exactly 10 units', () => {
++  const line9 = { qty: 9, unitPrice: 1000, discountPercent: 0, vatRate: 21 };
++  const line10 = { qty: 10, unitPrice: 1000, discountPercent: 0, vatRate: 21 };
++
++  assert.equal(bulkDiscount(line9), 0);
++  assert.equal(bulkDiscount(line10), 250); // 10000 * 2.5 / 100
++});
++
++test('lineVAT accounts for bulk discount', () => {
++  const line = { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 };
++  // lineTotal = 85000, lineDiscount = 0, bulkDiscount = 2125, net = 82875
++  // VAT = 82875 * 21 / 100 = 17403.75 → 17404
++  assert.equal(lineVAT(line), 17404);
++});
++
++test('lineVAT with line discount and bulk discount', () => {
++  const line = { qty: 10, unitPrice: 8500, discountPercent: 5, vatRate: 21 };
++  // lineTotal = 85000, lineDiscount = 4250, net = 80750
++  // bulkDiscount = 80750 * 2.5 / 100 = 2018.75 → 2019, net = 78731
++  // VAT = 78731 * 21 / 100 = 16533.51 → 16534
++  assert.equal(lineVAT(line), 16534);
++});
++
++test('invoiceTotals includes bulk discount in discount total', () => {
++  const invoice = {
++    lines: [
++      { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 }, // lineDisc=0, bulkDisc=2125
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++
++  assert.equal(totals.subtotal, 85000);
++  assert.equal(totals.discount, 2125); // Only bulk discount
++  assert.equal(totals.vat, 17404); // Calculated on 85000 - 2125 = 82875
++  assert.equal(totals.total, 100279); // 85000 - 2125 + 17404
++});
++
++test('invoiceTotals bulk discount with line discount', () => {
++  const invoice = {
++    lines: [
++      { qty: 10, unitPrice: 8500, discountPercent: 5, vatRate: 21 }, // lineDisc=4250, bulkDisc=2019
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++
++  assert.equal(totals.subtotal, 85000);
++  assert.equal(totals.discount, 6269); // 4250 + 2019
++  assert.equal(totals.vat, 16534);
++  assert.equal(totals.total, 95265); // 85000 - 6269 + 16534
++});
++
++test('invoiceTotals with multiple lines, some bulk, some not', () => {
++  const invoice = {
++    lines: [
++      { qty: 5, unitPrice: 8500, discountPercent: 0, vatRate: 21 }, // No bulk discount
++      { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 }, // 2125 bulk discount
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++
++  assert.equal(totals.subtotal, 127500); // 42500 + 85000
++  assert.equal(totals.discount, 2125); // Only from second line
++  assert.equal(totals.vat, 26329); // VAT on 42500 (8925) + VAT on 82875 (17404)
++  assert.equal(totals.total, 151704); // 127500 - 2125 + 26329
++});
++
++test('invoiceTotals with bulk discount and voucher', () => {
++  const invoice = {
++    lines: [
++      { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 },
++    ],
++    voucher: { code: 'TEST', amount: 5000 },
++  };
++  const totals = invoiceTotals(invoice);
++
++  assert.equal(totals.subtotal, 85000);
++  assert.equal(totals.discount, 2125);
++  assert.equal(totals.vat, 17404);
++  assert.equal(totals.voucher, 5000);
++  assert.equal(totals.total, 95279); // 85000 - 2125 + 17404 - 5000
++});
++
++test('bulkDiscount clamped to >= 0', () => {
++  // Bulk discount should never be negative
++  const line = { qty: 10, unitPrice: 8500, discountPercent: 0, vatRate: 21 };
++  assert.equal(bulkDiscount(line) >= 0, true);
++});
++
++test('lineVAT with bulk discount on 0% VAT line', () => {
++  const line = { qty: 10, unitPrice: 6000, discountPercent: 0, vatRate: 0 };
++  // lineTotal = 60000, lineDiscount = 0, bulkDiscount = 1500, net = 58500
++  // VAT = 0
++  assert.equal(lineVAT(line), 0);
++});
++
++test('invoiceTotals with bulk discount on 9% VAT line', () => {
++  const invoice = {
++    lines: [
++      { qty: 20, unitPrice: 37, discountPercent: 0, vatRate: 9 }, // 740, 18 bulk (740 * 2.5 / 100 = 18.5 → 18)
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++
++  // lineTotal = 740, lineDiscount = 0, bulkDiscount = roundCents(740 * 2.5 / 100) = 18 (banker's rounding)
++  // net = 740 - 18 = 722
++  // VAT = 722 * 9 / 100 = 64.98 → 65
++  assert.equal(totals.subtotal, 740);
++  assert.equal(totals.discount, 18);
++  assert.equal(totals.vat, 65);
++  assert.equal(totals.total, 787); // 740 - 18 + 65
++});

@@ -74,6 +74,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 32 | /clear every 5 requests vs one long session | 104/150 vs 124/150 requests kept, chat-only rules lost on clear | ❌ cut |
 | 33 | Handoff note every 5 requests vs /compact | 117/150 vs 118/150 requests kept, money rule broke 2 vs 8 times | 🟡 optional |
 | 34 | @-name the relevant files in every request | 120/150 vs 126/150 requests kept, reads and searches 186 vs 393 | 🟡 optional |
+| 35 | A Repomix pack of the repo, read first every 5 requests | 120/150 vs 122/150 requests kept, real-file reads 417 vs 389 | 🟡 optional |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

@@ -1,0 +1,352 @@
+diff --git a/src/reports.js b/src/reports.js
+index ac4d224..e5ddfb7 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -1,5 +1,6 @@
+ import { balanceDue } from './payments.js';
+ import { daysBetween } from './dates.js';
++import { roundCents } from './money.js';
+ 
+ /**
+  * Generate a report of overdue invoices.
+@@ -26,3 +27,49 @@ export function overdueInvoices(invoices, asOf) {
+ 
+   return overdue;
+ }
++
++/**
++ * Generate a VAT summary report.
++ * @param {Array<{ status: string, lines: Array<{ qty: number, unitPrice: number, vatRate: number, discountPercent?: number }> }>} invoices
++ * @returns {Array<{ rate: number, base: number, vat: number }>} - VAT by rate, sorted by rate descending
++ */
++export function vatSummary(invoices) {
++  const vatByRate = {};
++
++  for (const invoice of invoices) {
++    // Only process invoices with these statuses
++    if (invoice.status !== 'issued' && invoice.status !== 'partially_paid' && invoice.status !== 'paid') {
++      continue;
++    }
++
++    for (const line of invoice.lines) {
++      // Calculate taxable amount (line total after discount)
++      const lineTotal = line.qty * line.unitPrice;
++      const lineDiscount = line.discountPercent ? roundCents((lineTotal * line.discountPercent) / 100) : 0;
++      const taxableAmount = roundCents(lineTotal - lineDiscount);
++
++      // Calculate VAT
++      const lineVAT = roundCents((taxableAmount * line.vatRate) / 100);
++
++      // Group by rate
++      const rate = line.vatRate;
++      if (!vatByRate[rate]) {
++        vatByRate[rate] = { base: 0, vat: 0 };
++      }
++
++      vatByRate[rate].base += taxableAmount;
++      vatByRate[rate].vat += lineVAT;
++    }
++  }
++
++  // Convert to array and sort by rate descending
++  const result = Object.entries(vatByRate)
++    .map(([rate, data]) => ({
++      rate: parseFloat(rate),
++      base: roundCents(data.base),
++      vat: roundCents(data.vat),
++    }))
++    .sort((a, b) => b.rate - a.rate);
++
++  return result;
++}
+diff --git a/test/reports.test.js b/test/reports.test.js
+index 79e5700..7a8bddd 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -1,6 +1,6 @@
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { overdueInvoices } from '../src/reports.js';
++import { overdueInvoices, vatSummary } from '../src/reports.js';
+ import { createInvoice, issueInvoice } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+ 
+@@ -331,3 +331,278 @@ test('overdueInvoices: preserves all fields in output', () => {
+   assert('due' in overdue);
+   assert.equal(Object.keys(overdue).length, 5);
+ });
++
++test('vatSummary: returns empty array for no invoices', () => {
++  const result = vatSummary([]);
++
++  assert.deepEqual(result, []);
++});
++
++test('vatSummary: returns empty array for no valid invoices', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  // Draft invoice should be excluded
++  const result = vatSummary([invoiceResult.value]);
++
++  assert.deepEqual(result, []);
++});
++
++test('vatSummary: calculates VAT for single invoice', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert.equal(result[0].rate, 21);
++  // DEV-HOUR: 9500 * 10 = 95000 (no discount for standard tier), VAT = 95000 * 21% = 19950
++  assert.equal(result[0].base, 95000);
++  assert.equal(result[0].vat, 19950);
++});
++
++test('vatSummary: includes invoices with status issued', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert(result[0].base > 0);
++});
++
++test('vatSummary: includes invoices with status partially_paid', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const paymentResult = recordPayment(invoice, { amount: 50000, date: '2025-03-01' });
++  assert.equal(paymentResult.ok, true);
++  invoice = paymentResult.value;
++
++  assert.equal(invoice.status, 'partially_paid');
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert(result[0].base > 0);
++});
++
++test('vatSummary: excludes draft invoices', () => {
++  const invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const result = vatSummary([invoiceResult.value]);
++
++  assert.deepEqual(result, []);
++});
++
++test('vatSummary: applies discounts to base calculation', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10, discountPercent: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert.equal(result[0].rate, 21);
++  // DEV-HOUR: 9500 * 10 = 95000, discount = 9500, base = 85500, VAT = 85500 * 21% = 17955
++  assert.equal(result[0].base, 85500);
++  assert.equal(result[0].vat, 17955);
++});
++
++test('vatSummary: handles multiple VAT rates', () => {
++  let invoice1Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  let invoice2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-15',
++    lines: [{ sku: 'BOOK-DESIGN', qty: 5 }],
++  });
++
++  assert.equal(invoice1Result.ok, true);
++  assert.equal(invoice2Result.ok, true);
++
++  const invoice1 = issueInvoice(invoice1Result.value, []).value;
++  const invoice2 = issueInvoice(invoice2Result.value, ['2025-0001']).value;
++
++  const result = vatSummary([invoice1, invoice2]);
++
++  assert.equal(result.length, 2);
++  // Sorted by rate descending (21 first, then 9)
++  assert.equal(result[0].rate, 21);
++  assert.equal(result[1].rate, 9);
++});
++
++test('vatSummary: sorts by VAT rate descending', () => {
++  let invoice1Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'BOOK-DESIGN', qty: 5 }],
++  });
++
++  let invoice2Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoice1Result.ok, true);
++  assert.equal(invoice2Result.ok, true);
++
++  const invoice1 = issueInvoice(invoice1Result.value, []).value;
++  const invoice2 = issueInvoice(invoice2Result.value, ['2025-0001']).value;
++
++  const result = vatSummary([invoice1, invoice2]);
++
++  assert.equal(result.length, 2);
++  assert.equal(result[0].rate, 21);
++  assert.equal(result[1].rate, 9);
++});
++
++test('vatSummary: aggregates multiple lines with same VAT rate', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [
++      { sku: 'DEV-HOUR', qty: 10 },
++      { sku: 'DES-HOUR', qty: 5 },
++    ],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert.equal(result[0].rate, 21);
++  // DEV-HOUR: 9500 * 10 = 95000, DES-HOUR: 8500 * 5 = 42500, total base = 137500
++  // VAT = 137500 * 21% = 28875
++  assert.equal(result[0].base, 137500);
++  assert.equal(result[0].vat, 28875);
++});
++
++test('vatSummary: handles invoices with zero VAT rate', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'TALK', qty: 1 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  assert.equal(result[0].rate, 0);
++  // TALK: 35000 cents
++  assert.equal(result[0].base, 35000);
++  assert.equal(result[0].vat, 0);
++});
++
++test('vatSummary: combines VAT from multiple invoices with same rate', () => {
++  let invoice1Result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  let invoice2Result = createInvoice({
++    customerId: 'C-004',
++    issueDate: '2025-02-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 5 }],
++  });
++
++  assert.equal(invoice1Result.ok, true);
++  assert.equal(invoice2Result.ok, true);
++
++  const invoice1 = issueInvoice(invoice1Result.value, []).value;
++  const invoice2 = issueInvoice(invoice2Result.value, ['2025-0001']).value;
++
++  const result = vatSummary([invoice1, invoice2]);
++
++  assert.equal(result.length, 1);
++  assert.equal(result[0].rate, 21);
++  // Each invoice: 47500 base (no discount for standard tier), so total = 95000
++  // VAT: 47500 * 0.21 * 2 = 19950
++  assert.equal(result[0].base, 95000);
++  assert.equal(result[0].vat, 19950);
++});
++
++test('vatSummary: handles partially paid invoices same as issued', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  let invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const paymentResult = recordPayment(invoice, { amount: 50000, date: '2025-03-01' });
++  assert.equal(paymentResult.ok, true);
++  invoice = paymentResult.value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  // Base and VAT should be same as if it was just issued (no discount for standard tier)
++  assert.equal(result[0].base, 95000);
++  assert.equal(result[0].vat, 19950);
++});
++
++test('vatSummary: returns rate, base, and vat fields', () => {
++  let invoiceResult = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-02-14',
++    lines: [{ sku: 'DEV-HOUR', qty: 10 }],
++  });
++
++  assert.equal(invoiceResult.ok, true);
++  const invoice = issueInvoice(invoiceResult.value, []).value;
++
++  const result = vatSummary([invoice]);
++
++  assert.equal(result.length, 1);
++  const summary = result[0];
++  assert('rate' in summary);
++  assert('base' in summary);
++  assert('vat' in summary);
++  assert.equal(Object.keys(summary).length, 3);
++});

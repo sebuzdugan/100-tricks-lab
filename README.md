@@ -75,6 +75,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 33 | Handoff note every 5 requests vs /compact | 117/150 vs 118/150 requests kept, money rule broke 2 vs 8 times | 🟡 optional |
 | 34 | @-name the relevant files in every request | 120/150 vs 126/150 requests kept, reads and searches 186 vs 393 | 🟡 optional |
 | 35 | A Repomix pack of the repo, read first every 5 requests | 120/150 vs 122/150 requests kept, real-file reads 417 vs 389 | 🟡 optional |
+| 36 | Context7 docs server for a library newer than the model | 7/12 vs 0/12, faster and cheaper | ✅ keep |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

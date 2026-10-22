@@ -1,0 +1,253 @@
+diff --git a/src/legacy/assistant.js b/src/legacy/assistant.js
+index 943e7a6..1c074c9 100644
+--- a/src/legacy/assistant.js
++++ b/src/legacy/assistant.js
+@@ -1,5 +1,5 @@
+-// Support assistant helpers. Written for AI SDK 6 (ai@6.0.x); not yet migrated to AI SDK 7.
+-import { generateText, Output, stepCountIs, tool } from 'ai';
++// Support assistant helpers. Migrated to AI SDK 7 (ai@7.0.x).
++import { generateText, generateObject, tool } from 'ai';
+ import { z } from 'zod';
+ import { findOrder } from '../data/orders.js';
+ 
+@@ -18,6 +18,21 @@ const orderLookup = tool({
+   },
+ });
+ 
++const extractFinalText = (messages) => {
++  for (let i = messages.length - 1; i >= 0; i--) {
++    const msg = messages[i];
++    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
++      for (let j = msg.content.length - 1; j >= 0; j--) {
++        const content = msg.content[j];
++        if (content.type === 'text') {
++          return content.text;
++        }
++      }
++    }
++  }
++  return '';
++};
++
+ /**
+  * Summarises a support thread for the next agent on shift.
+  * @param {import('ai').LanguageModel} model
+@@ -28,8 +43,8 @@ const orderLookup = tool({
+ export async function summarizeThread(model, thread) {
+   const result = await generateText({
+     model,
++    system: SUMMARY_RULES,
+     messages: [
+-      { role: 'system', content: SUMMARY_RULES },
+       ...thread.map((m) => ({ role: m.from === 'customer' ? 'user' : 'assistant', content: m.text })),
+       { role: 'user', content: 'Summarise this thread.' },
+     ],
+@@ -50,15 +65,36 @@ export async function summarizeThread(model, thread) {
+  * @returns {Promise<{ text: string, toolsUsed: string[] }>} the answer and the names of the tools called, in order
+  */
+ export async function answerAboutOrders(model, question, { customerId }) {
+-  const result = await generateText({
+-    model,
+-    system: ORDER_RULES,
+-    tools: { orderLookup },
+-    experimental_context: { customerId },
+-    stopWhen: stepCountIs(4),
+-    prompt: question,
+-  });
+-  return { text: result.text, toolsUsed: result.steps.flatMap((s) => s.toolCalls.map((c) => c.toolName)) };
++  const toolsUsed = [];
++  const messages = [{ role: 'user', content: question }];
++
++  for (let step = 0; step < 4; step++) {
++    const result = await generateText({
++      model,
++      system: ORDER_RULES,
++      tools: { orderLookup },
++      experimental_context: { customerId },
++      messages,
++    });
++
++    messages.push(...result.response.messages);
++
++    let hasToolCalls = false;
++    for (const message of result.response.messages) {
++      if (message.role === 'assistant' && Array.isArray(message.content)) {
++        for (const content of message.content) {
++          if (content.type === 'tool-call') {
++            toolsUsed.push(content.toolName);
++            hasToolCalls = true;
++          }
++        }
++      }
++    }
++
++    if (!hasToolCalls) break;
++  }
++
++  return { text: extractFinalText(messages), toolsUsed };
+ }
+ 
+ const ticketSchema = z.object({
+@@ -73,12 +109,12 @@ const ticketSchema = z.object({
+  * @returns {Promise<{ category: 'billing' | 'shipping' | 'bug' | 'other', urgent: boolean }>} validated against the schema
+  */
+ export async function classifyTicket(model, text) {
+-  const { experimental_output } = await generateText({
++  const result = await generateObject({
+     model,
+-    experimental_output: Output.object({ schema: ticketSchema }),
++    schema: ticketSchema,
+     prompt: `Classify this support ticket:\n\n${text}`,
+   });
+-  return experimental_output;
++  return result.object;
+ }
+ 
+ /**
+@@ -93,13 +129,41 @@ export async function classifyTicket(model, text) {
+  */
+ export async function continueChat(model, history, userText, { customerId }) {
+   const messages = [...history, { role: 'user', content: userText }];
+-  const result = await generateText({
+-    model,
+-    system: ORDER_RULES,
+-    tools: { orderLookup },
+-    experimental_context: { customerId },
+-    stopWhen: stepCountIs(4),
+-    messages,
++  const userMessageIndex = messages.length - 1;
++
++  for (let step = 0; step < 4; step++) {
++    const result = await generateText({
++      model,
++      system: ORDER_RULES,
++      tools: { orderLookup },
++      experimental_context: { customerId },
++      messages,
++    });
++
++    messages.push(...result.response.messages);
++
++    let hasToolCalls = false;
++    for (const message of result.response.messages) {
++      if (message.role === 'assistant' && Array.isArray(message.content)) {
++        for (const content of message.content) {
++          if (content.type === 'tool-call') {
++            hasToolCalls = true;
++            break;
++          }
++        }
++      }
++      if (hasToolCalls) break;
++    }
++
++    if (!hasToolCalls) break;
++  }
++
++  const responseMessages = messages.slice(userMessageIndex + 1).map((msg) => {
++    if (Array.isArray(msg.content) && msg.content.length === 1 && msg.content[0].type === 'text') {
++      return { ...msg, content: msg.content[0].text };
++    }
++    return msg;
+   });
+-  return [...messages, ...result.response.messages];
++
++  return [...messages.slice(0, userMessageIndex + 1), ...responseMessages];
+ }
+diff --git a/test/assistant.test.js b/test/assistant.test.js
+new file mode 100644
+index 0000000..ca31434
+--- /dev/null
++++ b/test/assistant.test.js
+@@ -0,0 +1,91 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { scriptedModel } from './helpers/mock-model.js';
++import { summarizeThread, answerAboutOrders, classifyTicket, continueChat } from '../src/legacy/assistant.js';
++
++test('summarizeThread returns summary with token usage', async () => {
++  const model = scriptedModel([
++    { text: 'Customer asked about order. Agent provided status.', usage: [100, 20] },
++  ]);
++
++  const result = await summarizeThread(model, [
++    { from: 'customer', text: 'Where is my order?' },
++    { from: 'agent', text: 'Your order is on the way.' },
++  ]);
++
++  assert.equal(result.summary, 'Customer asked about order. Agent provided status.');
++  assert.equal(result.inputTokens, 100);
++  assert.equal(result.cachedInputTokens, 0);
++});
++
++test('answerAboutOrders returns text and tools used', async () => {
++  const model = scriptedModel([
++    { toolCalls: [{ name: 'orderLookup', input: { orderId: 'A100' } }], usage: [50, 10] },
++    { text: 'Your order A100 is shipped.', usage: [100, 15] },
++  ]);
++
++  const result = await answerAboutOrders(model, 'What is the status of order A100?', { customerId: 'C1' });
++
++  assert.equal(result.text, 'Your order A100 is shipped.');
++  assert.deepEqual(result.toolsUsed, ['orderLookup']);
++});
++
++test('answerAboutOrders with multiple tool calls', async () => {
++  const model = scriptedModel([
++    { toolCalls: [{ name: 'orderLookup', input: { orderId: 'A100' } }], usage: [50, 10] },
++    { toolCalls: [{ name: 'orderLookup', input: { orderId: 'A101' } }], usage: [60, 10] },
++    { text: 'Both orders are shipped.', usage: [100, 15] },
++  ]);
++
++  const result = await answerAboutOrders(model, 'What is the status of orders A100 and A101?', { customerId: 'C1' });
++
++  assert.equal(result.text, 'Both orders are shipped.');
++  assert.deepEqual(result.toolsUsed, ['orderLookup', 'orderLookup']);
++});
++
++test('classifyTicket returns classified ticket', async () => {
++  const model = scriptedModel([
++    { text: '{"category":"billing","urgent":true}', usage: [50, 10] },
++  ]);
++
++  const result = await classifyTicket(model, 'I was charged twice for my order!');
++
++  assert.equal(result.category, 'billing');
++  assert.equal(result.urgent, true);
++});
++
++test('continueChat returns updated history with assistant response', async () => {
++  const model = scriptedModel([
++    { text: 'Your current orders are...', usage: [50, 10] },
++  ]);
++
++  const history = [
++    { role: 'user', content: 'What are my orders?' },
++    { role: 'assistant', content: 'Let me check.' },
++  ];
++
++  const result = await continueChat(model, history, 'Please list them.', { customerId: 'C1' });
++
++  assert.equal(result.length, 4); // 2 history + 1 new user + 1 assistant response
++  assert.equal(result[2].role, 'user');
++  assert.equal(result[2].content, 'Please list them.');
++  assert.equal(result[3].role, 'assistant');
++  assert.equal(result[3].content, 'Your current orders are...');
++});
++
++test('continueChat with tool use', async () => {
++  const model = scriptedModel([
++    { toolCalls: [{ name: 'orderLookup', input: { orderId: 'A100' } }], usage: [50, 10] },
++    { text: 'Order A100 is shipped.', usage: [100, 15] },
++  ]);
++
++  const history = [{ role: 'user', content: 'What are my orders?' }];
++
++  const result = await continueChat(model, history, 'Show me order A100.', { customerId: 'C1' });
++
++  assert.ok(result.length > 2);
++  assert.equal(result[0].role, 'user');
++  assert.equal(result[0].content, 'What are my orders?');
++  assert.equal(result[1].role, 'user');
++  assert.equal(result[1].content, 'Show me order A100.');
++});

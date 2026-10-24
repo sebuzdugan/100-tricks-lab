@@ -1,0 +1,479 @@
+diff --git a/packages/frai-cli/README.md b/packages/frai-cli/README.md
+index ce5733b..d7e90e2 100644
+--- a/packages/frai-cli/README.md
++++ b/packages/frai-cli/README.md
+@@ -79,7 +79,7 @@ Generated artefacts live in your current working directory. Supplementary comman
+ |---------|---------|
+ | `frai [options]` | Interactive documentation workflow with backward-compatible shortcut flags. |
+ | `frai generate [options]` | Explicit interactive workflow command. |
+-| `frai scan [--ci] [--json]` | Scan the repository for AI/ML indicators. |
++| `frai scan [directory] [--ci] [--json]` | Scan the repository (or the given directory) for AI/ML indicators. |
+ | `frai setup [--key <apiKey>] [--global]` | Store an OpenAI API key locally or globally. |
+ | `frai config` | Show key configuration status. |
+ | `frai docs list` / `frai docs clean` / `frai docs export` | Manage generated documentation. |
+@@ -103,7 +103,7 @@ Runs the interactive documentation flow. Optional flags add shortcuts:
+ Same workflow as the default command, but scoped to documentation only. Options mirror the defaults: `--scan`, `--ci`, `--key`, `--global`, `--export-pdf`, and `--show-config`.
+ 
+ ### `frai scan`
+-Scans the repository for AI-related libraries, functions, and files. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
++Scans the repository for AI-related libraries, functions, and files. Pass a directory to scan it instead of the current one (`frai scan services/api`); a missing directory exits with an error. Use `--ci` for non-interactive mode or `--json` to emit raw JSON.
+ 
+ ### `frai setup`
+ Guided API key storage. Supply `--key <apiKey>` for headless use and `--global` to persist at `~/.config/frai/config`.
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..cf33698 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -640,16 +640,25 @@ async function main() {
+     });
+ 
+   program
+-    .command('scan')
+-    .description('Scan the current codebase for AI/ML artefacts.')
++    .command('scan [directory]')
++    .description('Scan a codebase (default: current directory) for AI/ML artefacts.')
+     .option('--ci', 'Run in CI mode')
+     .option('--json', 'Print raw JSON results')
+-    .action((options: { ci?: boolean; json?: boolean }) => {
+-      runScanCommand({
+-        ci: Boolean(options.ci),
+-        json: Boolean(options.json),
+-        silent: false
+-      });
++    .action((directory: string | undefined, options: { ci?: boolean; json?: boolean }) => {
++      const root = directory ? path.resolve(process.cwd(), directory) : process.cwd();
++      try {
++        runScanCommand({
++          root,
++          ci: Boolean(options.ci),
++          json: Boolean(options.json),
++          silent: false
++        });
++      } catch (error) {
++        log.error('Scan failed.', {
++          error: error instanceof Error ? error.message : String(error)
++        });
++        process.exit(1);
++      }
+     });
+ 
+   program
+diff --git a/packages/frai-core/src/scanners/constants.js b/packages/frai-core/src/scanners/constants.js
+index 173ee48..5d1a93f 100644
+--- a/packages/frai-core/src/scanners/constants.js
++++ b/packages/frai-core/src/scanners/constants.js
+@@ -13,7 +13,11 @@ export const DEFAULT_CODE_EXTENSIONS = [
+   '.py',
+   '.ipynb',
+   '.js',
++  '.mjs',
++  '.cjs',
+   '.ts',
++  '.mts',
++  '.cts',
+   '.jsx',
+   '.tsx',
+   '.r',
+@@ -23,6 +27,12 @@ export const DEFAULT_CODE_EXTENSIONS = [
+ ];
+ 
+ export const DEFAULT_AI_LIBRARIES = [
++  // LLM SDKs (Python and JavaScript/TypeScript)
++  'openai',
++  'anthropic',
++  '@anthropic-ai/sdk',
++  'langchain',
++  '@langchain',
+   // Python ML/AI libraries
+   'sklearn',
+   'scikit-learn',
+diff --git a/packages/frai-core/src/scanners/detectors.js b/packages/frai-core/src/scanners/detectors.js
+index a2c4586..2f75e61 100644
+--- a/packages/frai-core/src/scanners/detectors.js
++++ b/packages/frai-core/src/scanners/detectors.js
+@@ -2,6 +2,7 @@ import {
+   DEFAULT_AI_FUNCTIONS,
+   DEFAULT_AI_LIBRARIES
+ } from './constants.js';
++import { extractImportedModules, moduleMatchesLibrary } from './imports.js';
+ 
+ const uniqPush = (store, key, value) => {
+   const list = store[key] || (store[key] = []);
+@@ -13,9 +14,9 @@ const uniqPush = (store, key, value) => {
+ export const createLibraryDetector = (libraries = DEFAULT_AI_LIBRARIES) => ({
+   id: 'libraries',
+   analyze({ content, filePath, result }) {
++    const { separator, modules } = extractImportedModules(filePath, content);
+     for (const library of libraries) {
+-      const regex = new RegExp(`(import|from|require\\s*\\(\\s*['"\`])\\s*${library}`, 'i');
+-      if (regex.test(content)) {
++      if (modules.some((moduleName) => moduleMatchesLibrary(moduleName, library, separator))) {
+         uniqPush(result.aiLibraryMatches, filePath, library);
+         result.markAiFile(filePath);
+       }
+diff --git a/packages/frai-core/src/scanners/detectors.test.js b/packages/frai-core/src/scanners/detectors.test.js
+new file mode 100644
+index 0000000..010bac7
+--- /dev/null
++++ b/packages/frai-core/src/scanners/detectors.test.js
+@@ -0,0 +1,136 @@
++import fs from 'fs';
++import os from 'os';
++import path from 'path';
++import { describe, expect, it } from 'vitest';
++
++import { createLibraryDetector } from './detectors.js';
++import { scanCodebase } from './index.js';
++
++const detect = (filePath, content, libraries) => {
++  const result = {
++    aiLibraryMatches: {},
++    markAiFile() {}
++  };
++  createLibraryDetector(libraries).analyze({ filePath, content, result });
++  return result.aiLibraryMatches[filePath] ?? [];
++};
++
++const detectJs = (content, filePath = '/repo/src/client.ts') => detect(filePath, content);
++const detectPy = (content) => detect('/repo/app.py', content);
++
++describe('createLibraryDetector: JavaScript/TypeScript imports', () => {
++  it.each([
++    ["import OpenAI from 'openai';", ['openai']],
++    ['import type { Message } from "@anthropic-ai/sdk";', ['@anthropic-ai/sdk']],
++    ["import {\n  ChatOpenAI,\n  type Foo\n} from '@langchain/openai';", ['@langchain']],
++    ["import * as lc from 'langchain/tools';", ['langchain']],
++    ["import 'openai/shims';", ['openai']],
++    ["export { default } from 'anthropic';", ['anthropic']],
++    ["export * from '@langchain/core/messages';", ['@langchain']],
++    ["const OpenAI = require('openai');", ['openai']],
++    ["const sdk = require ( \"@anthropic-ai/sdk\" );", ['@anthropic-ai/sdk']],
++    ["const mod = await import('openai');", ['openai']],
++    ["import x = require('anthropic');", ['anthropic']]
++  ])('detects %s', (content, expected) => {
++    expect(detectJs(content)).toEqual(expected);
++  });
++
++  it('scans .mjs, .cjs, .mts and .cts files', () => {
++    for (const ext of ['.mjs', '.cjs', '.mts', '.cts']) {
++      expect(detectJs("import OpenAI from 'openai';", `/repo/a${ext}`)).toEqual(['openai']);
++    }
++  });
++
++  it('reports each library once, even when several modules map to it', () => {
++    const content = [
++      "import { ChatOpenAI } from '@langchain/openai';",
++      "import { PromptTemplate } from '@langchain/core/prompts';",
++      "import { tool } from 'langchain/tools';",
++      "import { tool as t2 } from 'langchain';"
++    ].join('\n');
++    expect(detectJs(content)).toEqual(['langchain', '@langchain']);
++  });
++
++  it('does not match a different module that starts with the same letters', () => {
++    expect(detectJs("import m from 'openai-mock';")).toEqual([]);
++    expect(detectJs("import c from 'caretaker';", '/repo/a.js')).toEqual([]);
++    expect(detectJs("import l from 'langchainjs-utils';")).toEqual([]);
++    expect(detectJs("import l from '@langchain-utils/x';")).toEqual([]);
++  });
++
++  it('ignores relative imports and commented-out imports', () => {
++    expect(detectJs("import OpenAI from './openai';")).toEqual([]);
++    expect(detectJs("import c from '../anthropic/client';")).toEqual([]);
++    expect(detectJs("// import OpenAI from 'openai';")).toEqual([]);
++    expect(detectJs("/* import OpenAI from 'openai'; */\nconst x = 1;")).toEqual([]);
++    expect(detectJs("const url = 'https://api.openai.com'; // import 'openai'")).toEqual([]);
++  });
++
++  it('does not treat a non-import use of from() as an import', () => {
++    expect(detectJs("const xs = Array.from('openai');")).toEqual([]);
++  });
++});
++
++describe('createLibraryDetector: Python imports', () => {
++  it.each([
++    ['import openai', ['openai']],
++    ['import numpy as np, anthropic', ['anthropic']],
++    ['import openai.resources', ['openai']],
++    ['from torch.nn import functional as F', ['torch']],
++    ['from langchain.chains import LLMChain', ['langchain']],
++    ['  import torch  # the openai and anthropic SDKs are not used here', ['torch']]
++  ])('detects %j', (content, expected) => {
++    expect(detectPy(content)).toEqual(expected);
++  });
++
++  it('ignores comments, docstrings, relative imports and names imported from other modules', () => {
++    expect(detectPy('# import openai')).toEqual([]);
++    expect(detectPy('"""\nimport openai\n"""\nx = 1')).toEqual([]);
++    expect(detectPy('from . import openai')).toEqual([]);
++    expect(detectPy('from .openai import Client')).toEqual([]);
++    expect(detectPy('from utils import torch')).toEqual([]);
++    expect(detectPy('import openai_mock')).toEqual([]);
++  });
++});
++
++describe('createLibraryDetector: custom libraries', () => {
++  it('matches only the libraries it was given', () => {
++    expect(detectJs("import OpenAI from 'openai';", '/repo/a.ts')).toEqual(['openai']);
++    expect(detect('/repo/a.ts', "import OpenAI from 'openai';", ['fizz'])).toEqual([]);
++    expect(detect('/repo/a.ts', "import f from 'fizz/buzz';", ['fizz'])).toEqual(['fizz']);
++  });
++});
++
++describe('scanCodebase: detection and roots', () => {
++  it('finds LLM SDK usage in .mts files and reports the library names', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-llm-'));
++    try {
++      fs.writeFileSync(
++        path.join(tmpDir, 'triage.mts'),
++        "import Anthropic from '@anthropic-ai/sdk';\nimport { ChatOpenAI } from '@langchain/openai';\n"
++      );
++      const results = scanCodebase({ root: tmpDir });
++      const file = path.join(tmpDir, 'triage.mts');
++      expect(results.aiFiles).toEqual([file]);
++      expect(results.aiLibraryMatches[file]).toEqual(['@anthropic-ai/sdk', '@langchain']);
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++
++  it('throws when the root directory does not exist', () => {
++    const missing = path.join(os.tmpdir(), `frai-missing-${process.pid}-${Date.now()}`);
++    expect(() => scanCodebase({ root: missing })).toThrow(/does not exist or is not a directory/);
++  });
++
++  it('throws when the root is a file', () => {
++    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frai-scan-file-'));
++    try {
++      const file = path.join(tmpDir, 'app.py');
++      fs.writeFileSync(file, 'import openai\n');
++      expect(() => scanCodebase({ root: file })).toThrow(/is not a directory/);
++    } finally {
++      fs.rmSync(tmpDir, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/packages/frai-core/src/scanners/imports.js b/packages/frai-core/src/scanners/imports.js
+new file mode 100644
+index 0000000..2caf427
+--- /dev/null
++++ b/packages/frai-core/src/scanners/imports.js
+@@ -0,0 +1,197 @@
++import path from 'path';
++
++const JS_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts']);
++
++const JS_SPECIFIER_PATTERNS = [
++  // import x from '…', import type { X } from '…', export { a } from '…', export * from '…'
++  /\b(?:import|export)\s+(?:type\s+)?[^;'"=()]*?\bfrom\s*(['"])([^'"\r\n]+)\1/g,
++  // import '…'
++  /\bimport\s*(['"])([^'"\r\n]+)\1/g,
++  // import('…')
++  /\bimport\s*\(\s*(['"])([^'"\r\n]+)\1\s*\)/g,
++  // require('…')
++  /\brequire\s*\(\s*(['"])([^'"\r\n]+)\1\s*\)/g
++];
++
++const PY_FROM_IMPORT = /^\s*from\s+([A-Za-z_][\w.]*)\s+import\b/;
++const PY_IMPORT = /^\s*import\s+(.+?)\s*;?\s*$/;
++const PY_MODULE = /^[A-Za-z_][\w.]*$/;
++
++// Replace comments with spaces (keeping newlines) so line numbers and string literals survive.
++const blankJsComments = (source) => {
++  const out = [];
++  const len = source.length;
++  let i = 0;
++  while (i < len) {
++    const ch = source[i];
++    const next = source[i + 1];
++
++    if (ch === '"' || ch === "'" || ch === '`') {
++      out.push(ch);
++      i += 1;
++      while (i < len && source[i] !== ch) {
++        if (source[i] === '\\' && i + 1 < len) {
++          out.push(source[i], source[i + 1]);
++          i += 2;
++          continue;
++        }
++        // Quoted strings cannot span lines; stop so a stray quote cannot hide the rest of the file.
++        if (source[i] === '\n' && ch !== '`') break;
++        out.push(source[i]);
++        i += 1;
++      }
++      if (i < len && source[i] === ch) {
++        out.push(ch);
++        i += 1;
++      }
++      continue;
++    }
++
++    if (ch === '/' && next === '/') {
++      while (i < len && source[i] !== '\n') {
++        out.push(' ');
++        i += 1;
++      }
++      continue;
++    }
++
++    if (ch === '/' && next === '*') {
++      out.push('  ');
++      i += 2;
++      while (i < len && !(source[i] === '*' && source[i + 1] === '/')) {
++        out.push(source[i] === '\n' ? '\n' : ' ');
++        i += 1;
++      }
++      if (i < len) {
++        out.push('  ');
++        i += 2;
++      }
++      continue;
++    }
++
++    out.push(ch);
++    i += 1;
++  }
++  return out.join('');
++};
++
++// Replace Python comments and string bodies with spaces, so docstrings and
++// commented-out imports cannot produce matches.
++const blankPythonCommentsAndStrings = (source) => {
++  const out = [];
++  const len = source.length;
++  const blank = (c) => (c === '\n' ? '\n' : ' ');
++  let i = 0;
++  while (i < len) {
++    const ch = source[i];
++
++    if (ch === '#') {
++      while (i < len && source[i] !== '\n') {
++        out.push(' ');
++        i += 1;
++      }
++      continue;
++    }
++
++    if (ch === '"' || ch === "'") {
++      const triple = source.startsWith(ch.repeat(3), i);
++      const delim = triple ? ch.repeat(3) : ch;
++      out.push(delim);
++      i += delim.length;
++      while (i < len && !source.startsWith(delim, i)) {
++        if (source[i] === '\\' && i + 1 < len) {
++          out.push(' ', blank(source[i + 1]));
++          i += 2;
++          continue;
++        }
++        if (!triple && source[i] === '\n') break;
++        out.push(blank(source[i]));
++        i += 1;
++      }
++      if (i < len && source.startsWith(delim, i)) {
++        out.push(delim);
++        i += delim.length;
++      }
++      continue;
++    }
++
++    out.push(ch);
++    i += 1;
++  }
++  return out.join('');
++};
++
++const findJsModules = (source) => {
++  const modules = [];
++  for (const pattern of JS_SPECIFIER_PATTERNS) {
++    for (const match of source.matchAll(pattern)) {
++      modules.push(match[2]);
++    }
++  }
++  return modules;
++};
++
++const findPythonModules = (source) => {
++  const modules = [];
++  for (const line of source.split('\n')) {
++    const fromMatch = PY_FROM_IMPORT.exec(line);
++    if (fromMatch) {
++      modules.push(fromMatch[1]);
++      continue;
++    }
++    const importMatch = PY_IMPORT.exec(line);
++    if (importMatch) {
++      for (const item of importMatch[1].split(',')) {
++        const moduleName = item.trim().split(/\s+as\s+/)[0].trim();
++        if (PY_MODULE.test(moduleName)) {
++          modules.push(moduleName);
++        }
++      }
++    }
++  }
++  return modules;
++};
++
++// Jupyter notebooks are JSON; only the code cells hold Python source.
++const notebookSource = (content) => {
++  try {
++    const notebook = JSON.parse(content);
++    return (notebook.cells ?? [])
++      .filter((cell) => cell.cell_type === 'code')
++      .map((cell) => [cell.source].flat().join(''))
++      .join('\n');
++  } catch {
++    return content;
++  }
++};
++
++/**
++ * Returns the module names a source file imports, plus the separator that
++ * separates a package from its sub-modules in that language.
++ * JS/TS use '/' (`openai/resources`, `@langchain/openai`); Python and other
++ * languages use '.' (`torch.nn`).
++ */
++export const extractImportedModules = (filePath, content) => {
++  const ext = path.extname(filePath).toLowerCase();
++  if (JS_EXTENSIONS.has(ext)) {
++    return { separator: '/', modules: findJsModules(blankJsComments(content)) };
++  }
++  if (ext === '.ipynb') {
++    return { separator: '.', modules: findPythonModules(blankPythonCommentsAndStrings(notebookSource(content))) };
++  }
++  if (ext === '.py') {
++    return { separator: '.', modules: findPythonModules(blankPythonCommentsAndStrings(content)) };
++  }
++  // Other languages (Java, Scala, R, …): match the Python-style `import a.b` form after stripping C-style comments.
++  return { separator: '.', modules: findPythonModules(blankJsComments(content)) };
++};
++
++/**
++ * A library matches a module when it is the module itself or one of its sub-modules.
++ * `openai` matches `openai` and `openai/resources`, but not `openai-mock`.
++ */
++export const moduleMatchesLibrary = (moduleName, library, separator) => {
++  const mod = moduleName.toLowerCase();
++  const lib = library.toLowerCase();
++  return mod === lib || mod.startsWith(`${lib}${separator}`);
++};
+diff --git a/packages/frai-core/src/scanners/index.js b/packages/frai-core/src/scanners/index.js
+index da38640..8e41d15 100644
+--- a/packages/frai-core/src/scanners/index.js
++++ b/packages/frai-core/src/scanners/index.js
+@@ -46,6 +46,16 @@ export function scanCodebase(options = {}) {
+     fs: fsModule
+   } = config;
+ 
++  let rootStats = null;
++  try {
++    rootStats = fsModule.statSync(root);
++  } catch {
++    // Reported below with the same message as a non-directory root.
++  }
++  if (!rootStats?.isDirectory()) {
++    throw new Error(`Scan root does not exist or is not a directory: ${root}`);
++  }
++
+   const result = createResult();
+ 
+   function scanDirectory(dir) {

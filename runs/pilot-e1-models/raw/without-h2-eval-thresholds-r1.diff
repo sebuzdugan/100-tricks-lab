@@ -1,0 +1,398 @@
+diff --git a/README.md b/README.md
+index 18fb328..c7789e5 100644
+--- a/README.md
++++ b/README.md
+@@ -151,6 +151,7 @@ Generate evaluation reports for model outputs.
+ - `--references <file>` – JSON file with reference answers.
+ - `--report <path>` – output location (`frai-eval-report.json` by default).
+ - `--format <json|markdown>` – output format (defaults to JSON). Markdown reports include human-readable summaries for review boards.
++- `--threshold <metric=min>` – minimum score for a metric, e.g. `--threshold exact_match=0.9`. Repeatable. A metric without a score fails its threshold. The report is written either way and records the outcome (`passed` and `thresholds` in JSON, a "Thresholds" section in Markdown). The command exits 1 if any threshold fails and 0 otherwise. A malformed value, a minimum outside 0 to 1, or an unknown metric id exits 2 and writes no report. Valid ids: `exact_match`, `toxicity`, `length_variance`.
+ 
+ ### `frai finetune`
+ Fine-tuning governance helpers:
+diff --git a/packages/frai-cli/README.md b/packages/frai-cli/README.md
+index ce5733b..686541a 100644
+--- a/packages/frai-cli/README.md
++++ b/packages/frai-cli/README.md
+@@ -130,6 +130,7 @@ Generate evaluation reports for model outputs.
+ - `--references <file>` – JSON file with reference answers.
+ - `--report <path>` – output location (`frai-eval-report.json` by default).
+ - `--format <json|markdown>` – output format (defaults to JSON). Markdown reports include human-readable summaries for review boards.
++- `--threshold <metric=min>` – minimum score for a metric, e.g. `--threshold exact_match=0.9`. Repeatable. A metric without a score fails its threshold. The report is written either way and records the outcome (`passed` and `thresholds` in JSON, a "Thresholds" section in Markdown). The command exits 1 if any threshold fails and 0 otherwise. A malformed value, a minimum outside 0 to 1, or an unknown metric id exits 2 and writes no report. Valid ids: `exact_match`, `toxicity`, `length_variance`.
+ 
+ ### `frai finetune`
+ Fine-tuning governance helpers:
+diff --git a/packages/frai-cli/src/index.ts b/packages/frai-cli/src/index.ts
+index 99bd58b..17930bd 100644
+--- a/packages/frai-cli/src/index.ts
++++ b/packages/frai-cli/src/index.ts
+@@ -53,8 +53,11 @@ interface EvalOptions {
+   references?: string;
+   report?: string;
+   format?: 'json' | 'markdown';
++  threshold?: string[];
+ }
+ 
++class UsageError extends Error {}
++
+ interface RagOptions {
+   input?: string | string[];
+   output?: string;
+@@ -473,7 +476,35 @@ function assertFileExists(targetPath: string) {
+   }
+ }
+ 
++function parseThresholdOptions(specs: string[]): Record<string, number> | undefined {
++  if (!specs.length) return undefined;
++
++  const thresholds: Record<string, number> = {};
++  specs.forEach((spec) => {
++    const parts = spec.split('=');
++    const metric = (parts[0] ?? '').trim();
++    const value = (parts[1] ?? '').trim();
++    if (parts.length !== 2 || !metric) {
++      throw new UsageError(`Invalid --threshold "${spec}": expected <metric>=<min>, for example exact_match=0.9.`);
++    }
++    if (!/^(\d+(\.\d+)?|\.\d+)$/.test(value) || Number(value) > 1) {
++      throw new UsageError(`Invalid --threshold "${spec}": minimum must be a number between 0 and 1.`);
++    }
++    if (!Eval.DEFAULT_METRIC_IDS.includes(metric)) {
++      throw new UsageError(
++        `Unknown metric "${metric}" in --threshold. Valid metric ids: ${Eval.DEFAULT_METRIC_IDS.join(', ')}.`
++      );
++    }
++    if (metric in thresholds) {
++      throw new UsageError(`Metric "${metric}" was given more than once in --threshold.`);
++    }
++    thresholds[metric] = Number(value);
++  });
++  return thresholds;
++}
++
+ function runEvalCommand(options: EvalOptions) {
++  const thresholds = parseThresholdOptions(options.threshold ?? []);
+   assertFileExists(options.outputs);
+   const dataset = (Eval.loadDataset as unknown as (config: unknown) => any)({
+     outputsPath: options.outputs,
+@@ -486,7 +517,8 @@ function runEvalCommand(options: EvalOptions) {
+   const report = (Eval.generateReport as unknown as (config: unknown) => any)({
+     evaluations,
+     outputsPath: dataset.outputsPath,
+-    referencesPath: dataset.referencesPath
++    referencesPath: dataset.referencesPath,
++    thresholds
+   });
+   const resolvedPath = (Eval.writeReport as unknown as (config: unknown) => string)({
+     report,
+@@ -494,6 +526,14 @@ function runEvalCommand(options: EvalOptions) {
+     reportPath: options.report
+   });
+   log.success('Evaluation report generated.', { path: resolvedPath });
++
++  if (report.passed === false) {
++    const failed = report.thresholds
++      .filter((threshold: { passed: boolean }) => !threshold.passed)
++      .map((threshold: { metric: string }) => threshold.metric);
++    log.error('Evaluation thresholds not met.', { failed });
++    process.exitCode = 1;
++  }
+ }
+ 
+ function runRagIndexCommand(options: RagOptions) {
+@@ -712,6 +752,12 @@ async function main() {
+     .option('--references <file>', 'Path to JSON file containing reference outputs')
+     .option('--report <path>', 'Report path (default: frai-eval-report.json)')
+     .option('--format <format>', 'Report format (json or markdown)', 'json')
++    .option(
++      '--threshold <metric=min>',
++      'Fail (exit 1) when a metric score is below a minimum, e.g. exact_match=0.9 (repeatable)',
++      (value: string, previous: string[]) => [...previous, value],
++      []
++    )
+     .action((options: EvalOptions) => {
+       runEvalCommand(options);
+     });
+@@ -764,6 +810,10 @@ async function main() {
+   try {
+     await program.parseAsync(process.argv);
+   } catch (error) {
++    if (error instanceof UsageError) {
++      log.error(error.message);
++      process.exit(2);
++    }
+     log.error('CLI execution failed.', {
+       error: error instanceof Error ? error.message : String(error)
+     });
+diff --git a/packages/frai-core/src/eval/index.js b/packages/frai-core/src/eval/index.js
+index d2d2fbe..f52d661 100644
+--- a/packages/frai-core/src/eval/index.js
++++ b/packages/frai-core/src/eval/index.js
+@@ -2,12 +2,14 @@ import fs from 'fs';
+ import path from 'path';
+ 
+ import {
++  DEFAULT_METRIC_IDS,
+   DEFAULT_METRICS,
+   exactMatchMetric,
+   lengthVarianceMetric,
+   toxicityMetric
+ } from './metrics.js';
+ import { resolveReportPath, toJson, toMarkdown } from './reporters.js';
++import { evaluateThresholds } from './thresholds.js';
+ 
+ const defaultFs = fs;
+ 
+@@ -63,6 +65,7 @@ export function generateReport({
+   evaluations,
+   outputsPath,
+   referencesPath,
++  thresholds,
+   generatedAt = new Date().toISOString()
+ }) {
+   const totalSamples = evaluations.reduce((total, metric) => {
+@@ -70,7 +73,7 @@ export function generateReport({
+     return total;
+   }, 0);
+ 
+-  return {
++  const report = {
+     metadata: {
+       generatedAt,
+       outputsPath,
+@@ -79,6 +82,15 @@ export function generateReport({
+     },
+     metrics: evaluations
+   };
++
++  if (thresholds === undefined) return report;
++
++  const results = evaluateThresholds({ evaluations, thresholds });
++  return {
++    ...report,
++    passed: results.every((result) => result.passed),
++    thresholds: results
++  };
+ }
+ 
+ export function writeReport({
+@@ -94,6 +106,7 @@ export function writeReport({
+ }
+ 
+ export {
++  DEFAULT_METRIC_IDS,
+   DEFAULT_METRICS,
+   exactMatchMetric,
+   toxicityMetric,
+@@ -106,6 +119,7 @@ export default {
+   generateReport,
+   writeReport,
+   DEFAULT_METRICS,
++  DEFAULT_METRIC_IDS,
+   exactMatchMetric,
+   toxicityMetric,
+   lengthVarianceMetric
+diff --git a/packages/frai-core/src/eval/index.test.js b/packages/frai-core/src/eval/index.test.js
+index 2cac2fb..b83efe8 100644
+--- a/packages/frai-core/src/eval/index.test.js
++++ b/packages/frai-core/src/eval/index.test.js
+@@ -4,11 +4,13 @@ import path from 'path';
+ import { afterEach, describe, expect, it } from 'vitest';
+ 
+ import {
++  exactMatchMetric,
+   generateReport,
+   loadDataset,
+   runEvaluations,
+   writeReport
+ } from './index.js';
++import { toMarkdown } from './reporters.js';
+ 
+ const tmpDirs = [];
+ afterEach(() => {
+@@ -76,4 +78,107 @@ describe('Evaluation harness', () => {
+     expect(fs.existsSync(jsonPath)).toBe(true);
+     expect(fs.existsSync(markdownPath)).toBe(true);
+   });
++
++  it('leaves reports unchanged when no thresholds are given', () => {
++    const evaluations = runEvaluations({ outputs: ['Hello'], references: ['hello'] });
++    const report = generateReport({ evaluations, outputsPath: 'o.json', generatedAt: 'now' });
++
++    expect(report).not.toHaveProperty('passed');
++    expect(report).not.toHaveProperty('thresholds');
++  });
++
++  it('records passing and failing thresholds in the report', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello', 'World'],
++      references: ['hello', 'planet']
++    });
++    const passing = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { exact_match: 0.5 }
++    });
++    expect(passing.passed).toBe(true);
++    expect(passing.thresholds).toEqual([
++      { metric: 'exact_match', min: 0.5, score: 0.5, passed: true }
++    ]);
++
++    const failing = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { exact_match: 0.9, length_variance: 0.9 }
++    });
++    expect(failing.passed).toBe(false);
++    expect(failing.thresholds.map((result) => result.passed)).toEqual([false, true]);
++  });
++
++  it('fails a threshold for a metric with no score instead of passing', () => {
++    const evaluations = runEvaluations({ outputs: ['Hello'] });
++    const report = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { exact_match: 0 }
++    });
++
++    expect(report.thresholds).toEqual([
++      { metric: 'exact_match', min: 0, score: null, passed: false }
++    ]);
++    expect(report.passed).toBe(false);
++  });
++
++  it('fails a threshold for a metric that was not evaluated', () => {
++    const evaluations = runEvaluations({
++      outputs: ['Hello'],
++      references: ['hello'],
++      metrics: [exactMatchMetric]
++    });
++    const report = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { length_variance: 0.5 }
++    });
++
++    expect(report.thresholds[0]).toMatchObject({ metric: 'length_variance', score: null, passed: false });
++  });
++
++  it('applies thresholds to custom metrics', () => {
++    const customMetric = () => ({ id: 'helpfulness', label: 'Helpfulness', score: 0.7, total: 1 });
++    const evaluations = runEvaluations({
++      outputs: ['Hello'],
++      metrics: [customMetric]
++    });
++    const report = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { helpfulness: 0.8 }
++    });
++
++    expect(report.thresholds).toEqual([
++      { metric: 'helpfulness', min: 0.8, score: 0.7, passed: false }
++    ]);
++  });
++
++  it('rejects thresholds outside 0 to 1', () => {
++    const evaluations = runEvaluations({ outputs: ['Hello'], references: ['hello'] });
++    [1.5, -0.1, '0.9', NaN].forEach((min) => {
++      expect(() => generateReport({
++        evaluations,
++        outputsPath: 'o.json',
++        thresholds: { exact_match: min }
++      })).toThrow(RangeError);
++    });
++  });
++
++  it('renders a Thresholds section in markdown reports', () => {
++    const evaluations = runEvaluations({ outputs: ['Hello'], references: ['hello'] });
++    const report = generateReport({
++      evaluations,
++      outputsPath: 'o.json',
++      thresholds: { exact_match: 1, length_variance: 0.99 }
++    });
++    const markdown = toMarkdown(report);
++
++    expect(markdown).toContain('## Thresholds');
++    expect(markdown).toContain('| exact_match | 1 | 1 | PASS |');
++    expect(markdown).toContain('| length_variance | 0.99 | 1 | PASS |');
++  });
+ });
+diff --git a/packages/frai-core/src/eval/metrics.js b/packages/frai-core/src/eval/metrics.js
+index 67e20f5..93a6f87 100644
+--- a/packages/frai-core/src/eval/metrics.js
++++ b/packages/frai-core/src/eval/metrics.js
+@@ -132,8 +132,12 @@ export const DEFAULT_METRICS = [
+   lengthVarianceMetric
+ ];
+ 
++// Each metric reports its id even when given no samples, so ids are read from empty runs.
++export const DEFAULT_METRIC_IDS = DEFAULT_METRICS.map((metric) => metric([], []).id);
++
+ export default {
+   DEFAULT_METRICS,
++  DEFAULT_METRIC_IDS,
+   exactMatchMetric,
+   toxicityMetric,
+   lengthVarianceMetric
+diff --git a/packages/frai-core/src/eval/reporters.js b/packages/frai-core/src/eval/reporters.js
+index 6cdb9a5..70643f8 100644
+--- a/packages/frai-core/src/eval/reporters.js
++++ b/packages/frai-core/src/eval/reporters.js
+@@ -35,6 +35,19 @@ export function toMarkdown(report) {
+     }
+     lines.push('');
+   });
++  if (Array.isArray(report.thresholds)) {
++    lines.push('## Thresholds');
++    lines.push('');
++    lines.push(`- **Outcome:** ${report.passed ? 'PASS' : 'FAIL'}`);
++    lines.push('');
++    lines.push('| Metric | Minimum | Score | Result |');
++    lines.push('| --- | --- | --- | --- |');
++    report.thresholds.forEach((threshold) => {
++      const result = threshold.passed ? 'PASS' : 'FAIL';
++      lines.push(`| ${threshold.metric} | ${threshold.min} | ${threshold.score ?? 'n/a'} | ${result} |`);
++    });
++    lines.push('');
++  }
+   lines.push('---');
+   lines.push('*Generated by FRAI Evaluation Harness*');
+   return lines.join('\n');
+diff --git a/packages/frai-core/src/eval/thresholds.js b/packages/frai-core/src/eval/thresholds.js
+new file mode 100644
+index 0000000..b55013f
+--- /dev/null
++++ b/packages/frai-core/src/eval/thresholds.js
+@@ -0,0 +1,32 @@
++const isValidMinimum = (value) =>
++  typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
++
++export function validateThresholds(thresholds) {
++  if (typeof thresholds !== 'object' || thresholds === null || Array.isArray(thresholds)) {
++    throw new TypeError('thresholds must be an object mapping metric ids to minimum scores.');
++  }
++  Object.entries(thresholds).forEach(([metric, min]) => {
++    if (!isValidMinimum(min)) {
++      throw new RangeError(`Threshold for "${metric}" must be a number between 0 and 1 (got ${String(min)}).`);
++    }
++  });
++  return thresholds;
++}
++
++// A threshold passes when the metric has a numeric score at or above its minimum.
++// A missing metric or a metric without a score fails rather than passing silently.
++export function evaluateThresholds({ evaluations = [], thresholds }) {
++  validateThresholds(thresholds);
++  return Object.entries(thresholds).map(([metric, min]) => {
++    const evaluation = evaluations.find((item) => item?.id === metric);
++    const score = typeof evaluation?.score === 'number' && Number.isFinite(evaluation.score)
++      ? evaluation.score
++      : null;
++    return { metric, min, score, passed: score !== null && score >= min };
++  });
++}
++
++export default {
++  validateThresholds,
++  evaluateThresholds
++};

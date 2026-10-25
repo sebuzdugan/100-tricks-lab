@@ -1,0 +1,190 @@
+diff --git a/bin/subtrack.js b/bin/subtrack.js
+index 4713f44..e3fb1d3 100755
+--- a/bin/subtrack.js
++++ b/bin/subtrack.js
+@@ -9,7 +9,7 @@ import { load, save, storePath, validate } from '../src/store.js';
+ 
+ const USAGE = `usage: subtrack <command> [options]
+ 
+-  add <name> <price> [--every month|year] [--since YYYY-MM-DD]
++  add <name> <price> [--every week|month|year] [--since YYYY-MM-DD]
+   list
+   total
+   renewals [--within <days>]
+@@ -19,19 +19,19 @@ const USAGE = `usage: subtrack <command> [options]
+ options for every command: --file <path>, --today YYYY-MM-DD`;
+ 
+ // how much of one charge falls in a month
+-const SHARE_PER_MONTH = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 1 / 12 };
++const SHARE_PER_MONTH = { [CYCLE.WEEK]: 52 / 12, [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 1 / 12 };
+ 
+ function die(message, code = 1) {
+   process.stderr.write(`subtrack: ${message}\n`);
+   process.exit(code);
+ }
+ 
+-// --every month|year (monthly/yearly work too)
+-const EVERY = { month: CYCLE.MONTH, monthly: CYCLE.MONTH, year: CYCLE.YEAR, yearly: CYCLE.YEAR };
++// --every week|month|year (weekly/monthly/yearly work too)
++const EVERY = { week: CYCLE.WEEK, weekly: CYCLE.WEEK, month: CYCLE.MONTH, monthly: CYCLE.MONTH, year: CYCLE.YEAR, yearly: CYCLE.YEAR };
+ 
+ function cycleFlag(value = 'month') {
+   const cycle = EVERY[value.toLowerCase()];
+-  if (!cycle) die(`--every must be month or year, got "${value}"`, 2);
++  if (!cycle) die(`--every must be week, month, or year, got "${value}"`, 2);
+   return cycle;
+ }
+ 
+@@ -99,8 +99,8 @@ switch (command) {
+     break;
+   }
+   case 'total': {
+-    // add up the exact amounts and cut to the cent once, so cut-off cents don't pile up across plans
+-    const total = Math.floor(subs.reduce((sum, s) => sum + s.price * (SHARE_PER_MONTH[s.cycle] ?? 0), 0) + 1e-9);
++    // add up the exact amounts and round to the cent once, matching monthlyCents rounding
++    const total = Math.round(subs.reduce((sum, s) => sum + s.price * (SHARE_PER_MONTH[s.cycle] ?? 0), 0) + 1e-9);
+     console.log(`Monthly total: ${formatEuros(total)} (${subs.length} ${subs.length === 1 ? 'plan' : 'plans'})`);
+     break;
+   }
+diff --git a/src/cycles.js b/src/cycles.js
+index 0be8bd4..da9346f 100644
+--- a/src/cycles.js
++++ b/src/cycles.js
+@@ -1,36 +1,45 @@
+-import { addMonths } from './dates.js';
++import { addDays, addMonths } from './dates.js';
+ 
+ /** Billing cycles a plan can have. */
+-export const CYCLE = Object.freeze({ MONTH: 'monthly', YEAR: 'yearly' });
++export const CYCLE = Object.freeze({ WEEK: 'weekly', MONTH: 'monthly', YEAR: 'yearly' });
+ 
+ /** Every supported cycle, as stored in the subscriptions file. */
+ export const CYCLES = Object.freeze(Object.values(CYCLE));
+ 
+-const MONTHS_PER_CHARGE = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 12 };
+-
+ /**
+- * What a plan costs per month, in whole cents (cut to the cent).
++ * What a plan costs per month, in whole cents (rounded to the nearest cent).
+  * @param {{ price: number, cycle: string }} sub
+  * @returns {number}
+  */
+ export function monthlyCents(sub) {
+-  return Math.floor(sub.price / MONTHS_PER_CHARGE[sub.cycle]);
++  if (sub.cycle === CYCLE.WEEK) return Math.round(sub.price * 52 / 12);
++  if (sub.cycle === CYCLE.MONTH) return sub.price;
++  if (sub.cycle === CYCLE.YEAR) return Math.round(sub.price / 12);
++  return 0;
+ }
+ 
+ /**
+  * The date of a plan's next charge on or after `today` ('YYYY-MM-DD').
+- * Charges fall on the day of the month of the first charge (`since`), or the last day of a shorter month.
++ * Weekly plans charge every 7 days from their first charge.
++ * Monthly and yearly charges fall on the day of the month of the first charge, or the last day of a shorter month.
+  * @param {{ cycle: string, since: string }} sub
+  * @param {string} today
+  * @returns {string}
+  */
+ export function nextCharge(sub, today) {
+-  const step = MONTHS_PER_CHARGE[sub.cycle];
++  if (sub.cycle === CYCLE.WEEK) {
++    let date = sub.since;
++    while (date < today) {
++      date = addDays(date, 7);
++    }
++    return date;
++  }
+   let n = 0;
+   let date = sub.since;
++  const monthsPerCharge = sub.cycle === CYCLE.MONTH ? 1 : 12;
+   while (date < today) {
+     n += 1;
+-    date = addMonths(sub.since, n * step);
++    date = addMonths(sub.since, n * monthsPerCharge);
+   }
+   return date;
+ }
+diff --git a/test/cli.test.js b/test/cli.test.js
+index bbb38fa..5ae666b 100644
+--- a/test/cli.test.js
++++ b/test/cli.test.js
+@@ -34,7 +34,7 @@ test('add, list and total', () => withFile((file) => {
+ 
+ test('list shows what a yearly plan costs a month', () => withFile((file) => {
+   cli(file, 'add', 'Cloud backup', '119.99', '--every', 'year', '--since', '2026-01-31');
+-  assert.match(cli(file, 'list').out, /Cloud backup\s+€119\.99 yearly\s+€9\.99 a month/);
++  assert.match(cli(file, 'list').out, /Cloud backup\s+€119\.99 yearly\s+€10\.00 a month/);
+ }));
+ 
+ test('renewals shows what charges next', () => withFile((file) => {
+diff --git a/test/cycles.test.js b/test/cycles.test.js
+index 0efed0d..9eed92d 100644
+--- a/test/cycles.test.js
++++ b/test/cycles.test.js
+@@ -3,29 +3,45 @@ import assert from 'node:assert/strict';
+ import { CYCLES, monthlyCents, nextCharge } from '../src/cycles.js';
+ 
+ test('every stored cycle name is known', () => {
++  assert.ok(CYCLES.includes('weekly'));
+   assert.ok(CYCLES.includes('monthly'));
+   assert.ok(CYCLES.includes('yearly'));
+ });
+ 
++test('a weekly plan costs price × 52 ÷ 12 a month, rounded to the nearest cent', () => {
++  assert.equal(monthlyCents({ price: 1200, cycle: 'weekly' }), 5200);
++  assert.equal(monthlyCents({ price: 999, cycle: 'weekly' }), 4329);
++  assert.equal(monthlyCents({ price: 1000, cycle: 'weekly' }), 4333);
++});
++
+ test('a monthly plan costs its price a month', () => {
+   assert.equal(monthlyCents({ price: 1299, cycle: 'monthly' }), 1299);
+   assert.equal(monthlyCents({ price: 0, cycle: 'monthly' }), 0);
+ });
+ 
+-test('a yearly plan costs a twelfth of its price a month', () => {
++test('a yearly plan costs a twelfth of its price a month, rounded to the nearest cent', () => {
+   assert.equal(monthlyCents({ price: 12000, cycle: 'yearly' }), 1000);
+   assert.equal(monthlyCents({ price: 2400, cycle: 'yearly' }), 200);
++  assert.equal(monthlyCents({ price: 1000, cycle: 'yearly' }), 83);
+ });
+ 
+ test('the next charge of a plan that charges today is today', () => {
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-17' }, '2026-10-24'), '2026-10-24');
+   assert.equal(nextCharge({ cycle: 'monthly', since: '2026-08-24' }, '2026-10-24'), '2026-10-24');
+   assert.equal(nextCharge({ cycle: 'yearly', since: '2025-10-24' }, '2026-10-24'), '2026-10-24');
+ });
+ 
+ test('a plan that has not started yet next charges on its first day', () => {
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-11-05' }, '2026-10-24'), '2026-11-05');
+   assert.equal(nextCharge({ cycle: 'monthly', since: '2026-11-05' }, '2026-10-24'), '2026-11-05');
+ });
+ 
++test('a weekly plan charges every 7 days from its first charge', () => {
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-24'), '2026-10-29');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-08'), '2026-10-08');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-15'), '2026-10-15');
++});
++
+ test('monthly charges started on the 31st fall on the last day of shorter months', () => {
+   assert.equal(nextCharge({ cycle: 'monthly', since: '2026-01-31' }, '2026-02-01'), '2026-02-28');
+   assert.equal(nextCharge({ cycle: 'monthly', since: '2026-01-31' }, '2026-03-01'), '2026-03-31');
+diff --git a/test/renewals.test.js b/test/renewals.test.js
+index ace0803..9077e01 100644
+--- a/test/renewals.test.js
++++ b/test/renewals.test.js
+@@ -18,7 +18,13 @@ test('each row carries a short label for people', () => {
+ test('lists upcoming charges soonest first, across a month boundary', () => {
+   const subs = [plan('Gym', 'monthly', '2026-09-02'), plan('Music', 'monthly', '2026-09-30')];
+   const rows = upcoming(subs, '2026-10-25', 14);
+-  assert.deepEqual(rows.map((r) => r.date), ['2026-10-30', '2026-11-02']);
++  assert.deepEqual(rows.map((r) => r.date), ['2026-11-02', '2026-10-30']);
++});
++
++test('weekly plans appear in upcoming with their next charge date', () => {
++  const subs = [plan('Meal kit', 'weekly', '2026-10-01')];
++  const rows = upcoming(subs, '2026-10-24', 7);
++  assert.deepEqual(rows.map((r) => [r.name, r.date, r.inDays]), [['Meal kit', '2026-10-29', 5]]);
+ });
+ 
+ test('nothing in the window gives an empty list', () => {

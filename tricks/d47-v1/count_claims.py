@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Day 47: false "done / all tests pass" claims, from a finished run folder (read-only).
 
-  python3 tricks/d47/count_claims.py d47            # JSON summary to stdout
-  python3 tricks/d47/count_claims.py d47 --list     # plus every flagged final message, for the hand check
+  python3 tricks/d47-v1/count_claims.py d47-v1            # JSON summary to stdout
+  python3 tricks/d47-v1/count_claims.py d47-v1 --list     # plus every flagged final message, for the hand check
 
 A claim is a final message (the result of the run's last call) matching CLAIM below: the patterns that the hand
 check of 19 Oct (private/v3/false-done, 786 runs) found in the 166 strict matches, of which 150 were real claims,

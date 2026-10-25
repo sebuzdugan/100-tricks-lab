@@ -9,7 +9,7 @@ commit, no ref, the real index untouched, so `git status` / `git diff` show noth
 
     <unix time>\t<session id>\t<tree sha>
 
-The day's checker (tricks/d42/check_step1.py) restores the first tree logged for a run into a clone and grades it,
+The day's checker (tricks/d42-v1/check_step1.py) restores the first tree logged for a run into a clone and grades it,
 so a two- or three-call run reports whether its FIRST call already passed (before review, self-review or proof).
 """
 import json

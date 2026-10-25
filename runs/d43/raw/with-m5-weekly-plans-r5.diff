@@ -1,0 +1,200 @@
+diff --git a/bin/subtrack.js b/bin/subtrack.js
+index 4713f44..7e0a8ce 100755
+--- a/bin/subtrack.js
++++ b/bin/subtrack.js
+@@ -9,7 +9,7 @@ import { load, save, storePath, validate } from '../src/store.js';
+ 
+ const USAGE = `usage: subtrack <command> [options]
+ 
+-  add <name> <price> [--every month|year] [--since YYYY-MM-DD]
++  add <name> <price> [--every month|year|week] [--since YYYY-MM-DD]
+   list
+   total
+   renewals [--within <days>]
+@@ -19,19 +19,19 @@ const USAGE = `usage: subtrack <command> [options]
+ options for every command: --file <path>, --today YYYY-MM-DD`;
+ 
+ // how much of one charge falls in a month
+-const SHARE_PER_MONTH = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 1 / 12 };
++const SHARE_PER_MONTH = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 1 / 12, [CYCLE.WEEK]: 52 / 12 };
+ 
+ function die(message, code = 1) {
+   process.stderr.write(`subtrack: ${message}\n`);
+   process.exit(code);
+ }
+ 
+-// --every month|year (monthly/yearly work too)
+-const EVERY = { month: CYCLE.MONTH, monthly: CYCLE.MONTH, year: CYCLE.YEAR, yearly: CYCLE.YEAR };
++// --every month|year|week (monthly/yearly/weekly work too)
++const EVERY = { month: CYCLE.MONTH, monthly: CYCLE.MONTH, year: CYCLE.YEAR, yearly: CYCLE.YEAR, week: CYCLE.WEEK, weekly: CYCLE.WEEK };
+ 
+ function cycleFlag(value = 'month') {
+   const cycle = EVERY[value.toLowerCase()];
+-  if (!cycle) die(`--every must be month or year, got "${value}"`, 2);
++  if (!cycle) die(`--every must be month, year, or week, got "${value}"`, 2);
+   return cycle;
+ }
+ 
+diff --git a/src/cycles.js b/src/cycles.js
+index 0be8bd4..15fc7c7 100644
+--- a/src/cycles.js
++++ b/src/cycles.js
+@@ -1,12 +1,12 @@
+-import { addMonths } from './dates.js';
++import { addDays, addMonths } from './dates.js';
+ 
+ /** Billing cycles a plan can have. */
+-export const CYCLE = Object.freeze({ MONTH: 'monthly', YEAR: 'yearly' });
++export const CYCLE = Object.freeze({ MONTH: 'monthly', YEAR: 'yearly', WEEK: 'weekly' });
+ 
+ /** Every supported cycle, as stored in the subscriptions file. */
+ export const CYCLES = Object.freeze(Object.values(CYCLE));
+ 
+-const MONTHS_PER_CHARGE = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 12 };
++const MONTHS_PER_CHARGE = { [CYCLE.MONTH]: 1, [CYCLE.YEAR]: 12, [CYCLE.WEEK]: 12 / 52 };
+ 
+ /**
+  * What a plan costs per month, in whole cents (cut to the cent).
+@@ -20,11 +20,19 @@ export function monthlyCents(sub) {
+ /**
+  * The date of a plan's next charge on or after `today` ('YYYY-MM-DD').
+  * Charges fall on the day of the month of the first charge (`since`), or the last day of a shorter month.
++ * Weekly charges fall every 7 days from `since`.
+  * @param {{ cycle: string, since: string }} sub
+  * @param {string} today
+  * @returns {string}
+  */
+ export function nextCharge(sub, today) {
++  if (sub.cycle === CYCLE.WEEK) {
++    let date = sub.since;
++    while (date < today) {
++      date = addDays(date, 7);
++    }
++    return date;
++  }
+   const step = MONTHS_PER_CHARGE[sub.cycle];
+   let n = 0;
+   let date = sub.since;
+diff --git a/src/export.js b/src/export.js
+index dea8f89..e42af29 100644
+--- a/src/export.js
++++ b/src/export.js
+@@ -4,7 +4,7 @@ import { plainEuros } from './money.js';
+ const HEADER = ['name', 'price', 'cycle', 'monthly_cost', 'next_charge'];
+ 
+ // how many months one charge pays for
+-const MONTHS = { monthly: 1, yearly: 12 };
++const MONTHS = { monthly: 1, yearly: 12, weekly: 12 / 52 };
+ 
+ function cell(value) {
+   const s = String(value);
+diff --git a/src/renewals.js b/src/renewals.js
+index 8c70e17..de8386e 100644
+--- a/src/renewals.js
++++ b/src/renewals.js
+@@ -17,5 +17,5 @@ export function upcoming(subs, today, within = 30) {
+       rows.push({ name: sub.name, date, when: shortLabel(date), inDays, price: sub.price, cycle: sub.cycle });
+     }
+   }
+-  return rows.sort((a, b) => a.when.localeCompare(b.when) || a.name.localeCompare(b.name));
++  return rows.sort((a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name));
+ }
+diff --git a/test/cli-weekly.test.js b/test/cli-weekly.test.js
+new file mode 100644
+index 0000000..fed0f40
+--- /dev/null
++++ b/test/cli-weekly.test.js
+@@ -0,0 +1,67 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { spawnSync } from 'node:child_process';
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const BIN = fileURLToPath(new URL('../bin/subtrack.js', import.meta.url));
++
++function cli(file, ...args) {
++  const r = spawnSync(process.execPath, [BIN, ...args, '--file', file], { encoding: 'utf8' });
++  return { code: r.status, out: r.stdout, err: r.stderr };
++}
++
++function withFile(fn) {
++  const dir = mkdtempSync(join(tmpdir(), 'subtrack-cli-'));
++  try {
++    fn(join(dir, 'subs.json'));
++  } finally {
++    rmSync(dir, { recursive: true, force: true });
++  }
++}
++
++test('add and list weekly plan', () => withFile((file) => {
++  const add = cli(file, 'add', 'Meal kit', '59.90', '--every', 'week');
++  assert.equal(add.code, 0);
++  assert.match(add.out, /Added Meal kit: €59\.90 weekly, €259\.56 a month\./);
++
++  const list = cli(file, 'list');
++  assert.equal(list.code, 0);
++  assert.match(list.out, /Meal kit\s+€59\.90 weekly\s+€259\.56 a month/);
++}));
++
++test('weekly plan shows in renewals every 7 days', () => withFile((file) => {
++  cli(file, 'add', 'Meal kit', '59.90', '--every', 'week', '--since', '2026-10-25');
++
++  const r1 = cli(file, 'renewals', '--within', '7', '--today', '2026-10-25');
++  assert.match(r1.out, /25 Oct.*Meal kit.*€59\.90/);
++
++  const r2 = cli(file, 'renewals', '--within', '7', '--today', '2026-11-01');
++  assert.match(r2.out, /1 Nov.*Meal kit.*€59\.90/);
++
++  const r3 = cli(file, 'renewals', '--within', '7', '--today', '2026-11-08');
++  assert.match(r3.out, /8 Nov.*Meal kit.*€59\.90/);
++}));
++
++test('export includes weekly plan with correct monthly cost', () => withFile((file) => {
++  cli(file, 'add', 'Meal kit', '59.90', '--every', 'week', '--since', '2026-10-25');
++  const exp = cli(file, 'export', '--today', '2026-10-25');
++  assert.equal(exp.code, 0);
++  assert.equal(exp.out, 'name,price,cycle,monthly_cost,next_charge\nMeal kit,59.90,weekly,259.56,2026-10-25\n');
++}));
++
++test('total includes weekly plan', () => withFile((file) => {
++  cli(file, 'add', 'Netflix', '12.99', '--since', '2026-09-14');
++  cli(file, 'add', 'Meal kit', '59.90', '--every', 'week', '--since', '2026-10-25');
++  const total = cli(file, 'total');
++  assert.equal(total.code, 0);
++  assert.match(total.out, /Monthly total: €272\.55/);
++}));
++
++test('bad --every week value is rejected', () => withFile((file) => {
++  const r = cli(file, 'add', 'X', '5', '--every', 'fortnight');
++  assert.equal(r.code, 2);
++  assert.match(r.err, /--every must be month, year, or week/);
++}));
+diff --git a/test/weekly.test.js b/test/weekly.test.js
+new file mode 100644
+index 0000000..7988005
+--- /dev/null
++++ b/test/weekly.test.js
+@@ -0,0 +1,20 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { CYCLE, monthlyCents, nextCharge } from '../src/cycles.js';
++
++test('weekly plan costs 52 weeks divided by 12 months', () => {
++  assert.equal(monthlyCents({ price: 1200, cycle: 'weekly' }), 5200);
++  assert.equal(monthlyCents({ price: 1299, cycle: 'weekly' }), 5629);
++});
++
++test('weekly plan next charge is every 7 days', () => {
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-01'), '2026-10-01');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-02'), '2026-10-08');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-08'), '2026-10-08');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-10-09'), '2026-10-15');
++});
++
++test('weekly plan handles multiple charges forward in time', () => {
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-11-01'), '2026-11-05');
++  assert.equal(nextCharge({ cycle: 'weekly', since: '2026-10-01' }, '2026-12-01'), '2026-12-03');
++});

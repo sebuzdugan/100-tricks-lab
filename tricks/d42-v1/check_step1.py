@@ -7,7 +7,7 @@ compact JSON (run.py keeps the last line, cut at 200 characters, in the row's `e
   {"snaps":N,"chg":0|1,"c2":0|1|null,"s1":true|false|null,"s1_reason":"..."}
 
   snaps      Stop-hook snapshots logged for this repo copy (one per call that ended normally; the overlay
-             tricks/d42/snap installs the hook on both sides). Only lines written after this copy was created are
+             tricks/d42-v1/snap installs the hook on both sides). Only lines written after this copy was created are
              counted, so a stale log from an earlier run at the same path is ignored (same rule as day 10).
   chg        1 if the repo at the end differs from the first snapshot (the later calls changed something)
   c2         1 if the second snapshot differs from the first (day 42: the read-only reviewer call changed files,

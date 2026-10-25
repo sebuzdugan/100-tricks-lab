@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Days 42, 44 and 48: first call vs end of run, per side, from a finished run folder (read-only).
 
-  python3 tricks/d42/count_steps.py d44                       # JSON summary to stdout
-  python3 tricks/d42/count_steps.py d42 --review-step 1 --sheet /path/review_sheet.csv
+  python3 tricks/d42-v1/count_steps.py d44-v1                      # JSON summary to stdout
+  python3 tricks/d42-v1/count_steps.py d42-v1 --review-step 1 --sheet /path/review_sheet.csv
 
 Reads runs/<id>/raw/<side>-<task>-r<n>.json: the graded row (passed, cost, minutes, infra error) and the row's
-`extra`, written by tricks/d42/check_step1.py ({"s1": first call passed?, "chg": later calls changed the repo?}).
+`extra`, written by tricks/d42-v1/check_step1.py ({"s1": first call passed?, "chg": later calls changed the repo?}).
 Per side, graded runs only (infra errors left out, as in the verdict rule):
 
   first_call_passes  runs whose first call alone passed the hidden tests

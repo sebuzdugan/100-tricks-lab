@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Days 46 and 49: which runs actually ran the tests, built, and ran the real CLI, from the saved events (read-only).
 
-  python3 tricks/d46/count_commands.py d46            # JSON summary to stdout
-  python3 tricks/d46/count_commands.py d46 --runs     # plus one line per run
+  python3 tricks/d46-v1/count_commands.py d46-v1            # JSON summary to stdout
+  python3 tricks/d46-v1/count_commands.py d46-v1 --runs     # plus one line per run
 
 Reads runs/<id>/raw/<side>-<task>-r<n>.events.jsonl (every tool call, PROTOCOL 15 Sep) and the graded row next to
 it. Shell commands are the Bash tool calls the agent made (denied ones included: a denied attempt still shows

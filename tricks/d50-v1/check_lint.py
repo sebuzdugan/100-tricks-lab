@@ -6,7 +6,7 @@ Usage (run.py's extra_check): check_lint.py <workdir> <side> <task>. Detail line
   {"lint":N,"type":N,"new":N,"hook_runs":N,"hook_fails":N,"hook_s":X}
 
   lint, type   ESLint errors / tsc errors left at the end in the files changed since lab-base, found with the very
-               same check the hooks run (tricks/d50/with/.claude/hooks/lint-check.py, identical on both sides)
+               same check the hooks run (tricks/d50-v1/with/.claude/hooks/lint-check.py, identical on both sides)
   new          errors the agent added: lint errors minus the lint errors those same files had at lab-base (ESLint on
                `git show lab-base:<file>` via --stdin), plus all type errors (tsc is clean on the baseline for
                frai-cli, frai-gate and frai-agent, measured 23 Oct). The pre-registered count is `new`.
@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 LAB = Path(__file__).resolve().parent.parent.parent
-_spec = importlib.util.spec_from_file_location("lintcheck", LAB / "tricks/d50/with/.claude/hooks/lint-check.py")
+_spec = importlib.util.spec_from_file_location("lintcheck", LAB / "tricks/d50-v1/with/.claude/hooks/lint-check.py")
 lc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(lc)
 

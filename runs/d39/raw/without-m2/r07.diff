@@ -1,0 +1,471 @@
+diff --git a/src/customers.js b/src/customers.js
+index e4f66cf..96b57e4 100644
+--- a/src/customers.js
++++ b/src/customers.js
+@@ -3,6 +3,15 @@ import { ok, fail } from './result.js';
+ 
+ const CUSTOMERS = JSON.parse(readFileSync(new URL('../data/customers.json', import.meta.url), 'utf8'));
+ 
++/**
++ * Discount percentages by customer tier.
++ */
++export const TIER_DISCOUNTS = {
++  gold: 5,
++  silver: 2.5,
++  standard: 0,
++};
++
+ /**
+  * All customers: { id, name, email, country, tier }.
+  */
+diff --git a/src/invoices.js b/src/invoices.js
+index a30d883..d195e76 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -1,5 +1,5 @@
+ import { ok, fail } from './result.js';
+-import { getCustomer } from './customers.js';
++import { getCustomer, TIER_DISCOUNTS } from './customers.js';
+ import { getProduct } from './catalogue.js';
+ import { nextInvoiceNumber } from './numbering.js';
+ import { roundCents } from './money.js';
+@@ -40,7 +40,10 @@ export function createInvoice({ customerId, issueDate, lines }) {
+   if (!Array.isArray(lines) || lines.length === 0) return fail('NO_LINES');
+ 
+   // Process lines
++  const customer = customerResult.value;
++  const tierDiscount = TIER_DISCOUNTS[customer.tier];
+   const invoiceLines = [];
++
+   for (const line of lines) {
+     // Validate qty
+     if (!Number.isInteger(line.qty) || line.qty <= 0) return fail('QTY_INVALID');
+@@ -63,9 +66,10 @@ export function createInvoice({ customerId, issueDate, lines }) {
+       vatRate: product.vatRate,
+     };
+ 
+-    // Add discount if provided
+-    if (line.discountPercent !== undefined) {
+-      newLine.discountPercent = line.discountPercent;
++    // Apply discount: explicit line discount wins, otherwise use tier discount
++    const discountPercent = line.discountPercent !== undefined ? line.discountPercent : tierDiscount;
++    if (discountPercent > 0) {
++      newLine.discountPercent = discountPercent;
+     }
+ 
+     invoiceLines.push(newLine);
+@@ -134,7 +138,12 @@ export function addLine(invoice, { sku, qty, discountPercent }) {
+   const productResult = getProduct(sku);
+   if (!productResult.ok) return productResult;
+ 
++  // Get customer for tier discount
++  const customerResult = getCustomer(invoice.customerId);
++  if (!customerResult.ok) return customerResult;
++
+   const product = productResult.value;
++  const tierDiscount = TIER_DISCOUNTS[customerResult.value.tier];
+   const newLines = invoice.lines.map((line) => ({ ...line }));
+ 
+   // Check if SKU already exists
+@@ -145,9 +154,16 @@ export function addLine(invoice, { sku, qty, discountPercent }) {
+       ...newLines[existingLineIndex],
+       qty: newLines[existingLineIndex].qty + qty,
+     };
+-    // Update discount if provided
++    // Update discount if provided, otherwise keep existing or apply tier discount
+     if (discountPercent !== undefined) {
+-      updated.discountPercent = discountPercent;
++      if (discountPercent > 0) {
++        updated.discountPercent = discountPercent;
++      } else {
++        delete updated.discountPercent;
++      }
++    } else if (!updated.discountPercent && tierDiscount > 0) {
++      // Apply tier discount if line doesn't have one
++      updated.discountPercent = tierDiscount;
+     }
+     newLines[existingLineIndex] = updated;
+   } else {
+@@ -159,8 +175,9 @@ export function addLine(invoice, { sku, qty, discountPercent }) {
+       unitPrice: product.unitPrice,
+       vatRate: product.vatRate,
+     };
+-    if (discountPercent !== undefined) {
+-      newLine.discountPercent = discountPercent;
++    const effectiveDiscount = discountPercent !== undefined ? discountPercent : tierDiscount;
++    if (effectiveDiscount > 0) {
++      newLine.discountPercent = effectiveDiscount;
+     }
+     newLines.push(newLine);
+   }
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 0cb8489..be565db 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -4,7 +4,7 @@ import { createInvoice, lineTotal, lineDiscount, invoiceTotals, addLine, removeL
+ 
+ test('createInvoice returns a draft invoice with enriched lines', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-001', // Gold tier: 5% discount
+     issueDate: '2025-01-15',
+     lines: [
+       { sku: 'DEV-HOUR', qty: 5 },
+@@ -18,22 +18,24 @@ test('createInvoice returns a draft invoice with enriched lines', () => {
+   assert.equal(result.value.status, 'draft');
+   assert.equal(result.value.lines.length, 2);
+ 
+-  // Check first line
++  // Check first line (gold tier 5% discount applied)
+   assert.deepEqual(result.value.lines[0], {
+     sku: 'DEV-HOUR',
+     name: 'Development (hour)',
+     qty: 5,
+     unitPrice: 9500,
+     vatRate: 21,
++    discountPercent: 5,
+   });
+ 
+-  // Check second line
++  // Check second line (gold tier 5% discount applied)
+   assert.deepEqual(result.value.lines[1], {
+     sku: 'LOGO-PACK',
+     name: 'Logo package',
+     qty: 1,
+     unitPrice: 120000,
+     vatRate: 21,
++    discountPercent: 5,
+   });
+ });
+ 
+@@ -231,7 +233,7 @@ test('invoiceTotals with empty lines', () => {
+ 
+ test('invoiceTotals calculated from createInvoice result', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-001', // Gold tier: 5% discount
+     issueDate: '2025-01-15',
+     lines: [
+       { sku: 'DEV-HOUR', qty: 5 },
+@@ -241,14 +243,16 @@ test('invoiceTotals calculated from createInvoice result', () => {
+ 
+   assert.equal(result.ok, true);
+   const totals = invoiceTotals(result.value);
+-  const expected = 5 * 9500 + 1 * 120000;
+-  assert.equal(totals.subtotal, expected);
+-  assert.equal(totals.total, expected);
++  const subtotal = 5 * 9500 + 1 * 120000; // 167500
++  const discount = (subtotal * 5) / 100; // 5% of 167500 = 8375
++  assert.equal(totals.subtotal, subtotal);
++  assert.equal(totals.discount, 8375);
++  assert.equal(totals.total, subtotal - 8375);
+ });
+ 
+ test('addLine adds a new line to a draft invoice', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-001', // Gold tier: 5% discount
+     issueDate: '2025-01-15',
+     lines: [{ sku: 'DEV-HOUR', qty: 5 }],
+   });
+@@ -264,6 +268,7 @@ test('addLine adds a new line to a draft invoice', () => {
+     qty: 5,
+     unitPrice: 9500,
+     vatRate: 21,
++    discountPercent: 5,
+   });
+   assert.deepEqual(addResult.value.lines[1], {
+     sku: 'LOGO-PACK',
+@@ -271,6 +276,7 @@ test('addLine adds a new line to a draft invoice', () => {
+     qty: 2,
+     unitPrice: 120000,
+     vatRate: 21,
++    discountPercent: 5,
+   });
+ });
+ 
+@@ -591,8 +597,8 @@ test('createInvoice accepts discountPercent on lines', () => {
+   });
+ 
+   assert.equal(result.ok, true);
+-  assert.equal(result.value.lines[0].discountPercent, 10);
+-  assert.equal(result.value.lines[1].discountPercent, 0);
++  assert.equal(result.value.lines[0].discountPercent, 10); // Explicit 10%
++  assert.equal(result.value.lines[1].discountPercent, undefined); // Explicit 0% means no discount
+ });
+ 
+ test('createInvoice fails with DISCOUNT_INVALID for invalid discount', () => {
+@@ -619,7 +625,12 @@ test('createInvoice accepts valid discount percentages including decimals', () =
+       lines: [{ sku: 'DEV-HOUR', qty: 1, discountPercent: discount }],
+     });
+     assert.equal(result.ok, true, `discount ${discount} should be valid`);
+-    assert.equal(result.value.lines[0].discountPercent, discount);
++    // 0 means no discount (no property), others are stored
++    if (discount === 0) {
++      assert.equal(result.value.lines[0].discountPercent, undefined);
++    } else {
++      assert.equal(result.value.lines[0].discountPercent, discount);
++    }
+   }
+ });
+ 
+@@ -723,3 +734,146 @@ test('addLine updates discount when adding to existing SKU', () => {
+   assert.equal(addResult.value.lines[0].qty, 8);
+   assert.equal(addResult.value.lines[0].discountPercent, 20);
+ });
++
++test('createInvoice applies gold tier discount automatically', () => {
++  // C-001 (Northwind Studio) is gold tier
++  const result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.lines[0].discountPercent, 5); // Gold = 5%
++});
++
++test('createInvoice applies silver tier discount automatically', () => {
++  // C-003 (Kite & Co) is silver tier
++  const result = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.lines[0].discountPercent, 2.5); // Silver = 2.5%
++});
++
++test('createInvoice applies standard tier discount (0) automatically', () => {
++  // C-002 (Blue Fern Bakery) is standard tier
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  // Standard tier has 0% discount, so no discountPercent property
++  assert.equal(result.value.lines[0].discountPercent, undefined);
++});
++
++test('createInvoice explicit discountPercent overrides tier discount', () => {
++  // C-001 is gold tier (5%), but explicitly set to 10%
++  const result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1, discountPercent: 10 }],
++  });
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.lines[0].discountPercent, 10);
++});
++
++test('createInvoice explicit 0 discount overrides tier discount', () => {
++  // C-001 is gold tier (5%), but explicitly set to 0%
++  const result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1, discountPercent: 0 }],
++  });
++
++  assert.equal(result.ok, true);
++  // Explicit 0 means no discount, so no discountPercent property
++  assert.equal(result.value.lines[0].discountPercent, undefined);
++});
++
++test('createInvoice mixed tier and explicit discounts on multiple lines', () => {
++  // C-001 is gold tier (5%)
++  const result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [
++      { sku: 'DEV-HOUR', qty: 1 }, // Should get gold tier 5%
++      { sku: 'LOGO-PACK', qty: 1, discountPercent: 15 }, // Explicit 15%
++      { sku: 'COPY-HOUR', qty: 1, discountPercent: 0 }, // Explicit 0%
++    ],
++  });
++
++  assert.equal(result.ok, true);
++  assert.equal(result.value.lines[0].discountPercent, 5); // Gold tier
++  assert.equal(result.value.lines[1].discountPercent, 15); // Explicit
++  assert.equal(result.value.lines[2].discountPercent, undefined); // Explicit 0
++});
++
++test('addLine applies gold tier discount to new line', () => {
++  const result = createInvoice({
++    customerId: 'C-001', // Gold tier
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const addResult = addLine(result.value, { sku: 'LOGO-PACK', qty: 1 });
++
++  assert.equal(addResult.ok, true);
++  assert.equal(addResult.value.lines[1].discountPercent, 5); // Gold tier
++});
++
++test('addLine explicit discount overrides tier for new line', () => {
++  const result = createInvoice({
++    customerId: 'C-001', // Gold tier = 5%
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const addResult = addLine(result.value, { sku: 'LOGO-PACK', qty: 1, discountPercent: 20 });
++
++  assert.equal(addResult.ok, true);
++  assert.equal(addResult.value.lines[1].discountPercent, 20); // Explicit wins
++});
++
++test('addLine explicit 0 discount overrides tier', () => {
++  const result = createInvoice({
++    customerId: 'C-001', // Gold tier = 5%
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const addResult = addLine(result.value, { sku: 'LOGO-PACK', qty: 1, discountPercent: 0 });
++
++  assert.equal(addResult.ok, true);
++  assert.equal(addResult.value.lines[1].discountPercent, undefined); // Explicit 0
++});
++
++test('invoiceTotals with tier discounts', () => {
++  // C-001 is gold tier (5%)
++  const result = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2025-01-15',
++    lines: [
++      { sku: 'DEV-HOUR', qty: 1 }, // 95.00 with 5% tier discount = 4.75 discount
++      { sku: 'LOGO-PACK', qty: 1, discountPercent: 10 }, // 1200.00 with 10% = 120.00 discount
++    ],
++  });
++
++  assert.equal(result.ok, true);
++  const totals = invoiceTotals(result.value);
++  // Subtotal = 95 + 1200 = 1295
++  // Discount = 4.75 + 120 = 124.75
++  // Total = 1295 - 124.75 = 1170.25
++  assert.equal(totals.subtotal, 129500);
++  assert.equal(totals.discount, 12475);
++  assert.equal(totals.total, 117025);
++});
+diff --git a/test/render.test.js b/test/render.test.js
+index 1e97d9c..493ddfc 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -82,11 +82,11 @@ test('renderInvoiceText formats prices with formatEuros', () => {
+ 
+ test('renderInvoiceText shows total line', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-001', // Gold tier: 5% discount
+     issueDate: '2025-01-15',
+     lines: [
+-      { sku: 'DEV-HOUR', qty: 5 }, // 5 * 9500 = 47500
+-      { sku: 'LOGO-PACK', qty: 1 }, // 1 * 120000 = 120000
++      { sku: 'DEV-HOUR', qty: 5 }, // 5 * 9500 = 47500, with 5% discount
++      { sku: 'LOGO-PACK', qty: 1 }, // 1 * 120000 = 120000, with 5% discount
+     ],
+   });
+ 
+@@ -95,14 +95,17 @@ test('renderInvoiceText shows total line', () => {
+ 
+   const lines = text.split('\n');
+   const totalLine = lines[lines.length - 1];
+-  assert.match(totalLine, /^Total: €/);
+-  // Total should be 47500 + 120000 = 167500 = €1,675.00
+-  assert.match(totalLine, /€1,675\.00/);
++  // Gold tier has discount, so shows expanded format
++  assert.match(totalLine, /Subtotal:/);
++  assert.match(totalLine, /Discount:/);
++  assert.match(totalLine, /Total:/);
++  // Total should be 167500 - (167500 * 0.05) = 159125 = €1,591.25
++  assert.match(totalLine, /€1,591\.25/);
+ });
+ 
+ test('renderInvoiceText with single item', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-001', // Gold tier: 5% discount
+     issueDate: '2025-01-15',
+     lines: [{ sku: 'SUPPORT-HOUR', qty: 3 }],
+   });
+@@ -114,12 +117,15 @@ test('renderInvoiceText with single item', () => {
+   assert.equal(lines[0], 'DRAFT');
+   assert.equal(lines[1], 'Northwind Studio');
+   assert.match(lines[2], /^3 Support \(hour\)/);
+-  assert.match(lines[3], /^Total: €/);
++  // Gold tier has discount, so shows expanded format
++  assert.match(lines[3], /Subtotal:/);
++  assert.match(lines[3], /Discount:/);
++  assert.match(lines[3], /Total:/);
+ });
+ 
+ test('renderInvoiceText with multiple items', () => {
+   const result = createInvoice({
+-    customerId: 'C-003',
++    customerId: 'C-003', // Silver tier: 2.5% discount
+     issueDate: '2025-02-20',
+     lines: [
+       { sku: 'DEV-HOUR', qty: 2 },
+@@ -138,7 +144,10 @@ test('renderInvoiceText with multiple items', () => {
+   assert.match(lines[2], /^2 Development \(hour\)/);
+   assert.match(lines[3], /^4 Copywriting \(hour\)/);
+   assert.match(lines[4], /^3 Icon set/);
+-  assert.match(lines[5], /^Total: €/);
++  // Silver tier has discount, so shows expanded format
++  assert.match(lines[5], /Subtotal:/);
++  assert.match(lines[5], /Discount:/);
++  assert.match(lines[5], /Total:/);
+ });
+ 
+ test('renderInvoiceText preserves line breaks structure', () => {
+@@ -165,7 +174,7 @@ test('renderInvoiceText preserves line breaks structure', () => {
+ 
+ test('renderInvoiceText with issued invoice and full data', () => {
+   const createResult = createInvoice({
+-    customerId: 'C-008',
++    customerId: 'C-008', // Lumen Records: gold tier: 5% discount
+     issueDate: '2025-03-10',
+     lines: [
+       { sku: 'PRINT-A4', qty: 500 },
+@@ -184,7 +193,10 @@ test('renderInvoiceText with issued invoice and full data', () => {
+   assert.equal(lines[1], 'Lumen Records');
+   assert.match(lines[2], /^500 Printed flyer A4/);
+   assert.match(lines[3], /^100 Printed poster A3/);
+-  assert.match(lines[4], /^Total: €/);
++  // Gold tier has discount, so shows expanded format
++  assert.match(lines[4], /Subtotal:/);
++  assert.match(lines[4], /Discount:/);
++  assert.match(lines[4], /Total:/);
+ });
+ 
+ test('renderInvoiceText formats small amounts correctly', () => {
+@@ -285,9 +297,9 @@ test('renderInvoiceText with multiple items with different discounts', () => {
+   assert.match(lines[4], /25% off/);
+ });
+ 
+-test('renderInvoiceText without discounts shows simple total line', () => {
++test('renderInvoiceText without tier discounts shows simple total line', () => {
+   const result = createInvoice({
+-    customerId: 'C-001',
++    customerId: 'C-002', // Standard tier: 0% discount (no tier discount)
+     issueDate: '2025-01-15',
+     lines: [
+       { sku: 'DEV-HOUR', qty: 1 },
+@@ -301,7 +313,7 @@ test('renderInvoiceText without discounts shows simple total line', () => {
+   const lines = text.split('\n');
+   const totalLine = lines[lines.length - 1];
+ 
+-  // Without discounts, should show simple "Total: " format
++  // Standard tier has no discount, so shows simple "Total: " format
+   assert.match(totalLine, /^Total: /);
+   assert(!totalLine.includes('Subtotal'));
+   assert(!totalLine.includes('Discount'));

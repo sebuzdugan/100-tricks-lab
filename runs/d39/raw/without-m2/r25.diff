@@ -1,0 +1,277 @@
+diff --git a/src/invoices.js b/src/invoices.js
+index 163fdf3..523536c 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -206,6 +206,7 @@ export function issueInvoice(invoice, existingNumbers) {
+     terms: invoice.terms,
+     dueDate: invoice.dueDate,
+     lines: invoice.lines.map((line) => ({ ...line })),
++    ...(invoice.voucher && { voucher: invoice.voucher }),
+   });
+ }
+ 
+diff --git a/src/render.js b/src/render.js
+index c8042ae..f6f46d4 100644
+--- a/src/render.js
++++ b/src/render.js
+@@ -1,6 +1,7 @@
+ import { getCustomer } from './customers.js';
+ import { lineTotal, lineDiscount, lineVat, invoiceTotals } from './invoices.js';
+ import { formatEuros } from './money.js';
++import { balanceDue } from './payments.js';
+ 
+ /**
+  * Render an invoice as plain text.
+@@ -41,6 +42,11 @@ export function renderInvoiceText(invoice) {
+     lines.push(`VAT: ${formatEuros(totals.vat)}`);
+   }
+ 
++  // Show voucher if present
++  if (totals.voucher > 0) {
++    lines.push(`Voucher: -${formatEuros(totals.voucher)}`);
++  }
++
+   // Total line
+   let totalLine = `Total: ${formatEuros(totals.total)}`;
+   if (totals.discount > 0) {
+@@ -48,5 +54,16 @@ export function renderInvoiceText(invoice) {
+   }
+   lines.push(totalLine);
+ 
++  // Due date line if invoice is issued or beyond
++  if (invoice.dueDate && invoice.status !== 'draft') {
++    lines.push(`Due: ${invoice.dueDate}`);
++  }
++
++  // Paid line if there are payments
++  if (invoice.payments && invoice.payments.length > 0) {
++    const totalPaid = invoice.payments.reduce((sum, p) => sum + p.amount, 0);
++    lines.push(`Paid: ${formatEuros(totalPaid)}`);
++  }
++
+   return lines.join('\n');
+ }
+diff --git a/test/render.test.js b/test/render.test.js
+index f43177c..fd19663 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
+ import { renderInvoiceText } from '../src/render.js';
+ import { createInvoice } from '../src/invoices.js';
+ import { issueInvoice } from '../src/invoices.js';
++import { applyVoucher } from '../src/invoices.js';
++import { recordPayment } from '../src/payments.js';
+ 
+ test('renderInvoiceText shows DRAFT for unsent invoice', () => {
+   const result = createInvoice({
+@@ -94,7 +96,7 @@ test('renderInvoiceText shows total line', () => {
+   const text = renderInvoiceText(result.value);
+ 
+   const lines = text.split('\n');
+-  const totalLine = lines[lines.length - 1];
++  const totalLine = lines.find((l) => l.includes('Total:'));
+   // Gold tier has discount, so shows expanded format
+   assert.match(totalLine, /Subtotal:/);
+   assert.match(totalLine, /Discount:/);
+@@ -275,7 +277,7 @@ test('renderInvoiceText shows subtotal and discount in total line when discounts
+   const text = renderInvoiceText(result.value);
+ 
+   const lines = text.split('\n');
+-  const totalLine = lines[lines.length - 1];
++  const totalLine = lines.find((l) => l.includes('Total:'));
+ 
+   // Should show subtotal, discount, and total
+   assert.match(totalLine, /Subtotal:/);
+@@ -326,7 +328,7 @@ test('renderInvoiceText without tier discounts shows simple total line', () => {
+   const text = renderInvoiceText(result.value);
+ 
+   const lines = text.split('\n');
+-  const totalLine = lines[lines.length - 1];
++  const totalLine = lines.find((l) => l.startsWith('Total:'));
+ 
+   // Standard tier has no discount, so shows simple "Total: " format
+   assert.match(totalLine, /^Total: /);
+@@ -411,8 +413,182 @@ test('renderInvoiceText with discount and VAT', () => {
+   // 95 - (95 * 0.05) = 90.25, VAT 21% of 90.25 = 18.9525, rounds to 1895
+   assert.match(vatLine, /€18\.95/);
+   // Should show expanded total line
+-  const totalLine = lines[lines.length - 1];
++  const totalLine = lines.find((l) => l.includes('Total:'));
+   assert.match(totalLine, /Subtotal:/);
+   assert.match(totalLine, /Discount:/);
+   assert.match(totalLine, /Total:/);
+ });
++
++test('renderInvoiceText shows voucher when applied', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const withVoucher = applyVoucher(result.value, { code: 'SAVE10', amount: 1000 });
++  assert.equal(withVoucher.ok, true);
++
++  const text = renderInvoiceText(withVoucher.value);
++  const lines = text.split('\n');
++
++  // Should show voucher line
++  const voucherLine = lines.find((l) => l.startsWith('Voucher:'));
++  assert(voucherLine);
++  assert.match(voucherLine, /€10\.00/);
++});
++
++test('renderInvoiceText shows due date for issued invoice', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++    terms: 'NET14',
++  });
++
++  assert.equal(result.ok, true);
++  const issued = issueInvoice(result.value, []);
++  assert.equal(issued.ok, true);
++
++  const text = renderInvoiceText(issued.value);
++  const lines = text.split('\n');
++
++  // Should show due date line
++  const dueLine = lines.find((l) => l.startsWith('Due:'));
++  assert(dueLine);
++  assert.match(dueLine, /2025-01-29/);
++});
++
++test('renderInvoiceText does not show due date for draft invoice', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const text = renderInvoiceText(result.value);
++  const lines = text.split('\n');
++
++  // Should not show due date line
++  const dueLine = lines.find((l) => l.startsWith('Due:'));
++  assert(!dueLine);
++});
++
++test('renderInvoiceText shows paid amount when payment recorded', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const issued = issueInvoice(result.value, []);
++  assert.equal(issued.ok, true);
++
++  const paid = recordPayment(issued.value, { amount: 5000, date: '2025-01-20' });
++  assert.equal(paid.ok, true);
++
++  const text = renderInvoiceText(paid.value);
++  const lines = text.split('\n');
++
++  // Should show paid line
++  const paidLine = lines.find((l) => l.startsWith('Paid:'));
++  assert(paidLine);
++  assert.match(paidLine, /€50\.00/);
++});
++
++test('renderInvoiceText shows total paid for multiple payments', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const issued = issueInvoice(result.value, []);
++  assert.equal(issued.ok, true);
++
++  const payment1 = recordPayment(issued.value, { amount: 3000, date: '2025-01-20' });
++  assert.equal(payment1.ok, true);
++
++  const payment2 = recordPayment(payment1.value, { amount: 2000, date: '2025-01-25' });
++  assert.equal(payment2.ok, true);
++
++  const text = renderInvoiceText(payment2.value);
++  const lines = text.split('\n');
++
++  // Should show total paid (3000 + 2000 = 5000 cents = €50.00)
++  const paidLine = lines.find((l) => l.startsWith('Paid:'));
++  assert(paidLine);
++  assert.match(paidLine, /€50\.00/);
++});
++
++test('renderInvoiceText does not show paid line when no payments', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++  });
++
++  assert.equal(result.ok, true);
++  const issued = issueInvoice(result.value, []);
++  assert.equal(issued.ok, true);
++
++  const text = renderInvoiceText(issued.value);
++  const lines = text.split('\n');
++
++  // Should not show paid line
++  const paidLine = lines.find((l) => l.startsWith('Paid:'));
++  assert(!paidLine);
++});
++
++test('renderInvoiceText shows all features together', () => {
++  const result = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2025-01-15',
++    lines: [{ sku: 'DEV-HOUR', qty: 1 }],
++    terms: 'NET30',
++  });
++
++  assert.equal(result.ok, true);
++  let invoice = result.value;
++
++  // Apply voucher
++  const withVoucher = applyVoucher(invoice, { code: 'SAVE', amount: 1000 });
++  assert.equal(withVoucher.ok, true);
++  invoice = withVoucher.value;
++
++  // Issue
++  const issued = issueInvoice(invoice, []);
++  assert.equal(issued.ok, true);
++  invoice = issued.value;
++
++  // Record payment
++  const paid = recordPayment(invoice, { amount: 5000, date: '2025-01-20' });
++  assert.equal(paid.ok, true);
++  invoice = paid.value;
++
++  const text = renderInvoiceText(invoice);
++  const lines = text.split('\n');
++
++  // Should contain all components
++  const voucherLine = lines.find((l) => l.startsWith('Voucher:'));
++  const dueLine = lines.find((l) => l.startsWith('Due:'));
++  const paidLine = lines.find((l) => l.startsWith('Paid:'));
++
++  assert(voucherLine, 'Should show voucher');
++  assert(dueLine, 'Should show due date');
++  assert(paidLine, 'Should show paid amount');
++
++  // Verify order: voucher before total, due date after total, paid after due
++  const voucherIdx = lines.findIndex((l) => l.startsWith('Voucher:'));
++  const totalIdx = lines.findIndex((l) => l.startsWith('Total:'));
++  const dueIdx = lines.findIndex((l) => l.startsWith('Due:'));
++  const paidIdx = lines.findIndex((l) => l.startsWith('Paid:'));
++
++  assert(voucherIdx < totalIdx, 'Voucher should come before Total');
++  assert(totalIdx < dueIdx, 'Total should come before Due');
++  assert(dueIdx < paidIdx, 'Due should come before Paid');
++});

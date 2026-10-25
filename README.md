@@ -78,6 +78,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 36 | Context7 docs server for a library newer than the model | 7/12 vs 0/12, faster and cheaper | ✅ keep |
 | 37 | One rule in CLAUDE.md vs said once in request 1 | 7/12 vs 5/12 clean runs over 15 requests | ✅ keep |
 | 38 | Paste the library docs vs give the links | 11/12 vs 3/12, links at twice the cost | ✅ keep |
+| 39 | Keep a NOTES.md the agent re-reads | 124/150 vs 127/150 requests kept, 11 compactions | 🟡 optional |
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 

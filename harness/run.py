@@ -299,8 +299,11 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     files, ins, dels = diffstat(work)
     extra = ""
     if trick.get("extra_check"):  # trick-specific measurement on the finished repo, before grading touches it
-        chk = subprocess.run([str(tdir / trick["extra_check"]), str(work), side, task], capture_output=True, text=True, timeout=300)
-        extra = (chk.stdout.strip().splitlines() or [""])[-1][:200]
+        try:  # same 900 s ceiling as the grader; a hung check is recorded, never fatal for the day (24 Oct, d42 r17)
+            chk = subprocess.run([str(tdir / trick["extra_check"]), str(work), side, task], capture_output=True, text=True, timeout=900)
+            extra = (chk.stdout.strip().splitlines() or [""])[-1][:200]
+        except subprocess.TimeoutExpired:
+            extra = '{"extra_check": "timeout after 900 s"}'
     if trick.get("record_compactions") and not dry:  # days 31-40: did /compact (or auto-compaction) actually happen
         extra = compaction_extra(extra, data.get("compactions") or [])
     passed, reason = (False, "infra error, not graded") if infra else grade(task, work)

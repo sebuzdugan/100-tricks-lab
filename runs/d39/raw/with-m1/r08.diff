@@ -1,0 +1,408 @@
+diff --git a/NOTES.md b/NOTES.md
+index dfef674..125f93a 100644
+--- a/NOTES.md
++++ b/NOTES.md
+@@ -59,3 +59,14 @@ Build invoicing functionality with createInvoice({ customerId, issueDate, lines
+ - createInvoice applies customer's tier discount when line has no explicit discountPercent
+ - Line's explicit discountPercent (even if 0) overrides tier discount
+ - All 86 tests pass (7 new for tier discounts, 79 from previous requests)
++
++## Request 8: VAT calculation
++✅ DONE — Added VAT calculation per line; updated invoiceTotals and renderInvoiceText.
++- VAT calculated per line on amount AFTER discount: roundCents((lineTotal - lineDiscount) * vatRate / 100)
++- invoiceTotals now returns { subtotal, discount, vat, total }
++  - subtotal = sum of line totals
++  - discount = sum of line discounts
++  - vat = sum of rounded line VATs (never percentage of invoice total)
++  - total = subtotal - discount + vat, clamped to ≥ 0
++- renderInvoiceText shows VAT line just above total (only if VAT > 0)
++- All 95 tests pass (9 new for VAT, updated 6 existing tests, 80 from previous requests)
+diff --git a/src/invoices.js b/src/invoices.js
+index a9f3d9d..fc1c2fc 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -89,22 +89,25 @@ export function lineTotal(line) {
+ 
+ /**
+  * Calculate subtotal and total for an invoice.
+- * @param {{ lines: Array<{ qty: number, unitPrice: number, discountPercent?: number }> }} invoice
+- * @returns {{ subtotal: number, discount: number, total: number }}
++ * @param {{ lines: Array<{ qty: number, unitPrice: number, discountPercent?: number, vatRate: number }> }} invoice
++ * @returns {{ subtotal: number, discount: number, vat: number, total: number }}
+  */
+ export function invoiceTotals(invoice) {
+   let subtotal = 0;
+   let discount = 0;
++  let vat = 0;
+ 
+   for (const line of invoice.lines) {
+     const lineAmount = lineTotal(line);
+     subtotal += lineAmount;
+     const lineDiscount = roundCents(lineAmount * (line.discountPercent ?? 0) / 100);
+     discount += lineDiscount;
++    const lineVat = roundCents((lineAmount - lineDiscount) * (line.vatRate / 100));
++    vat += lineVat;
+   }
+ 
+-  const total = Math.max(0, subtotal - discount);
+-  return { subtotal, discount, total };
++  const total = Math.max(0, subtotal - discount + vat);
++  return { subtotal, discount, vat, total };
+ }
+ 
+ /**
+diff --git a/src/render.js b/src/render.js
+index 003e28f..bedd662 100644
+--- a/src/render.js
++++ b/src/render.js
+@@ -1,8 +1,9 @@
+ import { formatEuros } from './money.js';
++import { invoiceTotals } from './invoices.js';
+ 
+ /**
+  * Render a plain-text invoice.
+- * @param {{ number?: string, customerId: string, customerName: string, issueDate: string, status: string, lines: Array<{ sku: string, name: string, qty: number, unitPrice: number, vatRate: number }> }} invoice
++ * @param {{ number?: string, customerId: string, customerName: string, issueDate: string, status: string, lines: Array<{ sku: string, name: string, qty: number, unitPrice: number, vatRate: number, discountPercent: number }> }} invoice
+  * @returns {string}
+  */
+ export function renderInvoiceText(invoice) {
+@@ -24,9 +25,16 @@ export function renderInvoiceText(invoice) {
+     lines.push(`${qtyStr}x ${line.name} @ ${priceStr} = ${totalStr}`);
+   }
+ 
++  // Calculate totals
++  const totals = invoiceTotals(invoice);
++
++  // Show VAT line if there's any VAT
++  if (totals.vat > 0) {
++    lines.push(`VAT: ${formatEuros(totals.vat)}`);
++  }
++
+   // Total line
+-  const total = invoice.lines.reduce((sum, line) => sum + line.qty * line.unitPrice, 0);
+-  lines.push(`Total: ${formatEuros(total)}`);
++  lines.push(`Total: ${formatEuros(totals.total)}`);
+ 
+   return lines.join('\n');
+ }
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 43a73bb..3513b0e 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -173,10 +173,13 @@ test('invoiceTotals with gold tier customer applies discount', () => {
+   const totals = invoiceTotals(result.value);
+   // 5*9500 + 1*120000 = 47500 + 120000 = 167500
+   // 5% gold discount = 8375
+-  // total = 159125
++  // Amount after discount = 159125
++  // VAT: 21% = 33416 (rounded)
++  // total = 167500 - 8375 + 33416 = 192541
+   assert.equal(totals.subtotal, 167500);
+   assert.equal(totals.discount, 8375);
+-  assert.equal(totals.total, 159125);
++  assert.equal(totals.vat, 33416);
++  assert.equal(totals.total, 192541);
+ });
+ 
+ test('invoiceTotals with empty lines', () => {
+@@ -187,10 +190,12 @@ test('invoiceTotals with empty lines', () => {
+ 
+ test('invoiceTotals with single line', () => {
+   const totals = invoiceTotals({
+-    lines: [{ qty: 10, unitPrice: 5000 }],
++    lines: [{ qty: 10, unitPrice: 5000, vatRate: 21, discountPercent: 0 }],
+   });
++  // 10*5000 = 50000, VAT 21% = 10500, Total = 60500
+   assert.equal(totals.subtotal, 50000);
+-  assert.equal(totals.total, 50000);
++  assert.equal(totals.vat, 10500);
++  assert.equal(totals.total, 60500);
+ });
+ 
+ test('addLine adds a new line to draft invoice', () => {
+@@ -476,19 +481,22 @@ test('createInvoice rejects non-numeric discountPercent', () => {
+   assert.deepEqual(result, { ok: false, error: 'DISCOUNT_INVALID' });
+ });
+ 
+-test('invoiceTotals includes discount', () => {
++test('invoiceTotals includes discount and VAT', () => {
+   const result = createInvoice({
+     customerId: 'C-001',
+     issueDate: '2026-10-07',
+     lines: [{ sku: 'DEV-HOUR', qty: 100, discountPercent: 10 }],
+   });
+   const totals = invoiceTotals(result.value);
+-  // 100 * 9500 = 950000 (€9500.00)
+-  // 10% discount = 95000 (€950.00)
+-  // total = 855000 (€8550.00)
++  // 100 * 9500 = 950000
++  // 10% discount = 95000
++  // Amount after discount = 855000
++  // 21% VAT = 179550
++  // total = 950000 - 95000 + 179550 = 1034550
+   assert.equal(totals.subtotal, 950000);
+   assert.equal(totals.discount, 95000);
+-  assert.equal(totals.total, 855000);
++  assert.equal(totals.vat, 179550);
++  assert.equal(totals.total, 1034550);
+ });
+ 
+ test('invoiceTotals with multiple lines and different discounts', () => {
+@@ -501,14 +509,16 @@ test('invoiceTotals with multiple lines and different discounts', () => {
+     ],
+   });
+   const totals = invoiceTotals(result.value);
+-  // DEV: 10*9500=95000, discount 10%=9500
+-  // DES: 5*8500=42500, discount 20%=8500
+-  // subtotal: 95000+42500=137500
+-  // discount: 9500+8500=18000
+-  // total: 137500-18000=119500
++  // DEV: 10*9500=95000, discount 10%=9500, after discount=85500, VAT 21%=17955
++  // DES: 5*8500=42500, discount 20%=8500, after discount=34000, VAT 21%=7140
++  // subtotal: 137500
++  // discount: 18000
++  // vat: 25095
++  // total: 137500-18000+25095=144595
+   assert.equal(totals.subtotal, 137500);
+   assert.equal(totals.discount, 18000);
+-  assert.equal(totals.total, 119500);
++  assert.equal(totals.vat, 25095);
++  assert.equal(totals.total, 144595);
+ });
+ 
+ test('invoiceTotals clamps negative totals to 0', () => {
+@@ -627,3 +637,101 @@ test('createInvoice with mixed line discounts uses line discount or tier', () =>
+   assert.equal(result.value.lines[0].discountPercent, 10);
+   assert.equal(result.value.lines[1].discountPercent, 5);
+ });
++
++test('invoiceTotals calculates VAT on discounted amount', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 100, unitPrice: 1000, vatRate: 21, discountPercent: 10 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  // Line total: 100*1000 = 100000
++  // Discount: 10% = 10000
++  // Amount after discount: 90000
++  // VAT: 21% of 90000 = 18900
++  // Total: 100000 - 10000 + 18900 = 108900
++  assert.equal(totals.subtotal, 100000);
++  assert.equal(totals.discount, 10000);
++  assert.equal(totals.vat, 18900);
++  assert.equal(totals.total, 108900);
++});
++
++test('invoiceTotals with 0% VAT has no VAT', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'WORKSHOP-DAY', name: 'Brand workshop (day, VAT exempt)', qty: 1, unitPrice: 60000, vatRate: 0, discountPercent: 0 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  assert.equal(totals.vat, 0);
++  assert.equal(totals.total, 60000);
++});
++
++test('invoiceTotals with mixed VAT rates', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++      { sku: 'PRINT-A4', name: 'Printed flyer A4 (each)', qty: 100, unitPrice: 37, vatRate: 9, discountPercent: 0 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  // Line 1: 10*1000=10000, VAT 21% = 2100
++  // Line 2: 100*37=3700, VAT 9% = 333
++  // Subtotal: 13700, VAT: 2433, Total: 16133
++  assert.equal(totals.subtotal, 13700);
++  assert.equal(totals.vat, 2433);
++  assert.equal(totals.total, 16133);
++});
++
++test('invoiceTotals with multiple lines and discounts and VAT', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 10, unitPrice: 9500, vatRate: 21, discountPercent: 10 },
++      { sku: 'DES-HOUR', name: 'Design work (hour)', qty: 5, unitPrice: 8500, vatRate: 21, discountPercent: 5 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  // Line 1: 10*9500=95000, discount 10%=9500, after discount=85500, VAT 21%=17955
++  // Line 2: 5*8500=42500, discount 5%=2125, after discount=40375, VAT 21%=8479 (rounded)
++  // Subtotal: 137500, Discount: 11625, VAT: 26434, Total: 152309
++  assert.equal(totals.subtotal, 137500);
++  assert.equal(totals.discount, 11625);
++  assert.equal(totals.vat, 26434);
++  assert.equal(totals.total, 152309);
++});
++
++test('invoiceTotals clamps negative total to 0 even with VAT', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 200 },
++    ],
++  };
++  const totals = invoiceTotals(invoice);
++  // Subtotal: 10000, Discount: 20000, VAT would be negative but clamped
++  // After discount: -10000 (clamped to 0)
++  // VAT on 0: 0
++  // Total clamped to 0
++  assert.equal(totals.subtotal, 10000);
++  assert.equal(totals.discount, 20000);
++  assert.equal(totals.total, 0);
++});
+diff --git a/test/render.test.js b/test/render.test.js
+index f36ccfb..901412d 100644
+--- a/test/render.test.js
++++ b/test/render.test.js
+@@ -53,13 +53,13 @@ test('renderInvoiceText shows each line item', () => {
+     issueDate: '2026-10-07',
+     status: 'draft',
+     lines: [
+-      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21 },
+-      { sku: 'LOGO-PACK', name: 'Logo package', qty: 1, unitPrice: 120000, vatRate: 21 },
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21, discountPercent: 0 },
++      { sku: 'LOGO-PACK', name: 'Logo package', qty: 1, unitPrice: 120000, vatRate: 21, discountPercent: 0 },
+     ],
+   };
+   const text = renderInvoiceText(invoice);
+   const lines = text.split('\n');
+-  assert.equal(lines.length, 5); // number, customer, 2 items, total
++  assert.equal(lines.length, 6); // number, customer, 2 items, VAT, total
+   assert.ok(lines[2].includes('5x Development (hour)'));
+   assert.ok(lines[2].includes('€95.00')); // 9500 cents = €95.00
+   assert.ok(lines[2].includes('€475.00')); // 5 * 9500 = 47500 cents = €475.00
+@@ -88,15 +88,17 @@ test('renderInvoiceText totals all line items', () => {
+     issueDate: '2026-10-07',
+     status: 'draft',
+     lines: [
+-      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21 },
+-      { sku: 'DES-HOUR', name: 'Design work (hour)', qty: 3, unitPrice: 8500, vatRate: 21 },
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21, discountPercent: 0 },
++      { sku: 'DES-HOUR', name: 'Design work (hour)', qty: 3, unitPrice: 8500, vatRate: 21, discountPercent: 0 },
+     ],
+   };
+   const text = renderInvoiceText(invoice);
+   const lines = text.split('\n');
+   const lastLine = lines[lines.length - 1];
+-  // 5*9500 + 3*8500 = 47500 + 25500 = 73000 cents = €730.00
+-  assert.ok(lastLine.startsWith('Total: €730.00'));
++  // Subtotal: 5*9500 + 3*8500 = 73000
++  // VAT: 73000 * 21% = 15330
++  // Total: 73000 + 15330 = 88330 cents = €883.30
++  assert.ok(lastLine.startsWith('Total: €883.30'));
+ });
+ 
+ test('renderInvoiceText with empty lines array', () => {
+@@ -119,12 +121,12 @@ test('renderInvoiceText preserves line breaks', () => {
+     issueDate: '2026-10-07',
+     status: 'draft',
+     lines: [
+-      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21 },
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 5, unitPrice: 9500, vatRate: 21, discountPercent: 0 },
+     ],
+   };
+   const text = renderInvoiceText(invoice);
+   const lines = text.split('\n');
+-  assert.equal(lines.length, 4); // number, customer, 1 item, total
++  assert.equal(lines.length, 5); // number, customer, 1 item, VAT, total
+ });
+ 
+ test('renderInvoiceText shows quantity and product name for each line', () => {
+@@ -134,9 +136,73 @@ test('renderInvoiceText shows quantity and product name for each line', () => {
+     issueDate: '2026-10-07',
+     status: 'draft',
+     lines: [
+-      { sku: 'ICON-SET', name: 'Icon set (24 icons)', qty: 2, unitPrice: 980, vatRate: 21 },
++      { sku: 'ICON-SET', name: 'Icon set (24 icons)', qty: 2, unitPrice: 980, vatRate: 21, discountPercent: 0 },
+     ],
+   };
+   const text = renderInvoiceText(invoice);
+   assert.ok(text.includes('2x Icon set (24 icons)'));
+ });
++
++test('renderInvoiceText shows VAT when invoice has VAT', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test Customer',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 100, unitPrice: 1000, vatRate: 21, discountPercent: 0 },
++    ],
++  };
++  const text = renderInvoiceText(invoice);
++  // 100*1000=100000, VAT 21%=21000
++  assert.ok(text.includes('VAT: €210.00'));
++});
++
++test('renderInvoiceText does not show VAT when invoice has no VAT', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test Customer',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'WORKSHOP-DAY', name: 'Brand workshop (day, VAT exempt)', qty: 1, unitPrice: 60000, vatRate: 0, discountPercent: 0 },
++    ],
++  };
++  const text = renderInvoiceText(invoice);
++  assert.ok(!text.includes('VAT:'));
++  assert.ok(text.includes('Total: €600.00'));
++});
++
++test('renderInvoiceText shows VAT on separate line', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test Customer',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 10, unitPrice: 1000, vatRate: 21, discountPercent: 10 },
++    ],
++  };
++  const text = renderInvoiceText(invoice);
++  const lines = text.split('\n');
++  // Should have: number, customer, item line, VAT line, total line
++  assert.ok(lines[lines.length - 2].startsWith('VAT:'));
++  assert.ok(lines[lines.length - 1].startsWith('Total:'));
++});
++
++test('renderInvoiceText total includes VAT in calculation', () => {
++  const invoice = {
++    customerId: 'C-001',
++    customerName: 'Test Customer',
++    issueDate: '2026-10-07',
++    status: 'draft',
++    lines: [
++      { sku: 'DEV-HOUR', name: 'Development (hour)', qty: 100, unitPrice: 1000, vatRate: 21, discountPercent: 10 },
++    ],
++  };
++  const text = renderInvoiceText(invoice);
++  // Subtotal: 100000, Discount: 10000, Amount after discount: 90000
++  // VAT: 21% of 90000 = 18900
++  // Total: 100000 - 10000 + 18900 = 108900
++  assert.ok(text.includes('Total: €1,089.00'));
++});

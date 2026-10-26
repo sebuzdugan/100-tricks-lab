@@ -79,6 +79,9 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 37 | One rule in CLAUDE.md vs said once in request 1 | 7/12 vs 5/12 clean runs over 15 requests | ✅ keep |
 | 38 | Paste the library docs vs give the links | 11/12 vs 3/12, links at twice the cost | ✅ keep |
 | 39 | Keep a NOTES.md the agent re-reads | 124/150 vs 127/150 requests kept, 11 compactions | 🟡 optional |
+| 40 | Paste the whole codebase into each fresh session | 108/150 vs 101/150 requests kept, 43% pricier | 🟡 optional |
+
+**Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 
 **Module 3, after 24 runs a day:** wording rarely moved passes. Pasted errors did. Passes followed test output.
 
@@ -92,7 +95,7 @@ A new row lands here the day its post goes live.
 
 ```mermaid
 flowchart TB
-  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["✅ 21-30 · Prompting"] --> M4["▶️ 31-40 · Context"] --> M5["41-50 · Verification"]
+  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["✅ 21-30 · Prompting"] --> M4["✅ 31-40 · Context"] --> M5["▶️ 41-50 · Verification"]
   M5 --> M6["51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
   style M1 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
   style M2 fill:#A3E635,stroke:#A3E635,color:#0B0B0D

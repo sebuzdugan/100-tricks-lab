@@ -1,0 +1,505 @@
+diff --git a/src/reports.js b/src/reports.js
+index e613dc9..5e1cdd7 100644
+--- a/src/reports.js
++++ b/src/reports.js
+@@ -1,6 +1,7 @@
+ import { balanceDue } from './payments.js';
+ import { daysBetween } from './dates.js';
+ import { roundCents } from './money.js';
++import { ok, fail } from './result.js';
+ 
+ /**
+  * Invoices overdue as of a date, sorted by days overdue (most first).
+@@ -10,7 +11,7 @@ import { roundCents } from './money.js';
+  */
+ export function overdueInvoices(invoices, asOf) {
+   const overdue = (invoices || [])
+-    .filter((inv) => ['issued', 'partially_paid'].includes(inv.status))
++    .filter((inv) => inv && ['issued', 'partially_paid'].includes(inv.status))
+     .filter((inv) => inv.dueDate < asOf)
+     .map((inv) => {
+       const due = balanceDue(inv);
+@@ -88,3 +89,50 @@ export function lateFee(invoice, asOf) {
+   const fee = due * 0.0004 * daysOverdue;
+   return roundCents(fee);
+ }
++
++/**
++ * Dashboard summary of invoicing activity and status.
++ * @param {Array<object>} invoices
++ * @param {string} asOf (YYYY-MM-DD format)
++ * @returns {{ ok: true, value: { counts, outstanding, overdue, topCustomers } } | { ok: false, error: string }}
++ */
++export function dashboard(invoices, asOf) {
++  if (!invoices || !Array.isArray(invoices)) return fail('NO_INVOICES');
++  if (!asOf || typeof asOf !== 'string') return fail('INVALID_DATE');
++
++  const counts = { draft: 0, issued: 0, partially_paid: 0, paid: 0 };
++  const customerDues = {};
++  let outstanding = 0;
++
++  for (const invoice of invoices) {
++    if (!invoice) continue;
++
++    const status = invoice.status || 'draft';
++    counts[status] = (counts[status] || 0) + 1;
++
++    if (['issued', 'partially_paid'].includes(status)) {
++      const due = balanceDue(invoice);
++      outstanding += due;
++
++      const customerId = invoice.customerId;
++      if (customerId) {
++        customerDues[customerId] = (customerDues[customerId] || 0) + due;
++      }
++    }
++  }
++
++  const overdue = overdueInvoices(invoices, asOf);
++  const overdueAmount = overdue.reduce((sum, inv) => sum + inv.due, 0);
++
++  const topCustomers = Object.entries(customerDues)
++    .map(([customerId, due]) => ({ customerId, due }))
++    .sort((a, b) => b.due - a.due)
++    .slice(0, 3);
++
++  return ok({
++    counts,
++    outstanding,
++    overdue: { count: overdue.length, amount: overdueAmount },
++    topCustomers,
++  });
++}
+diff --git a/src/totals.js b/src/totals.js
+index 5640076..5c71eba 100644
+--- a/src/totals.js
++++ b/src/totals.js
+@@ -31,14 +31,14 @@ export function invoiceTotals(invoice) {
+ 
+     let lineDiscount = 0;
+     if (line.discountPercent !== undefined && line.discountPercent !== null) {
+-      lineDiscount = Math.max(0, line.discountPercent / 100 * lt.value);
++      lineDiscount = roundCents(Math.max(0, line.discountPercent / 100 * lt.value));
+       totalDiscount += lineDiscount;
+     }
+ 
+     let afterLineDiscount = Math.max(0, lt.value - lineDiscount);
+     let bulkDiscount = 0;
+     if (line.qty >= 10) {
+-      bulkDiscount = Math.max(0, 0.025 * afterLineDiscount);
++      bulkDiscount = roundCents(Math.max(0, 0.025 * afterLineDiscount));
+       totalDiscount += bulkDiscount;
+     }
+ 
+@@ -50,6 +50,6 @@ export function invoiceTotals(invoice) {
+   }
+ 
+   const voucherAmount = invoice.voucher ? Math.max(0, invoice.voucher.amount) : 0;
+-  const total = Math.max(0, subtotal - totalDiscount + totalVat - voucherAmount);
++  const total = roundCents(Math.max(0, subtotal - totalDiscount + totalVat - voucherAmount));
+   return ok({ subtotal, discount: Math.max(0, totalDiscount), vat: Math.max(0, totalVat), voucher: voucherAmount, total });
+ }
+diff --git a/test/reports.test.js b/test/reports.test.js
+index 862ab11..46e720c 100644
+--- a/test/reports.test.js
++++ b/test/reports.test.js
+@@ -2,7 +2,7 @@ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { createInvoice, issueInvoice, invoiceTotals } from '../src/invoices.js';
+ import { recordPayment } from '../src/payments.js';
+-import { overdueInvoices, vatSummary, lateFee } from '../src/reports.js';
++import { overdueInvoices, vatSummary, lateFee, dashboard } from '../src/reports.js';
+ 
+ test('overdueInvoices returns empty array for null invoices', () => {
+   const r = overdueInvoices(null, '2026-10-31');
+@@ -951,3 +951,299 @@ test('lateFee with zero due amount', () => {
+   const r = lateFee(paid.value, '2026-11-01');
+   assert.equal(r, 0);
+ });
++
++test('dashboard with null invoices', () => {
++  const r = dashboard(null, '2026-10-31');
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'NO_INVOICES');
++});
++
++test('dashboard with empty invoices', () => {
++  const r = dashboard([], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.deepEqual(r.value.counts, { draft: 0, issued: 0, partially_paid: 0, paid: 0 });
++  assert.equal(r.value.outstanding, 0);
++  assert.deepEqual(r.value.overdue, { count: 0, amount: 0 });
++  assert.deepEqual(r.value.topCustomers, []);
++});
++
++test('dashboard with invalid date', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const r = dashboard([invoice.value], null);
++  assert.equal(r.ok, false);
++  assert.equal(r.error, 'INVALID_DATE');
++});
++
++test('dashboard counts draft invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const r = dashboard([invoice.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.draft, 1);
++  assert.equal(r.value.counts.issued, 0);
++});
++
++test('dashboard counts issued invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const r = dashboard([issued.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.issued, 1);
++  assert.equal(r.value.counts.draft, 0);
++});
++
++test('dashboard counts paid invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const totals = invoiceTotals(issued.value);
++  const paid = recordPayment(issued.value, { amount: totals.value.total, date: '2026-10-10' });
++  const r = dashboard([paid.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.paid, 1);
++});
++
++test('dashboard counts partially paid invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const partial = recordPayment(issued.value, { amount: 50, date: '2026-10-10' });
++  const r = dashboard([partial.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.partially_paid, 1);
++});
++
++test('dashboard counts multiple statuses', () => {
++  const draft = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++
++  const invoice2 = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued = issueInvoice(invoice2.value, []);
++  assert.ok(issued.ok);
++
++  const invoice3 = createInvoice({
++    customerId: 'C-003',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued3 = issueInvoice(invoice3.value, ['INV-2026-0001']);
++  assert.ok(issued3.ok);
++
++  const totals3 = invoiceTotals(issued3.value);
++  const paid = recordPayment(issued3.value, { amount: totals3.value.total, date: '2026-10-10' });
++
++  const r = dashboard([draft.value, issued.value, paid.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.draft, 1);
++  assert.equal(r.value.counts.issued, 1);
++  assert.equal(r.value.counts.paid, 1);
++  assert.equal(r.value.counts.partially_paid, 0);
++});
++
++test('dashboard calculates outstanding for issued invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const totals = invoiceTotals(issued.value);
++  const r = dashboard([issued.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.outstanding, totals.value.total);
++});
++
++test('dashboard excludes draft invoices from outstanding', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const r = dashboard([invoice.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.outstanding, 0);
++});
++
++test('dashboard excludes paid invoices from outstanding', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const totals = invoiceTotals(issued.value);
++  const paid = recordPayment(issued.value, { amount: totals.value.total, date: '2026-10-10' });
++  const r = dashboard([paid.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.outstanding, 0);
++});
++
++test('dashboard includes partially paid invoices in outstanding', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const partial = recordPayment(issued.value, { amount: 50, date: '2026-10-10' });
++  const totals = invoiceTotals(issued.value);
++  const r = dashboard([partial.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.outstanding, totals.value.total - 50);
++});
++
++test('dashboard calculates overdue invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++    terms: 'NET14',
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const r = dashboard([issued.value], '2026-10-22');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.overdue.count, 1);
++  assert(r.value.overdue.amount > 0);
++});
++
++test('dashboard excludes non-overdue invoices', () => {
++  const invoice = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++    terms: 'NET14',
++  });
++  const issued = issueInvoice(invoice.value, []);
++  const r = dashboard([issued.value], '2026-10-21');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.overdue.count, 0);
++  assert.equal(r.value.overdue.amount, 0);
++});
++
++test('dashboard identifies top customer', () => {
++  const invoice1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const issued1 = issueInvoice(invoice1.value, []);
++
++  const invoice2 = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued2 = issueInvoice(invoice2.value, ['INV-2026-0001']);
++
++  const r = dashboard([issued1.value, issued2.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.topCustomers.length, 2);
++  assert.equal(r.value.topCustomers[0].customerId, 'C-001');
++});
++
++test('dashboard sorts topCustomers by due amount', () => {
++  const invoice1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 3 }],
++  });
++  const issued1 = issueInvoice(invoice1.value, []);
++
++  const invoice2 = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const issued2 = issueInvoice(invoice2.value, ['INV-2026-0001']);
++
++  const r = dashboard([issued1.value, issued2.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.topCustomers[0].customerId, 'C-002');
++  assert.equal(r.value.topCustomers[1].customerId, 'C-001');
++});
++
++test('dashboard returns only top 3 customers', () => {
++  const invoices = [];
++  for (let i = 0; i < 5; i++) {
++    const invoice = createInvoice({
++      customerId: `C-${String(i).padStart(3, '0')}`,
++      issueDate: '2026-10-07',
++      lines: [{ sku: 'STICKER', qty: 1 }],
++    });
++    const issued = issueInvoice(invoice.value, invoices.length > 0 ? [`INV-2026-${String(invoices.length).padStart(4, '0')}`] : []);
++    if (issued.ok) invoices.push(issued.value);
++  }
++
++  const r = dashboard(invoices, '2026-10-31');
++  assert.equal(r.ok, true);
++  assert(r.value.topCustomers.length <= 3);
++});
++
++test('dashboard aggregates multiple invoices per customer', () => {
++  const invoice1 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++  const issued1 = issueInvoice(invoice1.value, []);
++
++  const invoice2 = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-10',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued2 = issueInvoice(invoice2.value, ['INV-2026-0001']);
++
++  const r = dashboard([issued1.value, issued2.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  const c001 = r.value.topCustomers.find(c => c.customerId === 'C-001');
++  assert(c001);
++  assert(c001.due > 0);
++});
++
++test('dashboard with mixed invoice statuses', () => {
++  const draft = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 1 }],
++  });
++
++  const invoice2 = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'STICKER', qty: 2 }],
++  });
++  const issued = issueInvoice(invoice2.value, []);
++  const partial = recordPayment(issued.value, { amount: 50, date: '2026-10-10' });
++
++  const r = dashboard([draft.value, partial.value], '2026-10-31');
++  assert.equal(r.ok, true);
++  assert.equal(r.value.counts.draft, 1);
++  assert.equal(r.value.counts.partially_paid, 1);
++  assert(r.value.outstanding > 0);
++  assert(r.value.topCustomers.length > 0);
++});
+diff --git a/test/totals.test.js b/test/totals.test.js
+index d1e017c..d5355f8 100644
+--- a/test/totals.test.js
++++ b/test/totals.test.js
+@@ -2,6 +2,7 @@ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import { lineTotal, invoiceTotals } from '../src/totals.js';
+ import { createInvoice, issueInvoice, addLine, removeLine, applyVoucher } from '../src/invoices.js';
++import { roundCents } from '../src/money.js';
+ 
+ test('lineTotal calculates qty × unitPrice', () => {
+   const r = lineTotal({ qty: 5, unitPrice: 8500 });
+@@ -236,14 +237,14 @@ test('invoiceTotals calculates gold tier discount', () => {
+   const r = invoiceTotals(invoice.value);
+   assert.equal(r.ok, true);
+   assert.equal(r.value.subtotal, 85000);
+-  const tierDiscount = 85000 * 0.05;
++  const tierDiscount = roundCents(85000 * 0.05);
+   const afterTierDiscount = 85000 - tierDiscount;
+-  const bulkDiscount = afterTierDiscount * 0.025;
++  const bulkDiscount = roundCents(afterTierDiscount * 0.025);
+   const totalDiscount = tierDiscount + bulkDiscount;
+   assert.equal(r.value.discount, totalDiscount);
+   const discountedAmount = 85000 - totalDiscount;
+-  const expectedVat = Math.round(discountedAmount * 0.21);
+-  const expectedTotal = 85000 - totalDiscount + expectedVat;
++  const expectedVat = roundCents(discountedAmount * 0.21);
++  const expectedTotal = roundCents(85000 - totalDiscount + expectedVat);
+   assert.equal(r.value.vat, expectedVat);
+   assert.equal(r.value.total, expectedTotal);
+ });
+@@ -258,14 +259,14 @@ test('invoiceTotals calculates silver tier discount', () => {
+   const r = invoiceTotals(invoice.value);
+   assert.equal(r.ok, true);
+   assert.equal(r.value.subtotal, 85000);
+-  const tierDiscount = 85000 * 0.025;
++  const tierDiscount = roundCents(85000 * 0.025);
+   const afterTierDiscount = 85000 - tierDiscount;
+-  const bulkDiscount = afterTierDiscount * 0.025;
++  const bulkDiscount = roundCents(afterTierDiscount * 0.025);
+   const totalDiscount = tierDiscount + bulkDiscount;
+   assert.equal(r.value.discount, totalDiscount);
+   const discountedAmount = 85000 - totalDiscount;
+-  const expectedVat = Math.round(discountedAmount * 0.21);
+-  const expectedTotal = 85000 - totalDiscount + expectedVat;
++  const expectedVat = roundCents(discountedAmount * 0.21);
++  const expectedTotal = roundCents(85000 - totalDiscount + expectedVat);
+   assert.equal(r.value.vat, expectedVat);
+   assert.equal(r.value.total, expectedTotal);
+ });
+@@ -494,9 +495,9 @@ test('invoiceTotals bulk discount with tier discount', () => {
+   const r = invoiceTotals(invoice.value);
+   assert.equal(r.ok, true);
+   assert.equal(r.value.subtotal, 85000);
+-  const tierDiscount = 85000 * 0.05;
++  const tierDiscount = roundCents(85000 * 0.05);
+   const afterTierDiscount = 85000 - tierDiscount;
+-  const bulkDiscount = afterTierDiscount * 0.025;
++  const bulkDiscount = roundCents(afterTierDiscount * 0.025);
+   const totalDiscount = tierDiscount + bulkDiscount;
+   assert.equal(r.value.discount, totalDiscount);
+ });
+@@ -532,12 +533,12 @@ test('invoiceTotals bulk discount with both line and bulk discount', () => {
+   const r = invoiceTotals(invoice);
+   assert.equal(r.ok, true);
+   assert.equal(r.value.subtotal, 20000);
+-  const line1LineDiscount = 10000 * 0.05;
++  const line1LineDiscount = roundCents(10000 * 0.05);
+   const line1AfterLineDiscount = 10000 - line1LineDiscount;
+-  const line1BulkDiscount = line1AfterLineDiscount * 0.025;
+-  const line2LineDiscount = 10000 * 0.1;
++  const line1BulkDiscount = roundCents(line1AfterLineDiscount * 0.025);
++  const line2LineDiscount = roundCents(10000 * 0.1);
+   const line2AfterLineDiscount = 10000 - line2LineDiscount;
+-  const line2BulkDiscount = line2AfterLineDiscount * 0.025;
++  const line2BulkDiscount = roundCents(line2AfterLineDiscount * 0.025);
+   const totalDiscount = line1LineDiscount + line1BulkDiscount + line2LineDiscount + line2BulkDiscount;
+   assert.equal(r.value.discount, totalDiscount);
+ });
+@@ -576,9 +577,9 @@ test('invoiceTotals bulk discount stacks with tier discount', () => {
+   assert.equal(invoice.ok, true);
+   const r = invoiceTotals(invoice.value);
+   assert.equal(r.ok, true);
+-  const silverDiscount = 85000 * 0.025;
++  const silverDiscount = roundCents(85000 * 0.025);
+   const afterTierDiscount = 85000 - silverDiscount;
+-  const bulkDiscount = afterTierDiscount * 0.025;
++  const bulkDiscount = roundCents(afterTierDiscount * 0.025);
+   const totalDiscount = silverDiscount + bulkDiscount;
+   assert.equal(r.value.discount, totalDiscount);
+   assert.ok(totalDiscount > silverDiscount);

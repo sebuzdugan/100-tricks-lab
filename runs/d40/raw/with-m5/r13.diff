@@ -1,0 +1,391 @@
+diff --git a/src/errors.js b/src/errors.js
+index 25a3caf..8ad4792 100644
+--- a/src/errors.js
++++ b/src/errors.js
+@@ -13,6 +13,7 @@ export const ERRORS = {
+   QTY_INVALID: 'Quantity must be a positive whole number.',
+   TERMS_INVALID: "Payment terms must be 'NET14', 'NET30', or 'EOM'.",
+   UNKNOWN_SKU: 'No product with that SKU in the catalogue.',
++  VOUCHER_EXISTS: 'Only one voucher per invoice.',
+ };
+ 
+ /**
+diff --git a/src/invoices.js b/src/invoices.js
+index 88adaa9..7a0e3f1 100644
+--- a/src/invoices.js
++++ b/src/invoices.js
+@@ -99,11 +99,12 @@ export function lineTotal(line) {
+ }
+ 
+ /**
+- * Calculate subtotal, discount, VAT and total for an invoice. Subtotal is the sum of line totals.
++ * Calculate subtotal, discount, VAT, voucher and total for an invoice. Subtotal is the sum of line totals.
+  * Discount is the sum of line discounts. VAT is computed per line on the amount after discount, then rounded and summed.
+- * Total = subtotal - discount + vat, clamped at 0.
+- * @param {{ lines: Array<{ qty: number, unitPrice: number, discountPercent?: number, vatRate?: number }> }}
+- * @returns {{ subtotal: number, discount: number, vat: number, total: number }}
++ * Voucher is a fixed amount off (applied after VAT).
++ * Total = subtotal - discount + vat - voucher, clamped at 0.
++ * @param {{ lines: Array<{ qty: number, unitPrice: number, discountPercent?: number, vatRate?: number }>, voucher?: { amount: number } }}
++ * @returns {{ subtotal: number, discount: number, vat: number, voucher: number, total: number }}
+  */
+ export function invoiceTotals(invoice) {
+   const subtotal = invoice.lines.reduce((sum, line) => sum + lineTotal(line), 0);
+@@ -118,8 +119,9 @@ export function invoiceTotals(invoice) {
+     const lineVat = roundCents(amountAfterDiscount * (line.vatRate ?? 0) / 100);
+     return sum + lineVat;
+   }, 0);
+-  const total = Math.max(0, subtotal - discount + vat);
+-  return { subtotal, discount, vat, total };
++  const voucher = invoice.voucher?.amount ?? 0;
++  const total = Math.max(0, subtotal - discount + vat - voucher);
++  return { subtotal, discount, vat, voucher, total };
+ }
+ 
+ /**
+@@ -207,3 +209,22 @@ export function issueInvoice(invoice, existingNumbers) {
+   // Return issued invoice
+   return ok({ ...invoice, status: 'issued', number });
+ }
++
++/**
++ * Apply a voucher to a draft invoice. The voucher is a fixed amount off, applied after VAT.
++ * @param {{ status: string, voucher?: any }, { code: string, amount: number }}
++ */
++export function applyVoucher(invoice, { code, amount }) {
++  // Check status
++  if (invoice.status !== 'draft') return fail('NOT_DRAFT');
++
++  // Check if voucher already exists
++  if (invoice.voucher) return fail('VOUCHER_EXISTS');
++
++  // Validate amount
++  if (!Number.isInteger(amount) || amount <= 0) {
++    return fail('AMOUNT_INVALID');
++  }
++
++  return ok({ ...invoice, voucher: { code, amount } });
++}
+diff --git a/test/invoices.test.js b/test/invoices.test.js
+index 62f08db..63a86b2 100644
+--- a/test/invoices.test.js
++++ b/test/invoices.test.js
+@@ -1,6 +1,6 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+-import { createInvoice, lineTotal, invoiceTotals, addLine, removeLine, issueInvoice } from '../src/invoices.js';
++import { createInvoice, lineTotal, invoiceTotals, addLine, removeLine, issueInvoice, applyVoucher } from '../src/invoices.js';
+ 
+ test('createInvoice creates a draft invoice with one line', () => {
+   const r = createInvoice({
+@@ -242,7 +242,7 @@ test('invoiceTotals calculates discount for single line', () => {
+     lines: [{ sku: 'DES-HOUR', name: 'Design work (hour)', qty: 5, unitPrice: 8500, vatRate: 21, discountPercent: 10 }],
+   };
+   const totals = invoiceTotals(invoice);
+-  assert.deepEqual(totals, { subtotal: 42500, discount: 4250, vat: 8032, total: 46282 });
++  assert.deepEqual(totals, { subtotal: 42500, discount: 4250, vat: 8032, voucher: 0, total: 46282 });
+ });
+ 
+ test('invoiceTotals calculates discount for multiple lines with different rates', () => {
+@@ -259,7 +259,7 @@ test('invoiceTotals calculates discount for multiple lines with different rates'
+   const expectedSubtotal = 42500 + 28500;
+   const expectedDiscount = 4250 + 5700;
+   const expectedVat = 8032 + 4788;
+-  assert.deepEqual(totals, { subtotal: expectedSubtotal, discount: expectedDiscount, vat: expectedVat, total: expectedSubtotal - expectedDiscount + expectedVat });
++  assert.deepEqual(totals, { subtotal: expectedSubtotal, discount: expectedDiscount, vat: expectedVat, voucher: 0, total: expectedSubtotal - expectedDiscount + expectedVat });
+ });
+ 
+ test('invoiceTotals handles decimal discount percentages', () => {
+@@ -270,7 +270,7 @@ test('invoiceTotals handles decimal discount percentages', () => {
+     lines: [{ sku: 'DES-HOUR', name: 'Design work (hour)', qty: 5, unitPrice: 8500, vatRate: 21, discountPercent: 12.5 }],
+   };
+   const totals = invoiceTotals(invoice);
+-  assert.deepEqual(totals, { subtotal: 42500, discount: 5312.5, vat: 7809, total: 44996.5 });
++  assert.deepEqual(totals, { subtotal: 42500, discount: 5312.5, vat: 7809, voucher: 0, total: 44996.5 });
+ });
+ 
+ test('invoiceTotals clamps total to 0 if discount exceeds subtotal', () => {
+@@ -281,7 +281,7 @@ test('invoiceTotals clamps total to 0 if discount exceeds subtotal', () => {
+     lines: [{ sku: 'DES-HOUR', name: 'Design work (hour)', qty: 5, unitPrice: 8500, vatRate: 21, discountPercent: 100 }],
+   };
+   const totals = invoiceTotals(invoice);
+-  assert.deepEqual(totals, { subtotal: 42500, discount: 42500, vat: 0, total: 0 });
++  assert.deepEqual(totals, { subtotal: 42500, discount: 42500, vat: 0, voucher: 0, total: 0 });
+ });
+ 
+ test('invoiceTotals calculates subtotal and total for single line', () => {
+@@ -293,7 +293,7 @@ test('invoiceTotals calculates subtotal and total for single line', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   // 42500 * 21% = 8925
+-  assert.deepEqual(totals, { subtotal: 42500, discount: 0, vat: 8925, total: 51425 });
++  assert.deepEqual(totals, { subtotal: 42500, discount: 0, vat: 8925, voucher: 0, total: 51425 });
+ });
+ 
+ test('invoiceTotals calculates subtotal and total for multiple lines', () => {
+@@ -308,7 +308,7 @@ test('invoiceTotals calculates subtotal and total for multiple lines', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   // 42500 * 21% = 8925, 28500 * 21% = 5985, total vat = 14910
+-  assert.deepEqual(totals, { subtotal: 71000, discount: 0, vat: 14910, total: 85910 });
++  assert.deepEqual(totals, { subtotal: 71000, discount: 0, vat: 14910, voucher: 0, total: 85910 });
+ });
+ 
+ test('addLine adds a new line to an invoice', () => {
+@@ -557,7 +557,7 @@ test('createInvoice calculates correct totals with tier discount', () => {
+   const totals = invoiceTotals(inv);
+   // 5 × 8500 = 42500, 5% tier discount = 2125
+   // amount after discount = 40375, 21% VAT = 8478.75 → 8479
+-  assert.deepEqual(totals, { subtotal: 42500, discount: 2125, vat: 8479, total: 48854 });
++  assert.deepEqual(totals, { subtotal: 42500, discount: 2125, vat: 8479, voucher: 0, total: 48854 });
+ });
+ 
+ test('invoiceTotals calculates VAT on amount after discount', () => {
+@@ -569,7 +569,7 @@ test('invoiceTotals calculates VAT on amount after discount', () => {
+   };
+   const totals = invoiceTotals(invoice);
+   // lineAmount = 10000, discount = 1000, afterDiscount = 9000, vat = 9000 * 21 / 100 = 1890
+-  assert.deepEqual(totals, { subtotal: 10000, discount: 1000, vat: 1890, total: 10890 });
++  assert.deepEqual(totals, { subtotal: 10000, discount: 1000, vat: 1890, voucher: 0, total: 10890 });
+ });
+ 
+ test('invoiceTotals handles lines with different VAT rates', () => {
+@@ -585,7 +585,7 @@ test('invoiceTotals handles lines with different VAT rates', () => {
+   const totals = invoiceTotals(invoice);
+   // Line 1: 42500 * 21% = 8925
+   // Line 2: 3700 * 9% = 333
+-  assert.deepEqual(totals, { subtotal: 46200, discount: 0, vat: 9258, total: 55458 });
++  assert.deepEqual(totals, { subtotal: 46200, discount: 0, vat: 9258, voucher: 0, total: 55458 });
+ });
+ 
+ test('invoiceTotals handles 0% VAT (VAT exempt)', () => {
+@@ -596,7 +596,7 @@ test('invoiceTotals handles 0% VAT (VAT exempt)', () => {
+     lines: [{ sku: 'WORKSHOP-DAY', name: 'Brand workshop (day, VAT exempt)', qty: 1, unitPrice: 60000, vatRate: 0, discountPercent: 0 }],
+   };
+   const totals = invoiceTotals(invoice);
+-  assert.deepEqual(totals, { subtotal: 60000, discount: 0, vat: 0, total: 60000 });
++  assert.deepEqual(totals, { subtotal: 60000, discount: 0, vat: 0, voucher: 0, total: 60000 });
+ });
+ 
+ test('invoiceTotals rounds VAT per line and sums', () => {
+@@ -613,7 +613,7 @@ test('invoiceTotals rounds VAT per line and sums', () => {
+   // Line 1: 1000 * 21% = 210
+   // Line 2: 2000 * 21% = 420
+   // Total VAT = 630 (sum of individually rounded VATs)
+-  assert.deepEqual(totals, { subtotal: 3000, discount: 0, vat: 630, total: 3630 });
++  assert.deepEqual(totals, { subtotal: 3000, discount: 0, vat: 630, voucher: 0, total: 3630 });
+ });
+ 
+ test('removeLine removes a line from an invoice', () => {
+@@ -918,3 +918,211 @@ test('createInvoice preserves terms through invoice operations', () => {
+   assert.equal(issued.terms, 'NET14');
+   assert.equal(issued.dueDate, '2026-10-21');
+ });
++
++// Voucher tests
++test('applyVoucher applies a voucher to a draft invoice', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  assert.equal(r2.ok, true);
++  const withVoucher = r2.value;
++  assert.deepEqual(withVoucher.voucher, { code: 'SUMMER2026', amount: 5000 });
++});
++
++test('applyVoucher reports NOT_DRAFT if invoice is not draft', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++  const r2 = issueInvoice(inv, []);
++  const issued = r2.value;
++
++  const r3 = applyVoucher(issued, { code: 'SUMMER2026', amount: 5000 });
++  assert.deepEqual(r3, { ok: false, error: 'NOT_DRAFT' });
++});
++
++test('applyVoucher reports VOUCHER_EXISTS if one already applied', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  const withVoucher = r2.value;
++
++  const r3 = applyVoucher(withVoucher, { code: 'AUTUMN2026', amount: 3000 });
++  assert.deepEqual(r3, { ok: false, error: 'VOUCHER_EXISTS' });
++});
++
++test('applyVoucher reports AMOUNT_INVALID for non-integer amount', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000.5 });
++  assert.deepEqual(r2, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('applyVoucher reports AMOUNT_INVALID for zero amount', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 0 });
++  assert.deepEqual(r2, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('applyVoucher reports AMOUNT_INVALID for negative amount', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: -5000 });
++  assert.deepEqual(r2, { ok: false, error: 'AMOUNT_INVALID' });
++});
++
++test('invoiceTotals includes voucher in calculation', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  const withVoucher = r2.value;
++
++  const totals = invoiceTotals(withVoucher);
++  // Base: 42500 - 2125 discount + 8479 VAT = 48854
++  // With voucher: 48854 - 5000 = 43854
++  assert.deepEqual(totals, { subtotal: 42500, discount: 2125, vat: 8479, voucher: 5000, total: 43854 });
++});
++
++test('invoiceTotals returns voucher field (zero if none)', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const totals = invoiceTotals(inv);
++  assert.equal(totals.voucher, 0);
++  assert.deepEqual(totals, { subtotal: 42500, discount: 2125, vat: 8479, voucher: 0, total: 48854 });
++});
++
++test('applyVoucher does not mutate original invoice', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  assert.equal(inv.voucher, undefined);
++});
++
++test('applyVoucher voucher is applied after VAT', () => {
++  const r = createInvoice({
++    customerId: 'C-002',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'NEWCUSTOMER', amount: 10000 });
++  const withVoucher = r2.value;
++
++  const totals = invoiceTotals(withVoucher);
++  // Standard tier (no discount): 42500 + 8925 VAT = 51425
++  // With 10000 voucher: 51425 - 10000 = 41425
++  assert.deepEqual(totals, { subtotal: 42500, discount: 0, vat: 8925, voucher: 10000, total: 41425 });
++});
++
++test('applyVoucher clamps total to zero if voucher exceeds total', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'HUGE', amount: 100000 });
++  const withVoucher = r2.value;
++
++  const totals = invoiceTotals(withVoucher);
++  // Base: 48854, voucher: 100000 → total clamped to 0
++  assert.equal(totals.total, 0);
++});
++
++test('applyVoucher preserves other invoice fields', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [
++      { sku: 'DES-HOUR', qty: 5 },
++      { sku: 'DEV-HOUR', qty: 3 },
++    ],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  const withVoucher = r2.value;
++
++  assert.equal(withVoucher.customerId, 'C-001');
++  assert.equal(withVoucher.issueDate, '2026-10-07');
++  assert.equal(withVoucher.status, 'draft');
++  assert.equal(withVoucher.lines.length, 2);
++});
++
++test('applyVoucher preserves terms', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++    terms: 'NET14',
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'SUMMER2026', amount: 5000 });
++  const withVoucher = r2.value;
++
++  assert.equal(withVoucher.terms, 'NET14');
++  assert.equal(withVoucher.dueDate, '2026-10-21');
++});
++
++test('applyVoucher works with various voucher amounts', () => {
++  const r = createInvoice({
++    customerId: 'C-001',
++    issueDate: '2026-10-07',
++    lines: [{ sku: 'DES-HOUR', qty: 5 }],
++  });
++  const inv = r.value;
++
++  const r2 = applyVoucher(inv, { code: 'TINY', amount: 1 });
++  assert.equal(r2.ok, true);
++  assert.equal(r2.value.voucher.amount, 1);
++
++  const r3 = applyVoucher(inv, { code: 'LARGE', amount: 1000000 });
++  assert.equal(r3.ok, true);
++  assert.equal(r3.value.voucher.amount, 1000000);
++});

@@ -80,6 +80,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 38 | Paste the library docs vs give the links | 11/12 vs 3/12, links at twice the cost | ✅ keep |
 | 39 | Keep a NOTES.md the agent re-reads | 124/150 vs 127/150 requests kept, 11 compactions | 🟡 optional |
 | 40 | Paste the whole codebase into each fresh session | 108/150 vs 101/150 requests kept, 43% pricier | 🟡 optional |
+| 41 | One system-card sentence on an impossible test | cheated 12/18 vs 0/18 | ✅ keep |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

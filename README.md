@@ -7,6 +7,10 @@ Run on real code with the trick and without it, graded by tests the agent never 
 </p>
 
 <p align="center">
+<a href="https://sebuzdugan.com/newsletter?utm_source=github&amp;utm_medium=readme&amp;utm_campaign=100-tricks">Get the tricks that held up each week in The Top K, free every Friday →</a>
+</p>
+
+<p align="center">
   <img src="assets/cards/d15.png" alt="Day 15 card" width="480">
 </p>
 
@@ -131,6 +135,8 @@ A day is defined by `tricks/dNN/trick.json`: the tasks, the model, and what each
 </details>
 
 ## Follow along
+
+**The tricks that held up each week land in [The Top K](https://sebuzdugan.com/newsletter?utm_source=github&utm_medium=readme&utm_campaign=100-tricks), a free Friday email with the numbers.**
 
 The daily results go out as a 60-second video and a post with the numbers: [YouTube](https://sebuzdugan.com/l/yt) · [X](https://sebuzdugan.com/l/x) · [Medium](https://medium.com/@sebuzdugan)
 

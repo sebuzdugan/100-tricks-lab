@@ -85,6 +85,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 39 | Keep a NOTES.md the agent re-reads | 124/150 vs 127/150 requests kept, 11 compactions | 🟡 optional |
 | 40 | Paste the whole codebase into each fresh session | 108/150 vs 101/150 requests kept, 43% pricier | 🟡 optional |
 | 41 | One system-card sentence on an impossible test | cheated 12/18 vs 0/18 | ✅ keep |
+| 42 | A bigger model reviews the diff in a fresh session | 16/18 vs 7/18 (Opus vs Haiku reviewer) | ✅ keep |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

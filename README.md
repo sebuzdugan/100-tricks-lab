@@ -88,6 +88,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 42 | A bigger model reviews the diff in a fresh session | 16/18 vs 7/18 (Opus vs Haiku reviewer) | ✅ keep |
 | 43 | Lock the tests with hooks | 0/18 vs 4/18, the ticket needed one old test changed | ❌ cut |
 | 44 | Ask the agent to review its own diff | 1/18 vs 1/18, at $1.02 vs $0.42 a run | ❌ cut |
+| 45 | The same setup against itself (A/A, 3 rounds) | 5/54 vs 6/54; one trap swung by 6 runs and back | 📏 luck band, no rule |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

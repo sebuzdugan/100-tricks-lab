@@ -90,6 +90,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 44 | Ask the agent to review its own diff | 1/18 vs 1/18, at $1.02 vs $0.42 a run | ❌ cut |
 | 45 | The same setup against itself (A/A, 3 rounds) | 5/54 vs 6/54; one trap swung by 6 runs and back | 📏 luck band, no rule |
 | 46 | "Run the tests before you finish" | 1/18 vs 2/18; 17 of 18 already ran them unasked | 🟡 optional |
+| 47 | A "Done when" checklist of commands to run | 17/18 vs 3/18; without it, 15 runs said done and weren't | ✅ keep |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

@@ -135,6 +135,26 @@ def agent_env(extra=None):
     return env
 
 
+def rewind_files(sid, work: Path, extra_env=None) -> str:
+    """Headless `claude --resume <sid> --rewind-files <first user message>`; needs
+    CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true in the side's env. Returns the CLI's last line (or why it failed)."""
+    env = agent_env(extra_env)
+    cfg = Path(env.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    log = next(iter(cfg.glob(f"projects/*/{sid}.jsonl")), None) if sid else None
+    if not log:
+        return "no session log"
+    first = None
+    for line in log.read_text().splitlines():
+        d = json.loads(line)
+        if d.get("type") == "user" and isinstance((d.get("message") or {}).get("content"), str):
+            first = d["uuid"]; break
+    if not first:
+        return "no first user message"
+    r = subprocess.run(["claude", "--resume", sid, "--rewind-files", first, "-p", ""], cwd=work, env=env,
+                       capture_output=True, text=True, timeout=300)
+    return ((r.stdout or r.stderr).strip().splitlines() or [f"exit {r.returncode}"])[-1][:200]
+
+
 def build_prompt(tdir: Path, side_cfg: dict, task: str) -> str:
     """Task prompt for one side: a full replacement file per task, or the task's prompt.md, plus prefixes."""
     by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
@@ -247,6 +267,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
         t0 = time.time()
         data, timeout = call_claude(cmd, work, timeout_s, side_cfg.get("env"))
         calls = [data]
+        attempts = []  # grader result before each `when: "fails"` turn (Module 6 attempt curves)
         # Follow-up turns resume the same session (plan -> execute, review -> fix, /compact, retries).
         for turn in turns:
             fresh = bool(turn.get("fresh"))  # a new session in the same repo copy (spec -> fresh build), not --resume
@@ -256,6 +277,22 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             if left <= 0:
                 timeout = True
                 break
+            if turn.get("when") == "fails":  # Module 6 retry days: only send this turn while the hidden grader still fails
+                probe = work.parent / f"{work.name}-probe"
+                shutil.rmtree(probe, ignore_errors=True)
+                if subprocess.run(["cp", "-cR", str(work), str(probe)], capture_output=True).returncode != 0:
+                    subprocess.run(["cp", "-R", str(work), str(probe)], check=True)
+                ok, why = grade(task, probe)  # graded on a throwaway clone, so the agent's copy is untouched
+                shutil.rmtree(probe, ignore_errors=True)
+                attempts.append({"attempt": len(calls), "passed": ok, "reason": why[:300]})
+                if ok:
+                    break  # fixed: no more retries, and every later turn is skipped too
+            if turn.get("rewind_files"):  # Claude Code's own checkpoint rewind to the first prompt (day 54); Bash-made changes stay
+                rw = rewind_files(calls[0].get("session_id"), work, side_cfg.get("env"))
+                attempts.append({"attempt": len(calls), "rewind": rw})
+            if turn.get("reset"):  # code back to the starting point (lab-base); ignored files such as node_modules stay
+                subprocess.run(["git", "-C", str(work), "checkout", "lab-base", "--", "."], capture_output=True)
+                subprocess.run(["git", "-C", str(work), "clean", "-fdq"], capture_output=True)
             tp = turn.get("prompt") or (tdir / turn["prompt_file"]).read_text()
             tp = (tp.replace("{task_prompt}", prompt).replace("{task}", task_text(tdir, side_cfg, task))
                     .replace("{prev_result}", str(data.get("result") or "").strip()))
@@ -275,7 +312,12 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             data = nxt or data
         if len(calls) > 1:
             data = dict(data)
-            data["total_cost_usd"] = sum(float(c.get("total_cost_usd") or 0) for c in calls)
+            # A resumed call reports the session's running total, not its own cost: count the last total of each
+            # session once (fresh turns start a new session). Summing every call double-counted (found 4 Nov 2026).
+            last = {}
+            for i, c in enumerate(calls):
+                last[c.get("session_id") or f"call{i}"] = float(c.get("total_cost_usd") or 0)
+            data["total_cost_usd"] = sum(last.values())
             data["duration_ms"] = sum(float(c.get("duration_ms") or 0) for c in calls)
             data["num_turns"] = sum(int(c.get("num_turns") or 0) for c in calls)
             data["calls"] = len(calls)
@@ -283,6 +325,8 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             data["usage"] = {k: sum(int((c.get("usage") or {}).get(k) or 0) for c in calls)
                              for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
             data["step_results"] = [str(c.get("result") or "")[:4000] for c in calls[:-1]]
+        if attempts:
+            data = dict(data); data["attempts"] = attempts
         data["compactions"] = compactions([e for c in calls for e in (c.get("_events") or [])])
         wall = (time.time() - t0) / 60
         text = str(data.get("result", "")).lower()

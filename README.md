@@ -92,6 +92,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 46 | "Run the tests before you finish" | 1/18 vs 2/18; 17 of 18 already ran them unasked | 🟡 optional |
 | 47 | A "Done when" checklist of commands to run | 17/18 vs 3/18; without it, 15 runs said done and weren't | ✅ keep |
 | 48 | A second turn: "Prove to me this works" | 2/18 vs 1/18, at $1.02 vs $0.48 a run; 9 proofs ticked a wrong price | 🟡 optional |
+| 49 | Run the real command, not just the unit tests | 8/18 vs 3/18, at $0.51 vs $0.42 a run; the wins came from fixing an old test first | ✅ keep |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

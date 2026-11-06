@@ -109,8 +109,8 @@ A new row lands here the day its post goes live.
 
 ```mermaid
 flowchart TB
-  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["✅ 21-30 · Prompting"] --> M4["✅ 31-40 · Context"] --> M5["▶️ 41-50 · Verification"]
-  M5 --> M6["51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
+  M1["✅ 1-10 · Setup<br>your rules file"] --> M2["✅ 11-20 · Planning"] --> M3["✅ 21-30 · Prompting"] --> M4["✅ 31-40 · Context"] --> M5["✅ 41-50 · Verification"]
+  M5 --> M6["▶️ 51-60 · Debugging"] --> M7["61-70 · Skills and MCP"] --> M8["71-80 · Safety"] --> M9["81-90 · Cost and models"] --> M10["91-100 · Long runs"]
   style M1 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
   style M2 fill:#A3E635,stroke:#A3E635,color:#0B0B0D
   style M3 fill:#A3E635,stroke:#A3E635,color:#0B0B0D

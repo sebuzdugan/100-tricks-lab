@@ -96,6 +96,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 50 | Check after every edit, or once at the end | 2/18 vs 3/18, at $0.41 vs $0.43 a run; 79 of 202 checks red, and the old test the ticket changes pulled runs back to the old rule | 🟡 optional |
 | 51 | Explain the bug before fixing it | 4/18 vs 10/18, at $0.11 vs $0.09 a run; all 18 explanations named the cause, and every fix stopped at the places it listed | ❌ cut |
 | 52 | Add logging and run it before fixing | 6/18 vs 8/18, at $0.12 vs $0.09 a run; every run logged and cleaned up, but only the reported price was ever replayed | 🟡 optional |
+| 53 | After two failed fixes, start over in a fresh session | 18/18 vs 17/18; 33 of 36 were fixed by the third try, so only 1 vs 2 runs reached the restart. Nudges that edited code passed 21/21, ones that edited nothing 0/11 | ⏳ too few to judge |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

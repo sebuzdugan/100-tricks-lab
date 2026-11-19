@@ -100,6 +100,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 54 | Rewind the code, keep the chat | 16/18 vs 11/18; retries after the rewind passed 11/13 with the chat vs 7/14 fresh (p = 0.10), and 5 fresh retries lost a fix they already had | ✅ kept (plausible) |
 | 55 | Just hand it the failing test | 4/18 vs 8/18, at $0.07 vs $0.09 a run; with only the test it stopped at green, and the import got fixed in 5 vs 14 runs (p = 0.007) | ❌ cut |
 | 56 | Let the agent run git bisect | 16/18 vs 5/18, at $0.18 vs $0.10 a run ($0.20 vs $0.36 per pass); both sides found the bad commit, but reading the whole commit meant a pass in 36 of 36 runs | ✅ kept |
+| 57 | Rubber duck: walk the code line by line after a missed fix | 9/18 vs 16/18, at $0.15 vs $0.13 a run; retries after a missed fix passed 3/12 with the walkthrough vs 8/10 with a plain retry, and 9 of 12 walkthroughs made no edit | ❌ cut |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

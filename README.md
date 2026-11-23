@@ -103,6 +103,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 57 | Rubber duck: walk the code line by line after a missed fix | 9/18 vs 16/18, at $0.15 vs $0.13 a run; retries after a missed fix passed 3/12 with the walkthrough vs 8/10 with a plain retry, and 9 of 12 walkthroughs made no edit | ❌ cut |
 | 58 | Stuck twice? Hand the same chat to a bigger model | 18/18 vs 17/18, at $0.19 vs $0.14 a run; only 6 vs 3 runs got stuck, Sonnet fixed 6 of 6 on its first turn, Haiku 2 of 3 on its fourth | ⏳ too few to judge |
 | 59 | Reproduce the bug first, then fix | 2/18 vs 7/18, at $0.13 vs $0.10 a run ($1.15 vs $0.25 per pass); every run saw the bug first, but only ever replayed the reported price, so the comma price got fixed in 5 vs 9 runs (p = 0.12) | ❌ cut |
+| 60 | Cap the retry loop at 3 tries | 17/18 vs 17/18, at $0.12 vs $0.17 a run; only 3 runs got past try 3, tries 4 to 10 bought 2 fixes for $0.37, and one uncapped run broke a working fix | ⏳ too few to judge |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 

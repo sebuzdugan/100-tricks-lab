@@ -8,6 +8,11 @@ Run it from a normal terminal, not from inside another Claude Code session (a ne
   python3 harness/run.py d01                   # runs × sides × tasks from tricks/d01/trick.json
   python3 harness/run.py d01 --runs 2 --parallel 3
   python3 harness/run.py d01 --summarize-only  # rebuild summary.json from finished runs
+  python3 harness/run.py d61 --smoke           # 1 real run per side per task into runs/d61-smoke/
+
+LAB_CLAUDE_BIN picks the claude binary (default: `claude` on PATH). M7 side fields: disallowed_tools_extra (joined
+onto the deny list), mcp_config_template ({work} filled per run, written to <work>.mcp.json), plugin_dirs (copied
+to /private/tmp/100-tricks-runs/_plugins/<trick>/<side>/), and {work} inside extra_args.
 
 Isolation. Every run gets a fresh copy of base/frai (APFS clone) under /private/tmp/100-tricks-runs,
 so no CLAUDE.md, skill or agent from your own setup leaks in. Set LAB_CLAUDE_CONFIG_DIR to a clean
@@ -33,6 +38,9 @@ from pathlib import Path
 LAB = Path(__file__).resolve().parent.parent
 BASE = LAB / "base" / "frai"
 WORK_ROOT = Path("/private/tmp/100-tricks-runs")
+PLUGIN_ROOT = WORK_ROOT / "_plugins"  # G4: plugin copies outside ~/Personal (the Read deny below covers ~/Personal)
+# The Claude Code binary; LAB_CLAUDE_BIN pins one version by path (M7 chain: ~/.local/share/claude/versions/2.1.309)
+CLAUDE_BIN = os.path.expanduser(os.environ.get("LAB_CLAUDE_BIN") or "claude")
 ALLOWED_TOOLS = ",".join([
     "Read", "Edit", "Write", "Glob", "Grep",
     "Bash(pnpm *)", "Bash(npx *)", "Bash(node *)",
@@ -150,7 +158,7 @@ def rewind_files(sid, work: Path, extra_env=None) -> str:
             first = d["uuid"]; break
     if not first:
         return "no first user message"
-    r = subprocess.run(["claude", "--resume", sid, "--rewind-files", first, "-p", ""], cwd=work, env=env,
+    r = subprocess.run([CLAUDE_BIN, "--resume", sid, "--rewind-files", first, "-p", ""], cwd=work, env=env,
                        capture_output=True, text=True, timeout=300)
     return ((r.stdout or r.stderr).strip().splitlines() or [f"exit {r.returncode}"])[-1][:200]
 
@@ -171,6 +179,56 @@ def task_text(tdir: Path, side_cfg: dict, task: str) -> str:
     """The task's own prompt, without the side's prefix or suffix (for follow-up turn templates)."""
     by_file = (side_cfg.get("prompt_file_by_task") or {}).get(task)
     return (tdir / by_file).read_text() if by_file else (LAB / "tasks" / task / "prompt.md").read_text()
+
+
+def fill_work(args, work: Path):
+    """G2: `{work}` in an argument list becomes the run's absolute repo folder."""
+    return [str(a).replace("{work}", str(work)) for a in (args or [])]
+
+
+def denied_for(side_cfg: dict) -> str:
+    """G1: the lab deny list plus a side's `disallowed_tools_extra`, passed as one --disallowedTools value."""
+    return ",".join([DENIED_TOOLS] + list(side_cfg.get("disallowed_tools_extra") or []))
+
+
+def mcp_config_file(tdir: Path, side_cfg: dict, work: Path):
+    """G2: a side's `mcp_config_template` (path under the trick folder) with every `{work}` filled, written next to
+    the repo copy (<work>.mcp.json), never inside it, so it stays out of the diff. None when the side has none."""
+    tpl = side_cfg.get("mcp_config_template")
+    if not tpl:
+        return None
+    dest = work.parent / f"{work.name}.mcp.json"
+    dest.write_text((tdir / tpl).read_text().replace("{work}", str(work)))
+    return dest
+
+
+def plugin_copies(tid: str, side: str, side_cfg: dict):
+    """G4: copy each `plugin_dirs` folder once per trick to PLUGIN_ROOT/<trick>/<side>/<basename> (recopied only
+    when the file list differs) and return the copies, one --plugin-dir each."""
+    files = lambda d: sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file())
+    out = []
+    for src in side_cfg.get("plugin_dirs") or []:
+        src = Path(os.path.expanduser(src))
+        if not src.is_dir():
+            sys.exit(f"plugin_dirs folder missing: {src}")
+        dest = PLUGIN_ROOT / tid / side / src.name
+        with lock:
+            if not (dest.is_dir() and files(dest) == files(src)):
+                shutil.rmtree(dest, ignore_errors=True)
+                shutil.copytree(src, dest, ignore_dangling_symlinks=True)
+        out.append(dest)
+    return out
+
+
+def side_flags(tid: str, side: str, tdir: Path, side_cfg: dict, work: Path):
+    """--mcp-config and --plugin-dir flags from the M7 side fields (empty list for every older trick)."""
+    flags = []
+    mcp = mcp_config_file(tdir, side_cfg, work)
+    if mcp:
+        flags += ["--mcp-config", str(mcp)]
+    for p in plugin_copies(tid, side, side_cfg):
+        flags += ["--plugin-dir", str(p)]
+    return flags
 
 
 def call_claude(cmd, work, timeout_s, env_extra=None):
@@ -242,11 +300,11 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     turns = side_cfg.get("turns") or []
     allowed = ",".join([ALLOWED_TOOLS] + list(side_cfg.get("allowed_tools_extra") or []))
     base_flags = ["--output-format", "stream-json", "--verbose", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
-                  "--allowedTools", allowed, "--disallowedTools", DENIED_TOOLS,
-                  "--setting-sources", "project,local", "--strict-mcp-config"]
+                  "--allowedTools", allowed, "--disallowedTools", denied_for(side_cfg),
+                  "--setting-sources", "project,local", "--strict-mcp-config"] + side_flags(tid, side, tdir, side_cfg, work)
     if not turns:
         base_flags.insert(2, "--no-session-persistence")
-    cmd = ["claude", "-p", prompt] + base_flags
+    cmd = [CLAUDE_BIN, "-p", prompt] + base_flags
     if not trick.get("skills"):
         cmd.append("--disable-slash-commands")
     model = side_cfg.get("model") or trick.get("model")
@@ -255,10 +313,10 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
     effort = side_cfg.get("effort") or trick.get("effort")
     if effort:
         cmd += ["--effort", effort]
-    cmd += side_cfg.get("extra_args", [])
+    cmd += fill_work(side_cfg.get("extra_args"), work)
     timeout_s = int(trick.get("timeout_min", 20)) * 60
 
-    row = {"trick": tid, "side": side, "task": task, "run": n, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    row ={"trick": tid, "side": side, "task": task, "run": n, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     data, timeout, infra = {}, False, ""
     if dry:
         row.update(duration_min=0, cost_usd=0, turns=0)
@@ -299,14 +357,14 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
             tflags = list(base_flags)
             if turn.get("permission_mode"):  # e.g. plan mode for the first call, acceptEdits to implement
                 i = tflags.index("--permission-mode"); tflags[i + 1] = turn["permission_mode"]
-            tcmd = ["claude", "-p", tp] + ([] if fresh else ["--resume", data["session_id"]]) + tflags
+            tcmd = [CLAUDE_BIN, "-p", tp] +([] if fresh else ["--resume", data["session_id"]]) + tflags
             if not trick.get("skills") and not turn.get("slash_commands"):
                 tcmd.append("--disable-slash-commands")
             if turn.get("model") or model:
                 tcmd += ["--model", turn.get("model") or model]
             if effort:
                 tcmd += ["--effort", effort]
-            tcmd += turn.get("extra_args", [])
+            tcmd += fill_work(turn.get("extra_args"), work)
             nxt, timeout = call_claude(tcmd, work, left, side_cfg.get("env"))
             calls.append(nxt)
             data = nxt or data
@@ -372,6 +430,7 @@ def run_one(trick, tid, side, task, n, out_dir, dry):
                     w.writeheader()
                 w.writerow(row)
         shutil.rmtree(work, ignore_errors=True)
+        (work.parent / f"{work.name}.mcp.json").unlink(missing_ok=True)
     print(f"{'PASS' if passed else 'FAIL'} {side:<7} {task:<20} r{n}  {row.get('duration_min', 0)} min  ${row.get('cost_usd', 0)}  {reason}")
     return {"row": row}
 
@@ -410,7 +469,8 @@ def run_sequence(trick, tid, side, n, out_dir, dry):
     allowed = ",".join([ALLOWED_TOOLS] + list(side_cfg.get("allowed_tools_extra") or []))
     # Same flags as run_one, with sessions kept on disk (needed for --resume; harmless for fresh sessions).
     flags = ["--output-format", "stream-json", "--verbose", "--permission-mode", side_cfg.get("permission_mode", "acceptEdits"),
-             "--allowedTools", allowed, "--disallowedTools", DENIED_TOOLS, "--setting-sources", "project,local", "--strict-mcp-config"]
+             "--allowedTools", allowed, "--disallowedTools", denied_for(side_cfg), "--setting-sources", "project,local", "--strict-mcp-config"]
+    flags += side_flags(tid, side, tdir, side_cfg, work)
     if not trick.get("skills"):
         flags.append("--disable-slash-commands")
     model = side_cfg.get("model") or trick.get("model")
@@ -419,12 +479,12 @@ def run_sequence(trick, tid, side, n, out_dir, dry):
     effort = side_cfg.get("effort") or trick.get("effort")
     if effort:
         flags += ["--effort", effort]
-    flags += side_cfg.get("extra_args", [])
+    flags += fill_work(side_cfg.get("extra_args"), work)
     timeout_s = int(trick.get("timeout_min", 20)) * 60
     session, prev_tree, stopped = None, "lab-base", ""
     for pos, task in enumerate(tasks, 1):
         prompt = build_prompt(tdir, side_cfg, task)
-        cmd = ["claude", "-p", prompt] + (["--resume", session] if resume and session else []) + flags
+        cmd = [CLAUDE_BIN, "-p", prompt] + (["--resume", session] if resume and session else []) + flags
         row = {"trick": tid, "side": side, "task": task, "run": n, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
         data, timeout, infra = {}, False, ""
         if dry:
@@ -492,6 +552,7 @@ def run_sequence(trick, tid, side, n, out_dir, dry):
         print(f"{'PASS' if passed else 'FAIL'} {side:<7} {task:<20} r{n} [{pos}/{len(tasks)}]  {row.get('duration_min', 0)} min  ${row.get('cost_usd', 0)}  {reason}")
     if not dry:
         shutil.rmtree(work, ignore_errors=True)
+        (work.parent / f"{work.name}.mcp.json").unlink(missing_ok=True)
 
 
 def side_stats(rows):
@@ -566,21 +627,26 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--summarize-only", action="store_true")
     ap.add_argument("--only-task")
+    ap.add_argument("--smoke", action="store_true",
+                    help="1 real run per side per task into runs/<id>-smoke/ (repo copies under _smoke/); runs/<id>/ untouched")
     a = ap.parse_args()
     trick = load_trick(a.trick)
     if trick.get("marathon"):  # module 4 v2 marathon days: one long scripted session per run, run by harness/marathon.py
         import marathon  # same folder; parses the same command line (--runs, --parallel, --dry-run, --summarize-only)
         return marathon.main()
     ensure_fetched(trick, LAB / "tricks" / a.trick)
-    out_dir = LAB / "runs" / a.trick
+    out_dir = LAB / "runs" / (a.trick + ("-smoke" if a.smoke else ""))
+    if a.smoke:
+        global WORK_ROOT
+        WORK_ROOT = WORK_ROOT / "_smoke"
     out_dir.mkdir(parents=True, exist_ok=True)
     if a.summarize_only:
         return summarize(trick, a.trick, out_dir)
-    if not shutil.which("claude") and not a.dry_run:
-        sys.exit("claude CLI not found on PATH")
+    if not shutil.which(CLAUDE_BIN) and not a.dry_run:
+        sys.exit(f"claude CLI not found: {CLAUDE_BIN}")
     if not a.dry_run and not os.environ.get("LAB_CLAUDE_CONFIG_DIR"):
         print("WARNING: LAB_CLAUDE_CONFIG_DIR is not set, so your user-level agents and commands may load into runs.")
-    runs = 1 if a.dry_run else (a.runs or trick.get("runs", 3))
+    runs = 1 if (a.dry_run or a.smoke) else (a.runs or trick.get("runs", 3))
     tasks = [a.only_task] if a.only_task else trick["tasks"]
     jobs = [(side, task, n) for n in range(1, runs + 1) for task in tasks for side in ("with", "without")]
     if trick.get("sequence"):  # day 32: one job per side and run, covering every task in order (--only-task doesn't apply)

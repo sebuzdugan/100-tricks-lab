@@ -107,6 +107,7 @@ The verdict rule is written down **before** the runs, in [PROTOCOL.md](PROTOCOL.
 | 61 | Put the finish checklist in a skill instead of CLAUDE.md | 9/18 vs 14/18, at $0.47 vs $0.44 a run ($0.94 vs $0.56 per pass); the skill was opened in 12 of 18 runs, every time after the code was written, so the first build came at 2.1 vs 0.9 min on the feature (p = 0.16) | ❌ cut |
 | 62 | Send an Explore subagent to read the code first | 5/18 vs 9/18, at $0.40 vs $0.36 a run ($1.44 vs $0.72 per pass); the helper was sent in 18 of 18 runs, but 7 of 9 feature runs waited for its report and then read the files themselves anyway, so total tokens were the same; the whole gap is on the bug fix, 2 vs 6 (p = 0.31) | ❌ cut |
 | 63 | Run 3 agents at once, each in its own git worktree | 6/9 vs 6/9, at 1.99 vs 4.98 min a batch ($0.65 vs $0.71); all 3 merges were clean, but the 3 tasks touched 3 different packages, nothing tested the merged code, and one clean merge carried a deleted CI workflow (p = 1.0 on passes) | ✅ kept |
+| 64 | Give the agent the Superpowers plugin, unattended | 3/18 vs 9/18, at $0.42 vs $0.42 a run ($2.52 vs $0.85 per pass); on the feature 5 runs wrote a plan first and all 5 changed the reports the task said to leave alone (0 vs 5 there, p = 0.029); the bug fix was about even, 3 vs 4 (p = 0.075 overall) | ❌ cut |
 
 **Module 4, after 10 days of long sessions:** 3 kept, 1 cut, 6 optional. No long-session trick helped here. Missing docs and CLAUDE.md rules did.
 
